@@ -37,9 +37,28 @@ se | Implementation Detail | Related Files | Test Coverage |`
 
 ## Project status
 
-This repository is a fresh scaffold for an **AI/LLM-powered personalized resume builder**. As of now it contains only `README.md` and a Python `.gitignore` — no source code, dependencies, or tests have been added yet.
+Phase 1 (core pipeline + FastAPI + Docker) is implemented — see `PLAN.md` for the phase roadmap and `TECHNICAL-DESIGN.md` §13 for implementation notes. The system is an **AI/LLM-powered personalized resume builder**: two LangGraph `StateGraph`s (ingestion and tailoring) behind a FastAPI service, with an anti-fabrication validation gate and a versioned JSON profile store.
 
-There are no build, lint, or test commands to document because no code exists yet. Once implementation begins, update this file with the actual commands (e.g. `pytest`, linters, entry points) rather than assuming any of the conventions below are already in place.
+## Commands
+
+```bash
+# setup (Python 3.11 venv)
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # fill in ANTHROPIC_API_KEY
+
+# run the API locally
+uvicorn src.api.main:app --reload
+
+# run in Docker (one container, data/ volume)
+docker compose up --build
+
+# tests
+pytest tests/unit/ -v    # unit tests — all LLMs mocked, no network
+pytest -m integration    # real-API end-to-end (needs ANTHROPIC_API_KEY)
+```
+
+Unit tests run by default (`pytest.ini` excludes the `integration` marker). Mock LLM calls by monkeypatching `make_llm` in the specific agent module (each agent imports it by name), e.g. `monkeypatch.setattr(src.agents.extraction, "make_llm", ...)`.
 
 ## Conventions to follow when adding code
 

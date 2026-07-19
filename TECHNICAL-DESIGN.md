@@ -212,3 +212,89 @@ Renders `TailoredCV` → `.docx` (and/or PDF) using a template. This is a pure r
 4. Validation agent (do this before shipping to real use, not after).
 5. LinkedIn export ingestion.
 6. Document rendering + review UI.
+
+---
+
+## 13. Implementation notes — Phase 1 (2026-07-18)
+
+Phase 1 implements §12 steps 1–4 as two **separate LangGraph `StateGraph`s**
+sharing one schema module (`src/models/schemas.py`), since ingestion and
+tailoring run at different times. State is a `TypedDict` per graph; node names
+are verbs. There is no orchestrator graph yet — FastAPI routes invoke each
+graph directly.
+
+### Ingestion graph (`src/agents/ingestion_graph.py`)
+
+```mermaid
+flowchart LR
+    START --> ingest_sources --> extract_source --> synthesize_profile --> store_profile --> END
+```
+
+- `ingest_sources` — validates non-empty sources (deterministic).
+- `extract_source` — one Haiku call per `SourceDocument` →
+  `SourceExtraction`; the `source` field of every extracted
+  experience/project is **overwritten in code** with the document id, so
+  traceability never depends on the model.
+- `synthesize_profile` — one Sonnet call merges extractions into a
+  `CareerProfile`; dedupe + conflict surfacing happen in the prompt, but
+  `raw_source_map` is built **deterministically** from the merged entries'
+  `source` fields (`synthesis.build_raw_source_map`).
+- `store_profile` — versioned JSON store (no LLM).
+
+### Tailoring graph (`src/agents/tailoring_graph.py`)
+
+```mermaid
+flowchart LR
+    START --> analyze_job --> tailor_cv --> validate_cv --> END
+```
+
+- `analyze_job` — Sonnet → `JobRequirements`.
+- `tailor_cv` — Sonnet with hard no-fabrication rules in the system prompt →
+  `TailoredCV`.
+- `validate_cv` — layered gate: (a) exact `raw_source_map` hit passes;
+  (b) difflib similarity vs. original bullets ≥ threshold
+  (`VALIDATION_SIMILARITY_THRESHOLD`, default 0.55) passes; (c) anything
+  below threshold goes to an LLM cross-check; unsupported claims are
+  returned as `needs_review` flags. Skill/experience/project membership
+  checks are fully deterministic. In Phases 1–3 human review of flags is
+  client-side; Phase 4 upgrades to a LangGraph `interrupt()` + checkpointer.
+
+### Model tiering (env-configurable, `src/config.py`)
+
+| Stage | Env var | Default |
+|---|---|---|
+| Extraction | `EXTRACTION_MODEL` | `claude-haiku-4-5-20251001` |
+| Synthesis | `SYNTHESIS_MODEL` | `claude-sonnet-5` |
+| Job analysis + tailoring | `TAILORING_MODEL` | `claude-sonnet-5` |
+| Validation cross-check | `VALIDATION_MODEL` | `claude-sonnet-5` (override to `claude-opus-4-8` for max precision) |
+
+Every LLM node uses `make_llm(...).with_structured_output(<PydanticModel>)`
+via the single factory `src/agents/llm.py:make_llm` — no free-form JSON
+parsing anywhere. The factory follows the same method as FUND's
+`AgentBase.get_llm()` (provider switch + lazy imports, configured via
+`LLM_PROVIDER`, `LLM_API_KEY`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`,
+`LLM_BASE_URL`, `LLM_STREAM_TIMEOUT_S`), defaulting to `anthropic`; `model`
+and `max_tokens` remain per-call arguments because models are tiered per
+pipeline stage. Temperature is only passed when explicitly configured, since
+current Claude models reject non-default sampling parameters.
+
+### Storage schema
+
+Versioned JSON files (single-user; no Postgres):
+
+```
+data/profiles/{profile_id}/
+├── v1.json      # CareerProfile serialized by Pydantic
+├── v2.json      # e.g. after a user edit via PUT /profile/{id}
+└── latest       # plain-text pointer to the current version number
+```
+
+### API / SSE
+
+FastAPI app factory (`src/api/main.py`) + routes (`src/api/routes.py`).
+Long-running ingestion progress is streamed per-node over SSE using an
+in-process job registry (`dict[job_id, asyncio.Queue]`); the graph runs in a
+worker thread and publishes node names via `loop.call_soon_threadsafe`. The
+client may supply its own `job_id` form field so it can subscribe before
+POSTing. Everything ships in **one Docker container** (python:3.11-slim,
+uvicorn on 0.0.0.0:8000, `data/` volume-mounted).
