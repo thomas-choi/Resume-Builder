@@ -5,11 +5,14 @@ to keep downstream token cost down (design doc §3).
 """
 
 import base64
+import logging
 
 import httpx
 
 from src import config
 from src.models.schemas import SourceDocument
+
+logger = logging.getLogger(__name__)
 
 API_BASE = "https://api.github.com"
 README_EXCERPT_CHARS = 1500
@@ -42,6 +45,12 @@ def fetch_github_profile(username: str, client: httpx.Client | None = None) -> S
         )
         repos_resp.raise_for_status()
         repos = [r for r in repos_resp.json() if not r.get("fork")]
+        logger.debug(
+            "github[%s]: %d non-fork repos: %s",
+            username,
+            len(repos),
+            [r["name"] for r in repos],
+        )
 
         sections: list[str] = [f"GitHub profile: {username}"]
         for repo in repos:
@@ -65,12 +74,24 @@ def fetch_github_profile(username: str, client: httpx.Client | None = None) -> S
                     lines.append("README excerpt:\n" + text[:README_EXCERPT_CHARS])
                 except (ValueError, TypeError):
                     pass
+            logger.debug(
+                "github[%s]: repo %s: language=%s stars=%s readme=%s",
+                username,
+                name,
+                repo.get("language"),
+                repo.get("stargazers_count", 0),
+                "yes" if readme_resp.status_code == 200 else "no",
+            )
             sections.append("\n".join(lines))
 
+        raw_text = "\n".join(sections)
+        logger.debug(
+            "github[%s]: source document %d chars:\n%s", username, len(raw_text), raw_text
+        )
         return SourceDocument(
             id=f"github:{username}",
             source_type="github",
-            raw_text="\n".join(sections),
+            raw_text=raw_text,
         )
     finally:
         if own_client:

@@ -219,3 +219,6 @@ __marimo__/
 
 # Runtime profile storage
 data/
+
+# Runtime log files (LOG_FILE + rotated backups)
+logs/

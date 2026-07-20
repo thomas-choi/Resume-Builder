@@ -1,5 +1,7 @@
 """API tests via TestClient with the graphs mocked out."""
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -38,7 +40,13 @@ def test_healthz(client):
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
-def test_ingest_docx_returns_profile(client, monkeypatch, sample_profile):
+def test_root_redirects_to_docs(client):
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code == 307
+    assert resp.headers["location"] == "/docs"
+
+
+def test_ingest_docx_returns_profile(client, data_dir, monkeypatch, sample_profile):
     final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
     monkeypatch.setattr(
         routes, "build_ingestion_graph", lambda: FakeIngestionGraph(final_state)
@@ -61,9 +69,56 @@ def test_ingest_docx_returns_profile(client, monkeypatch, sample_profile):
     body = resp.json()
     assert body["profile_id"] == "abc123"
     assert body["job_id"] == "job-1"
+    assert body["run_id"] == "job-1"
     assert body["profile"]["name"] == "Alice Smith"
     # conflicts are surfaced in the response
     assert body["profile"]["conflicts"][0]["field"] == "experience.start_date"
+
+    # the raw upload is archived under sources/{run_id}/cv/ and indexed
+    cv_path = data_dir / "sources" / "job-1" / "cv" / "resume.docx"
+    assert cv_path.exists()
+    manifest = json.loads((data_dir / "sources" / "job-1" / "manifest.json").read_text())
+    assert manifest["run_id"] == "job-1"
+    categories = {e["category"] for e in manifest["sources"]}
+    assert categories == {"cv"}
+    assert manifest["sources"][0]["sha256"]
+
+
+def test_ingest_archives_github_and_free_text_sources(
+    client, data_dir, monkeypatch, sample_profile
+):
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    monkeypatch.setattr(
+        routes, "build_ingestion_graph", lambda: FakeIngestionGraph(final_state)
+    )
+
+    def fake_fetch(username):
+        from src.models.schemas import SourceDocument
+
+        return SourceDocument(
+            id=f"github:{username}", source_type="github", raw_text="repos ..."
+        )
+
+    monkeypatch.setattr(routes, "fetch_github_profile", fake_fetch)
+
+    resp = client.post(
+        "/ingest",
+        data={
+            "job_id": "job-2",
+            "github_username": "alice",
+            "free_text": "LinkedIn summary paragraph",
+        },
+    )
+    assert resp.status_code == 200
+
+    run_dir = data_dir / "sources" / "job-2"
+    assert (run_dir / "github" / "github.json").exists()
+    assert (run_dir / "linkedin" / "linkedin-summary.txt").read_text() == (
+        "LinkedIn summary paragraph"
+    )
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    categories = {e["category"] for e in manifest["sources"]}
+    assert categories == {"github", "linkedin"}
 
 
 def test_ingest_without_sources_is_400(client):

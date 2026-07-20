@@ -48,7 +48,12 @@ docker compose up --build
 ## Usage
 
 Start the server (`uvicorn src.api.main:app --reload` locally, or the Docker
-command above), then:
+command above), then open `http://localhost:8000/docs` for the interactive
+API UI, or use curl:
+
+> To access from another machine on your network, bind to all interfaces:
+> `uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000`
+> (Docker Compose already does this.)
 
 ```bash
 # 1. Build your career profile from any mix of sources

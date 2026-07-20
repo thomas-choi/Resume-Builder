@@ -1,6 +1,11 @@
-langgraph>=0.2
-langchain-anthropic>=0.3
 langchain-core>=0.3
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-openai>=0.1.0
+langchain-anthropic>=0.1.0
+langchain-google-genai>=1.0.0
+langchain-nvidia-ai-endpoints>=0.3
+langchain-deepseek>=1.1.0
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-docx>=1.1
@@ -13,3 +18,4 @@ python-multipart>=0.0.9
 pytest>=8.0
 pytest-mock>=3.14
 pytest-asyncio>=0.23
+sse-starlette

@@ -3,6 +3,11 @@
 Base URL: `http://localhost:8000` (single FastAPI service). All responses are JSON
 unless noted. Schemas referenced below are defined in `src/models/schemas.py`.
 
+## GET /
+
+Redirects (307) to `/docs` — FastAPI's interactive Swagger UI, the
+browser-friendly way to explore and try every endpoint below.
+
 ## GET /healthz
 
 Liveness probe. Returns `{"status": "ok"}`.
@@ -10,7 +15,9 @@ Liveness probe. Returns `{"status": "ok"}`.
 ## POST /ingest
 
 Runs the ingestion graph over the provided sources and stores the resulting
-profile as v1.
+profile as v1. Each call is tagged with a `run_id` that archives the raw inputs
+under `data/sources/{run_id}/` and a copy of the output under
+`data/output/{run_id}/output.json` (see OPERATIONS.md → Run tracking & retention).
 
 **Request:** `multipart/form-data`
 
@@ -18,8 +25,8 @@ profile as v1.
 |---|---|---|---|
 | `cv` | file(s) | no* | One or more `.docx` / `.pdf` CVs |
 | `github_username` | text | no* | Public GitHub profile to ingest |
-| `free_text` | text | no* | Pasted bio/notes passthrough |
-| `job_id` | text | no | Client-generated id for SSE progress; subscribe to `GET /ingest/{job_id}/events` before POSTing. Server generates one if omitted. |
+| `free_text` | text | no* | Pasted bio/notes passthrough (also the LinkedIn-summary path) |
+| `job_id` | text | no | Client-generated id for SSE progress; subscribe to `GET /ingest/{job_id}/events` before POSTing. Server generates one if omitted. Doubles as the `run_id`. |
 
 *At least one of `cv`, `github_username`, `free_text` is required (else 400).
 Unsupported CV extensions → 400. Graph failure → 500.
@@ -29,11 +36,16 @@ Unsupported CV extensions → 400. Graph failure → 500.
 ```json
 {
   "job_id": "…",
+  "run_id": "…",
   "profile_id": "…",
   "version": 1,
   "profile": { CareerProfile — includes "conflicts": [Conflict, …] }
 }
 ```
+
+`run_id` equals `job_id`. Its archive lives at `data/sources/{run_id}/`
+(raw CV under `cv/`, `github/github.json`, `linkedin/linkedin-summary.txt`,
+plus `manifest.json`) and `data/output/{run_id}/output.json`.
 
 ## GET /ingest/{job_id}/events
 

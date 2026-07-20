@@ -47,7 +47,10 @@ src/
 │   ├── validation.py          # validate_cv node: source-map check + similarity + LLM cross-check
 │   └── document.py            # Phase 3: render_document node (no LLM)
 ├── chains/prompts/            # one prompt-template module per LLM agent
-├── utils/profile_store.py     # versioned JSON store: data/profiles/{profile_id}/v{n}.json + latest pointer
+├── utils/
+│   ├── profile_store.py       # versioned JSON store: data/profiles/{profile_id}/v{n}.json + latest pointer
+│   ├── run_store.py           # per-run provenance: data/sources/{run_id}/ + data/output/{run_id}/output.json + manifest
+│   └── logging_setup.py       # root logging config + run_id log correlation (contextvar)
 └── api/
     ├── main.py                # FastAPI app factory; serves built frontend in Phase 4
     └── routes.py
@@ -56,7 +59,10 @@ tests/
 ├── conftest.py                # fixtures: sample docx/pdf/LinkedIn-export files, mocked LLMs, tmp data dir
 ├── unit/                      # no real API calls; LLMs mocked
 └── integration/               # @pytest.mark.integration; real Anthropic/GitHub APIs
-data/profiles/                 # gitignored runtime storage
+data/
+├── profiles/                  # gitignored runtime storage (versioned profiles)
+├── sources/{run_id}/          # archived raw inputs per ingest run (cv/, github.json, linkedin-summary.txt, manifest.json)
+└── output/{run_id}/output.json  # copy of the synthesized profile per run
 ```
 
 ## Environment variables (`.env.example`, kept in sync every phase)
@@ -84,7 +90,7 @@ DATA_DIR=./data
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /ingest` | multipart: CV file(s) + optional `github_username` + optional `free_text` → runs ingestion graph → `profile_id` + `CareerProfile` (incl. `conflicts`) |
+| `POST /ingest` | multipart: CV file(s) + optional `github_username` + optional `free_text` → runs ingestion graph → `run_id` + `profile_id` + `CareerProfile` (incl. `conflicts`); archives raw inputs + output copy per `run_id` |
 | `GET /ingest/{job_id}/events` | SSE per-node progress |
 | `GET /profile/{profile_id}` | latest version; `?version=n` for specific |
 | `PUT /profile/{profile_id}` | save user-edited profile as new version (v1 conflict resolution) |
@@ -92,6 +98,36 @@ DATA_DIR=./data
 | `GET /healthz` | liveness |
 
 **Tests:** `tests/unit/` — schemas, docx/pdf readers (fixture files), github client (mocked httpx), extraction/synthesis (mocked LLM; dedupe + conflict logic), tailoring (subset-of-profile invariant), **validation (key suite: fabricated bullet → flagged; reworded-but-sourced → passes; unsourced skill → flagged)**, profile_store versioning, API via `TestClient` with graphs mocked. `tests/integration/test_pipeline.py` — real end-to-end on a sample CV.
+
+#### Phase 1.a — Run tracking & provenance (`run_id`)
+
+An enhancement to Phase 1 that gives end-to-end traceability between pipeline steps. Previously
+`/ingest` kept no record of its inputs — uploaded CVs were parsed from a temp file then deleted,
+GitHub/free-text were discarded, and only the final profile was stored; neither `job_id` (SSE
+progress) nor `profile_id` (storage key) tied raw inputs to the produced output.
+
+- **`run_id`** — one correlation id per `/ingest` execution. Reuses the `job_id` (they are 1:1);
+  generated when the client doesn't pass one. Distinct from `profile_id` (which evolves across runs).
+- **`src/utils/run_store.py`** (mirrors `profile_store.py`) archives, keyed by `run_id`:
+  - `data/sources/{run_id}/cv/<original-name>` — raw uploaded CV bytes, persisted **before** parsing
+    (so inputs survive even if the graph later fails). Filenames are sanitized (`Path(name).name`).
+  - `data/sources/{run_id}/github/github.json` — the serialized GitHub `SourceDocument`.
+  - `data/sources/{run_id}/linkedin/linkedin-summary.txt` — the free-text input. **LinkedIn is mapped
+    through the existing `free_text` path** and archived here; no dedicated LinkedIn ingestion is built
+    (that remains Phase 2 below).
+  - `data/sources/{run_id}/manifest.json` — index of the above (category, filename, size, sha256),
+    linked to the produced `profile_id`/`version`.
+  - `data/output/{run_id}/output.json` — a copy of the synthesized profile, written by `store_profile`.
+- **Log correlation** — a `contextvars` `run_id` field (`logging_setup.py`) tags every node's log line
+  with `[run:<run_id>]`, so a run is greppable across steps.
+- **Schema** — `SourceDocument.stored_path` (optional) links a source back to its archived raw file.
+- **Retention note** — raw CVs are now **retained** where they were previously deleted; documented in
+  `OPERATIONS.md`. `data/` remains gitignored.
+
+**Tests:** `tests/unit/test_run_store.py` (save/sanitize/manifest/output roundtrip); extended
+`test_api.py` (asserts `sources/{run_id}/` files, `manifest.json`, and `run_id` in the response);
+extended `test_graphs.py` (`store_profile` writes `output/{run_id}/output.json`); extended
+`test_logging_setup.py` (`[run:...]` tag).
 
 ## Phase 2 — LinkedIn export ingestion (design doc §12 step 5)
 
@@ -143,6 +179,7 @@ DATA_DIR=./data
 
 - `pytest tests/unit/ -v` green; `pytest -m integration` with real keys as final gate.
 - **Phase 1:** `docker compose up --build`; `curl -F cv=@sample.docx -F github_username=<user> localhost:8000/ingest` → inspect `CareerProfile` + `data/profiles/`; `POST /tailor` → confirm output only contains profile-sourced facts and an intentionally injected fake skill gets flagged.
+- **Phase 1 (run tracking):** after an `/ingest` call, confirm the returned `run_id` has `data/sources/{run_id}/` holding the raw CV, `github.json`, `linkedin-summary.txt`, and `manifest.json`, and that `data/output/{run_id}/output.json` matches the returned profile.
 - **Phase 2:** ingest a real LinkedIn export ZIP alongside a CV → conflicting dates appear in `conflicts`, not silently merged.
 - **Phase 3:** tailor with `render=true` → open the .docx/.pdf, verify structure matches `TailoredCV` ordering.
 - **Phase 4:** full browser flow from the Windows host (server on `0.0.0.0`): upload → edit profile → tailor → approve a flagged item → download rendered CV; verify a flagged run cannot render without approval.

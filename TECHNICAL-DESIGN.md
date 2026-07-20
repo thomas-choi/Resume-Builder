@@ -239,7 +239,24 @@ flowchart LR
   `CareerProfile`; dedupe + conflict surfacing happen in the prompt, but
   `raw_source_map` is built **deterministically** from the merged entries'
   `source` fields (`synthesis.build_raw_source_map`).
-- `store_profile` — versioned JSON store (no LLM).
+- `store_profile` — versioned JSON store (no LLM); when the run carries a
+  `run_id` it also writes a copy of the profile to
+  `data/output/{run_id}/output.json` and links the run's manifest to the new
+  `profile_id`/`version` (`src/utils/run_store.py`).
+
+**Run tracking / provenance.** Each `/ingest` execution is assigned a `run_id`
+(the same value as `job_id`; generated if the client omits it). Before the graph
+runs, `src/api/routes.py` archives every raw input under `data/sources/{run_id}/`
+via `run_store.save_source_file` (CV bytes persisted **before** parsing so inputs
+survive a later failure; GitHub serialized to `github.json`; the `free_text` /
+LinkedIn-summary input to `linkedin-summary.txt`) and writes a `manifest.json`
+indexing them (category, filename, size, sha256). This ties raw inputs → produced
+output, which neither `job_id` (SSE only) nor `profile_id` (storage key) did
+before. A `contextvars`-based `run_id` (`src/utils/logging_setup.py`) tags every
+node's log line `[run:<run_id>]` for cross-step tracing, and
+`SourceDocument.stored_path` links a source back to its archived file. LinkedIn is
+mapped through the existing `free_text` path (no dedicated LinkedIn ingestion —
+that remains §12 Phase 2).
 
 ### Tailoring graph (`src/agents/tailoring_graph.py`)
 
@@ -283,11 +300,23 @@ current Claude models reject non-default sampling parameters.
 Versioned JSON files (single-user; no Postgres):
 
 ```
-data/profiles/{profile_id}/
-├── v1.json      # CareerProfile serialized by Pydantic
-├── v2.json      # e.g. after a user edit via PUT /profile/{id}
-└── latest       # plain-text pointer to the current version number
+data/
+├── profiles/{profile_id}/
+│   ├── v1.json      # CareerProfile serialized by Pydantic
+│   ├── v2.json      # e.g. after a user edit via PUT /profile/{id}
+│   └── latest       # plain-text pointer to the current version number
+├── sources/{run_id}/            # per-run raw-input archive (src/utils/run_store.py)
+│   ├── cv/<original-name>        # raw uploaded CV bytes (saved before parsing)
+│   ├── github/github.json        # serialized GitHub SourceDocument
+│   ├── linkedin/linkedin-summary.txt  # the free_text / LinkedIn-summary input
+│   └── manifest.json             # index (category, filename, size, sha256) + profile_id/version
+└── output/{run_id}/output.json   # copy of the synthesized profile for the run
 ```
+
+`profile_store.py` owns `profiles/`; `run_store.py` owns `sources/` and
+`output/`. `run_id` = one ingest execution; `profile_id` = an evolving profile
+that may span runs. Raw CVs are **retained** here (previously deleted after
+parsing) — see OPERATIONS.md for the retention/privacy note.
 
 ### API / SSE
 

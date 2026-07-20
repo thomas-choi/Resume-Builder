@@ -30,6 +30,10 @@ VALIDATION_MODEL: str = os.getenv("VALIDATION_MODEL", "claude-sonnet-5")
 
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
 
+# Logging: level name (DEBUG/INFO/WARNING/ERROR); unset LOG_FILE = console only
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+LOG_FILE: Path | None = Path(os.environ["LOG_FILE"]) if os.getenv("LOG_FILE") else None
+
 # difflib similarity below which a tailored bullet triggers the LLM cross-check
 VALIDATION_SIMILARITY_THRESHOLD: float = float(
     os.getenv("VALIDATION_SIMILARITY_THRESHOLD", "0.55")

@@ -82,6 +82,11 @@ def make_llm(model: str, max_tokens: int | None = None):
     elif provider == "deepseek":
         from langchain_deepseek import ChatDeepSeek  # type: ignore
 
+        # DeepSeek thinking-mode models (e.g. deepseek-v4-flash/-pro) reject
+        # the forced tool_choice that with_structured_output sends ("Thinking
+        # mode does not support this tool_choice"), and every pipeline stage
+        # relies on structured output.
+        kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
         logger.info("deepseek: kwargs: %s", _mask_sensitive(kwargs))
         return ChatDeepSeek(**kwargs)
     elif provider == "openrouter":

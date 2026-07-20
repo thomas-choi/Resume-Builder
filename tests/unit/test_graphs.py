@@ -28,6 +28,27 @@ def test_ingestion_graph_runs_all_nodes(monkeypatch, data_dir, sample_profile):
     assert state["profile_id"]
 
 
+def test_ingestion_graph_saves_output_copy_for_run(monkeypatch, data_dir, sample_profile):
+    import json
+
+    monkeypatch.setattr(
+        extraction, "extract_one", lambda source: SourceExtraction(name="Alice Smith")
+    )
+    monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
+
+    graph = ingestion_graph.build_ingestion_graph()
+    doc = SourceDocument(id="free_text", source_type="free_text", raw_text="Alice ...")
+    state = graph.invoke({"run_id": "run-xyz", "sources": [doc]})
+
+    output_path = data_dir / "output" / "run-xyz" / "output.json"
+    assert output_path.exists()
+    payload = json.loads(output_path.read_text())
+    assert payload["run_id"] == "run-xyz"
+    assert payload["profile_id"] == state["profile_id"]
+    assert payload["version"] == state["version"]
+    assert payload["profile"]["name"] == "Alice Smith"
+
+
 def test_ingestion_graph_rejects_empty_sources(data_dir):
     graph = ingestion_graph.build_ingestion_graph()
     doc = SourceDocument(id="free_text", source_type="free_text", raw_text="   ")

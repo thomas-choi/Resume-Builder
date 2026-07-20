@@ -1,8 +1,6 @@
 """REST + SSE routes for the resume builder API."""
 
 import asyncio
-import json
-import tempfile
 import uuid
 from pathlib import Path
 
@@ -17,7 +15,8 @@ from src.models.schemas import CareerProfile, SourceDocument
 from src.tools.docx_reader import read_docx
 from src.tools.github_client import fetch_github_profile, free_text_source
 from src.tools.pdf_reader import read_pdf
-from src.utils import profile_store
+from src.utils import profile_store, run_store
+from src.utils.logging_setup import set_run_id
 
 router = APIRouter()
 
@@ -45,23 +44,25 @@ class JobRegistry:
 jobs = JobRegistry()
 
 
-def _load_upload(upload: UploadFile) -> SourceDocument:
-    """Persist an uploaded CV to a temp file and parse it by extension."""
-    suffix = Path(upload.filename or "cv").suffix.lower()
+def _load_upload(run_id: str, upload: UploadFile) -> tuple[SourceDocument, dict]:
+    """Archive an uploaded CV under the run's sources dir, then parse it.
+
+    The raw bytes are persisted to ``data/sources/{run_id}/cv/<original-name>``
+    *before* parsing, so an upload survives even if the graph later fails and
+    the run can still be reconstructed. Returns the parsed source document and
+    its manifest entry.
+    """
+    filename = upload.filename or "cv"
+    suffix = Path(filename).suffix.lower()
     if suffix not in (".docx", ".pdf"):
         raise HTTPException(400, f"unsupported CV file type: {suffix or '(none)'}")
-    with tempfile.NamedTemporaryFile(
-        suffix=suffix, prefix=Path(upload.filename or "cv").stem + "-", delete=False
-    ) as tmp:
-        tmp.write(upload.file.read())
-        tmp_path = Path(tmp.name)
-    try:
-        doc = read_docx(tmp_path) if suffix == ".docx" else read_pdf(tmp_path)
-        # Keep the original filename in the source id, not the temp name.
-        doc.id = f"{doc.source_type}:{upload.filename}"
-        return doc
-    finally:
-        tmp_path.unlink(missing_ok=True)
+    data = upload.file.read()
+    stored = run_store.save_source_file(run_id, "cv", filename, data)
+    doc = read_docx(stored) if suffix == ".docx" else read_pdf(stored)
+    # Keep the original filename in the source id, not the stored path.
+    doc.id = f"{doc.source_type}:{filename}"
+    doc.stored_path = str(stored)
+    return doc, run_store.source_entry("cv", stored, data, source_id=doc.id)
 
 
 @router.get("/healthz")
@@ -80,31 +81,60 @@ async def ingest(
 
     Pass a client-generated `job_id` and subscribe to
     `GET /ingest/{job_id}/events` before/while POSTing to watch per-node
-    progress; otherwise a server-generated job_id is returned.
+    progress; otherwise a server-generated job_id is returned. The same id is
+    used as the `run_id`: raw inputs are archived under
+    `data/sources/{run_id}/` and the output copy under `data/output/{run_id}/`.
     """
+    # Allocate the run/correlation id up front so raw inputs can be archived
+    # before parsing (and before the graph runs). job_id doubles as run_id.
+    run_id = job_id or uuid.uuid4().hex[:12]
+    set_run_id(run_id)
+
     sources: list[SourceDocument] = []
+    manifest_entries: list[dict] = []
     for upload in cv or []:
-        sources.append(_load_upload(upload))
+        doc, entry = _load_upload(run_id, upload)
+        sources.append(doc)
+        manifest_entries.append(entry)
     if github_username:
-        sources.append(
-            await anyio.to_thread.run_sync(fetch_github_profile, github_username)
+        gh_doc = await anyio.to_thread.run_sync(fetch_github_profile, github_username)
+        gh_bytes = gh_doc.model_dump_json(indent=2).encode("utf-8")
+        gh_path = run_store.save_source_file(run_id, "github", "github.json", gh_bytes)
+        gh_doc.stored_path = str(gh_path)
+        sources.append(gh_doc)
+        manifest_entries.append(
+            run_store.source_entry("github", gh_path, gh_bytes, source_id=gh_doc.id)
         )
     if free_text and free_text.strip():
-        sources.append(free_text_source(free_text))
+        ft_doc = free_text_source(free_text)
+        # free_text is also the LinkedIn-summary path (PLAN.md Phase 2 maps
+        # LinkedIn through here); archive it as linkedin-summary.txt.
+        ft_bytes = ft_doc.raw_text.encode("utf-8")
+        ft_path = run_store.save_source_file(
+            run_id, "linkedin", "linkedin-summary.txt", ft_bytes
+        )
+        ft_doc.stored_path = str(ft_path)
+        sources.append(ft_doc)
+        manifest_entries.append(
+            run_store.source_entry("linkedin", ft_path, ft_bytes, source_id=ft_doc.id)
+        )
     if not sources:
         raise HTTPException(400, "provide at least one source (cv, github_username, free_text)")
 
-    job_id = job_id or uuid.uuid4().hex[:12]
-    queue = jobs.create(job_id)
+    run_store.write_manifest(run_id, manifest_entries)
+
+    queue = jobs.create(run_id)
     loop = asyncio.get_running_loop()
 
     def publish(event: dict) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
     def run_graph() -> dict:
+        set_run_id(run_id)
         graph = build_ingestion_graph()
         state: dict = {}
-        for update in graph.stream({"sources": sources}, stream_mode="updates"):
+        stream_input = {"run_id": run_id, "sources": sources}
+        for update in graph.stream(stream_input, stream_mode="updates"):
             for node, node_state in update.items():
                 publish({"event": "node", "data": node})
                 state.update(node_state or {})
@@ -120,7 +150,8 @@ async def ingest(
 
     profile: CareerProfile = state["profile"]
     return {
-        "job_id": job_id,
+        "job_id": run_id,
+        "run_id": run_id,
         "profile_id": state["profile_id"],
         "version": state["version"],
         "profile": profile.model_dump(),

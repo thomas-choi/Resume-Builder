@@ -6,11 +6,14 @@ validation gate never depends on LLM-generated traceability.
 """
 
 import json
+import logging
 
 from src import config
 from src.agents.llm import make_llm
 from src.chains.prompts import synthesis_prompt
 from src.models.schemas import CareerProfile, SourceExtraction
+
+logger = logging.getLogger(__name__)
 
 
 def build_raw_source_map(profile: CareerProfile) -> dict[str, str]:
@@ -32,6 +35,12 @@ def synthesize(extractions: list[SourceExtraction]) -> CareerProfile:
     extractions_json = json.dumps(
         [e.model_dump() for e in extractions], indent=2, ensure_ascii=False
     )
+    logger.debug(
+        "synthesize: %d extractions, payload %d chars, model=%s",
+        len(extractions),
+        len(extractions_json),
+        config.SYNTHESIS_MODEL,
+    )
     profile: CareerProfile = llm.invoke(
         [
             ("system", synthesis_prompt.SYSTEM),
@@ -39,4 +48,14 @@ def synthesize(extractions: list[SourceExtraction]) -> CareerProfile:
         ]
     )
     profile.raw_source_map = build_raw_source_map(profile)
+    logger.debug(
+        "synthesize: profile name=%r, %d experiences, %d projects, %d skills, "
+        "%d conflicts",
+        profile.name,
+        len(profile.experiences),
+        len(profile.projects),
+        len(profile.skills),
+        len(profile.conflicts),
+    )
+    logger.debug("synthesize: result:\n%s", profile.model_dump_json(indent=2))
     return profile

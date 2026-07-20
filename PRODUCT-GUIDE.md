@@ -26,6 +26,12 @@ The system extracts structured data from each source, merges duplicates
 - **conflicts**: when sources disagree (e.g. two different start dates), the
   disagreement is surfaced to you — never silently resolved
 
+Each ingest is tagged with a **`run_id`** and keeps a full record of that run:
+the exact files/inputs you provided are archived, alongside a copy of the
+generated profile, so any result can be traced back to what produced it or
+re-examined later. (Your uploaded résumés are retained on disk as part of this —
+see OPERATIONS.md for the retention/privacy details.)
+
 ### 2. Review and edit the profile
 
 Fetch the profile, fix anything (including resolving surfaced conflicts), and

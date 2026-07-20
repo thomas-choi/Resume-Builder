@@ -14,6 +14,7 @@ class SourceDocument(BaseModel):
     source_type: str  # "cv_docx" | "cv_pdf" | "github" | "free_text" | "linkedin"
     raw_text: str
     structured_fields: dict | None = None
+    stored_path: str | None = None  # archived raw file under data/sources/{run_id}/
 
 
 class Experience(BaseModel):

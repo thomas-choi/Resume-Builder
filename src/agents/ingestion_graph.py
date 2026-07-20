@@ -6,10 +6,11 @@ from langgraph.graph import END, START, StateGraph
 
 from src.agents import extraction, synthesis
 from src.models.schemas import CareerProfile, SourceDocument, SourceExtraction
-from src.utils import profile_store
+from src.utils import profile_store, run_store
 
 
 class IngestionState(TypedDict, total=False):
+    run_id: str
     sources: list[SourceDocument]
     extractions: list[SourceExtraction]
     profile: CareerProfile
@@ -36,10 +37,23 @@ def synthesize_profile(state: IngestionState) -> IngestionState:
 
 
 def store_profile(state: IngestionState) -> IngestionState:
-    """Persist the profile as v1 in the versioned JSON store."""
+    """Persist the profile as a new version, and archive an output copy per run.
+
+    The canonical store is the versioned profile store; when a ``run_id`` is
+    present we additionally save ``data/output/{run_id}/output.json`` and link
+    the run's manifest to the produced ``profile_id`` / ``version`` for
+    end-to-end provenance.
+    """
     profile_id, version = profile_store.save_profile(
         state["profile"], state.get("profile_id")
     )
+    run_id = state.get("run_id")
+    if run_id:
+        run_store.save_output(
+            run_id,
+            state["profile"],
+            {"profile_id": profile_id, "version": version},
+        )
     return {"profile_id": profile_id, "version": version}
 
 

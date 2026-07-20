@@ -31,6 +31,15 @@ def test_temperature_omitted_unless_set(monkeypatch):
     assert llm.make_llm("claude-sonnet-5").temperature == 0.3
 
 
+def test_deepseek_disables_thinking(monkeypatch):
+    pytest.importorskip("langchain_deepseek")
+    monkeypatch.setattr(config, "LLM_PROVIDER", "deepseek")
+    monkeypatch.setattr(config, "LLM_API_KEY", "test-key")
+    model = llm.make_llm("deepseek-v4-flash")
+    assert type(model).__name__ == "ChatDeepSeek"
+    assert model.extra_body == {"thinking": {"type": "disabled"}}
+
+
 def test_unsupported_provider_raises(monkeypatch):
     monkeypatch.setattr(config, "LLM_PROVIDER", "mystery")
     with pytest.raises(ValueError, match="Unsupported LLM provider"):
