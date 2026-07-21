@@ -89,6 +89,70 @@ def test_synthesize_populates_source_map_and_keeps_conflicts(monkeypatch):
     assert "Alice Smith" in fake.calls[0][1][1]
 
 
+def test_linkedin_and_cv_disagreement_is_surfaced_not_merged(monkeypatch):
+    # Phase 2: the same job appears in the CV and in the LinkedIn export with
+    # different dates. It must dedupe to one experience *and* keep the
+    # disagreement in `conflicts` — never silently pick a side.
+    merged = CareerProfile(
+        name="Alice Smith",
+        experiences=[
+            Experience(
+                company="Acme Corp",
+                title="Senior Engineer",
+                start_date="2020",
+                bullets=["Built a distributed trading backtester in Python"],
+                source="cv_docx:resume.docx",
+            )
+        ],
+        conflicts=[
+            Conflict(
+                field="experience.start_date",
+                description="Acme Corp start date differs between the CV and LinkedIn",
+                values={
+                    "cv_docx:resume.docx": "2020",
+                    "linkedin:export.zip": "Jan 2021",
+                },
+            )
+        ],
+    )
+    fake = FakeLLM(merged)
+    monkeypatch.setattr(synthesis, "make_llm", lambda model, **kw: fake)
+
+    cv = SourceExtraction(
+        name="Alice Smith",
+        experiences=[
+            Experience(
+                company="Acme Corp",
+                title="Senior Engineer",
+                start_date="2020",
+                bullets=["Built a distributed trading backtester in Python"],
+                source="cv_docx:resume.docx",
+            )
+        ],
+    )
+    linkedin = SourceExtraction(
+        name="Alice Smith",
+        experiences=[
+            Experience(
+                company="Acme Corp",
+                title="Senior Engineer",
+                start_date="Jan 2021",
+                source="linkedin:export.zip",
+            )
+        ],
+    )
+    profile = synthesis.synthesize([cv, linkedin])
+
+    assert len(profile.experiences) == 1
+    (conflict,) = profile.conflicts
+    assert conflict.field == "experience.start_date"
+    assert conflict.values["linkedin:export.zip"] == "Jan 2021"
+    assert conflict.values["cv_docx:resume.docx"] == "2020"
+    # Both extractions, with their distinct source ids, went into the prompt.
+    user_prompt = fake.calls[0][1][1]
+    assert "linkedin:export.zip" in user_prompt and "cv_docx:resume.docx" in user_prompt
+
+
 def _synthesize_capturing(monkeypatch) -> FakeLLM:
     fake = FakeLLM(CareerProfile(name="Alice Smith"))
     monkeypatch.setattr(synthesis, "make_llm", lambda model, **kw: fake)

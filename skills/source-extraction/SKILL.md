@@ -25,6 +25,20 @@ contribution it is (e.g. "contributed N merged pull requests to <project>",
 with the listed PR titles as the achievement), and never describe the project
 itself as the person's own work, no matter how prominent the project is.
 
+## Structured exports (LinkedIn and similar)
+
+Some sources arrive as an official data export the person downloaded
+themselves, and carry a block of structured fields alongside the rendered text.
+Those fields are exported records, not prose: take their values literally and
+prefer them wherever the rendering and the records could be read differently.
+Two record types need care because they are not the person's own claims:
+
+- **Skills** listed on a profile are self-asserted, with no achievement behind
+  them. Extract them as skills; never promote one into an experience bullet.
+- **Recommendations** are written by other people. Extract a recommendation as
+  what it is — someone else's statement — and never restate its praise as an
+  achievement the person claims about themselves.
+
 ## Fact vs. inference
 
 A *fact* is a claim the document states directly (an employer name, a date

@@ -56,6 +56,41 @@ def test_source_extraction_skill_body_in_system_prompt(monkeypatch):
     assert "cv_docx:resume.docx" in system_prompt
 
 
+def test_structured_fields_are_sent_as_authoritative(monkeypatch):
+    # Phase 2: a LinkedIn export carries exported records alongside the
+    # rendered text; the records must reach the model marked as authoritative.
+    fake = FakeLLM(SourceExtraction(name="Alice Smith"))
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    extraction.extract_one(
+        SourceDocument(
+            id="linkedin:export.zip",
+            source_type="linkedin",
+            raw_text="# LinkedIn data export\n\n## Positions\n### Engineer — Acme",
+            structured_fields={"positions": [{"Company Name": "Acme Corp"}]},
+        )
+    )
+
+    system_prompt, user_prompt = fake.calls[0][0][1], fake.calls[0][1][1]
+    assert "STRUCTURED FIELDS (JSON)" in user_prompt
+    assert '"Company Name": "Acme Corp"' in user_prompt
+    assert "prefer them over the rendered text" in user_prompt
+    # The rendered text is still there — the records win, they don't replace it.
+    assert "### Engineer — Acme" in user_prompt
+    # The skill's export reasoning (self-asserted skills, third-party
+    # recommendations) is in the system prompt.
+    assert "Structured exports (LinkedIn and similar)" in system_prompt
+
+
+def test_prose_source_gets_no_structured_block(monkeypatch):
+    fake = FakeLLM(SourceExtraction(name="Alice Smith"))
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    extraction.extract_one(_doc())
+
+    assert "STRUCTURED FIELDS" not in fake.calls[0][1][1]
+
+
 def _github_payload() -> dict:
     """30 repos as the GitHub extractor emits them — 3 with no description."""
     projects = [

@@ -2,8 +2,8 @@
 
 AI – LLM-Powered Personalized Resume Builder
 
-Ingests your career sources (CV `.docx`/`.pdf`, GitHub profile, free text) into one
-canonical **career profile**, then — given any job posting — generates a
+Ingests your career sources (CV `.docx`/`.pdf`, LinkedIn data export, GitHub
+profile, free text) into one canonical **career profile**, then — given any job posting — generates a
 **tailored CV** that emphasizes relevant experience **without fabricating
 anything**. Every generated claim is traced back to a source document; anything
 that can't be traced is flagged for your review instead of silently shipped.
@@ -15,7 +15,7 @@ Two LangGraph pipelines behind a FastAPI service:
 ```mermaid
 flowchart LR
     subgraph Ingestion
-        A[CV / GitHub / free text] --> B[extract per source<br/>Haiku] --> C[synthesize profile<br/>Sonnet] --> D[(versioned JSON store)]
+        A[CV / LinkedIn / GitHub / free text] --> B[extract per source<br/>Haiku] --> C[synthesize profile<br/>Sonnet] --> D[(versioned JSON store)]
     end
     subgraph Tailoring
         D --> E[analyze job post] --> F[tailor CV<br/>no-fabrication rules] --> G[validation gate<br/>source map + similarity + LLM check]
@@ -58,6 +58,7 @@ API UI, or use curl:
 ```bash
 # 1. Build your career profile from any mix of sources
 curl -F "cv=@resume.docx" -F "github_username=your-gh-user" \
+     -F "linkedin_export=@Basic_LinkedInDataExport.zip" \
      -F "free_text=I also mentor junior developers." \
      localhost:8000/ingest
 # -> {"profile_id": "...", "version": 1, "profile": {... "conflicts": [...]}}

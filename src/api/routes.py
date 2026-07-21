@@ -15,6 +15,7 @@ from src.agents.tailoring_graph import build_tailoring_graph
 from src.models.schemas import CareerProfile, SourceDocument
 from src.tools.docx_reader import read_docx
 from src.tools.github_client import fetch_github_profile, free_text_source
+from src.tools.linkedin_export import read_linkedin_export
 from src.tools.pdf_reader import read_pdf
 from src.utils import profile_store, run_store
 from src.utils.logging_setup import set_run_id
@@ -81,6 +82,33 @@ def _load_upload(run_id: str, upload: UploadFile) -> tuple[SourceDocument, dict]
     return doc, run_store.source_entry("cv", stored, data, source_id=doc.id)
 
 
+def _load_linkedin_export(run_id: str, upload: UploadFile) -> tuple[SourceDocument, dict]:
+    """Archive an uploaded LinkedIn data export, then parse it.
+
+    Same order as :func:`_load_upload`: the raw archive is persisted under
+    ``data/sources/{run_id}/linkedin/<original-name>`` *before* parsing, so a
+    rejected export is still on disk to inspect. Parsing is deterministic (no
+    LLM) and never scrapes LinkedIn — the person's own export is the only
+    supported input.
+    """
+    filename = upload.filename or "linkedin-export.zip"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in (".zip", ".csv"):
+        raise HTTPException(
+            400, f"unsupported LinkedIn export file type: {suffix or '(none)'}"
+        )
+    data = upload.file.read()
+    stored = run_store.save_source_file(run_id, "linkedin", filename, data)
+    try:
+        doc = read_linkedin_export(stored)
+    except ValueError as exc:
+        raise HTTPException(400, f"unreadable LinkedIn export: {exc}") from exc
+    # Keep the original filename in the source id, not the stored path.
+    doc.id = f"linkedin:{filename}"
+    doc.stored_path = str(stored)
+    return doc, run_store.source_entry("linkedin", stored, data, source_id=doc.id)
+
+
 @router.get("/healthz")
 def healthz() -> dict:
     return {"status": "ok"}
@@ -89,12 +117,17 @@ def healthz() -> dict:
 @router.post("/ingest")
 async def ingest(
     cv: list[UploadFile] | None = None,
+    linkedin_export: list[UploadFile] | None = None,
     github_username: str | None = Form(default=None),
     free_text: str | None = Form(default=None),
     job_id: str | None = Form(default=None),
     profile_id: str | None = Form(default=None),
 ) -> dict:
     """Run the ingestion graph over the provided sources.
+
+    Sources are CV file(s), LinkedIn data export(s) (the official ZIP the
+    person downloads, or single CSVs from it), a GitHub username, and pasted
+    free text — any combination, at least one.
 
     Pass a client-generated `job_id` and subscribe to
     `GET /ingest/{job_id}/events` before/while POSTing to watch per-node
@@ -117,6 +150,10 @@ async def ingest(
     manifest_entries: list[dict] = []
     for upload in cv or []:
         doc, entry = _load_upload(run_id, upload)
+        sources.append(doc)
+        manifest_entries.append(entry)
+    for upload in linkedin_export or []:
+        doc, entry = _load_linkedin_export(run_id, upload)
         sources.append(doc)
         manifest_entries.append(entry)
     if github_username:
@@ -142,7 +179,10 @@ async def ingest(
             run_store.source_entry("linkedin", ft_path, ft_bytes, source_id=ft_doc.id)
         )
     if not sources:
-        raise HTTPException(400, "provide at least one source (cv, github_username, free_text)")
+        raise HTTPException(
+            400,
+            "provide at least one source (cv, linkedin_export, github_username, free_text)",
+        )
 
     run_store.write_manifest(run_id, manifest_entries)
 

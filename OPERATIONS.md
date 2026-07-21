@@ -188,6 +188,9 @@ Unit tests are the default (`pytest.ini` excludes the `integration` marker).
 ```bash
 curl localhost:8000/healthz
 curl -F "cv=@resume.docx" -F "github_username=<user>" localhost:8000/ingest
+# with a LinkedIn data export (Settings → "Get a copy of your data")
+curl -F "cv=@resume.docx" -F "linkedin_export=@Basic_LinkedInDataExport.zip" \
+  localhost:8000/ingest
 curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
   -d '{"profile_id": "<id from ingest>", "job_post": "<paste job post>"}'
 ```
@@ -198,7 +201,7 @@ inputs + output copy (see [Run tracking & retention](#run-tracking--retention)):
 
 ```bash
 RUN_ID=<run_id from ingest response>
-ls data/sources/$RUN_ID          # cv/, github/github.json, linkedin/linkedin-summary.txt, manifest.json
+ls data/sources/$RUN_ID          # cv/, github/github.json, linkedin/, manifest.json
 cat data/output/$RUN_ID/output.json   # copy of the synthesized profile
 ```
 
@@ -218,6 +221,7 @@ and its inputs/outputs are archived under `DATA_DIR`:
 | `data/sources/{run_id}/cv/<original-name>` | Raw uploaded CV bytes, saved **before** parsing |
 | `data/sources/{run_id}/github/github.json` | Serialized GitHub `SourceDocument` |
 | `data/sources/{run_id}/linkedin/linkedin-summary.txt` | The `free_text` input (LinkedIn summary path) |
+| `data/sources/{run_id}/linkedin/<original-name>` | Uploaded LinkedIn data export (`.zip` / `.csv`), saved **before** parsing |
 | `data/sources/{run_id}/manifest.json` | Index of inputs (category, filename, size, sha256) linked to `profile_id`/`version` |
 | `data/output/{run_id}/output.json` | Copy of the synthesized profile |
 
@@ -232,6 +236,17 @@ and its inputs/outputs are archived under `DATA_DIR`:
   `grep '\[run:<run_id>\]' logs/app.log`.
 - **Disk growth:** sources + output accumulate per run; prune old `run_id`
   directories periodically.
+- **LinkedIn exports (Phase 2) — no setup change.** No new env vars and no new
+  dependencies (`zipfile`/`csv` are stdlib); parsing is offline, so no outbound
+  request and no credential is involved. Operationally the one thing to know is
+  size and sensitivity: an export archive is retained verbatim under
+  `data/sources/{run_id}/linkedin/` and can be tens of MB (it contains far more
+  than the career sections the builder reads), so factor it into disk planning
+  and treat it as PII along with the résumés. A rejected export (400) is
+  archived too, on purpose — it is the artifact you need to diagnose the
+  rejection. Parse decisions are logged at DEBUG
+  (`linkedin[<file>]: parsed sections {...}`, plus one line per ignored
+  archive member).
 - **Partial extractions (Phase 1.e) — no setup change.** No new env vars or
   dependencies. Dropped items and skipped sources are logged at `WARNING`
   (`extract[<source_id>]: dropped projects[11] …`, `extraction failed for

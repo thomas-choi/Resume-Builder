@@ -26,13 +26,16 @@ tagged with a `run_id` that archives the raw inputs under
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `cv` | file(s) | no* | One or more `.docx` / `.pdf` CVs |
+| `linkedin_export` | file(s) | no* | One or more official LinkedIn data exports — the `.zip` from Settings → "Get a copy of your data", or a single `.csv` from it (e.g. `Positions.csv`). Other extensions → 400; an archive with no recognizable section → 400 |
 | `github_username` | text | no* | Public GitHub profile to ingest — owned repos, org/collaborator repos, and contributions to external repos (public data only) |
 | `free_text` | text | no* | Pasted bio/notes passthrough (also the LinkedIn-summary path) |
 | `job_id` | text | no | Client-generated id for SSE progress; subscribe to `GET /ingest/{job_id}/events` before POSTing. Server generates one if omitted. Doubles as the `run_id`. |
 | `profile_id` | text | no | Target profile for the result. **Existing id** → a new version is appended; **new id** → created at v1. Must be 1–64 chars of `[A-Za-z0-9_-]` (else 400). Omitted → the server mints a fresh id. Distinct from `run_id` (which is one execution). |
 
-*At least one of `cv`, `github_username`, `free_text` is required (else 400).
-Unsupported CV extensions → 400. An invalid `profile_id` → 400. Graph failure → 500.
+*At least one of `cv`, `linkedin_export`, `github_username`, `free_text` is
+required (else 400). Unsupported CV or LinkedIn-export extensions → 400; an
+unreadable LinkedIn export (corrupt ZIP, or no recognized section) → 400. An
+invalid `profile_id` → 400. Graph failure → 500.
 
 **Response 200:**
 
@@ -47,8 +50,17 @@ Unsupported CV extensions → 400. An invalid `profile_id` → 400. Graph failur
 ```
 
 `run_id` equals `job_id`. Its archive lives at `data/sources/{run_id}/`
-(raw CV under `cv/`, `github/github.json`, `linkedin/linkedin-summary.txt`,
-plus `manifest.json`) and `data/output/{run_id}/output.json`.
+(raw CV under `cv/`, `github/github.json`, `linkedin/` holding the uploaded
+export archive and/or `linkedin-summary.txt`, plus `manifest.json`) and
+`data/output/{run_id}/output.json`.
+
+**Example — CV + LinkedIn export in one call:**
+
+```bash
+curl -F "cv=@resume.docx" \
+     -F "linkedin_export=@Basic_LinkedInDataExport.zip" \
+     localhost:8000/ingest
+```
 
 ## GET /ingest/{job_id}/events
 
@@ -123,8 +135,13 @@ dropped or auto-approved in Phase 1.
 > field — the endpoint still accepts no caller-supplied credential, so it can
 > only ever reach private data belonging to the configured token's own account.
 
+> **Phase 2 (2026-07-21) — one new request field.** `POST /ingest` accepts
+> `linkedin_export` file uploads (see the request table above). No other
+> endpoint changes: the LinkedIn export becomes an ordinary `SourceDocument`
+> inside the same ingestion graph, so the response shape, the SSE events, and
+> `/tailor` are untouched.
+
 ## Planned (later phases)
 
-- Phase 2: `POST /ingest` accepts a `linkedin_export` ZIP upload.
 - Phase 3: `POST /tailor` gains `render`/`cover_letter` flags; `GET /document/{tailor_id}`.
 - Phase 4: `GET /tailor/{id}/review`, `POST /tailor/{id}/resume` (server-side human-in-the-loop).

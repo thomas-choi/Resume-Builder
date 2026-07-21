@@ -9,7 +9,7 @@ from src.api import routes
 from src.api.main import create_app
 from src.models.schemas import JobRequirements, TailoredCV, ValidationResult
 from src.utils import profile_store
-from tests.conftest import build_sample_docx
+from tests.conftest import build_linkedin_export_zip, build_sample_docx
 
 
 @pytest.fixture
@@ -121,6 +121,64 @@ def test_ingest_archives_github_and_free_text_sources(
     manifest = json.loads((run_dir / "manifest.json").read_text())
     categories = {e["category"] for e in manifest["sources"]}
     assert categories == {"github", "linkedin"}
+
+
+def test_ingest_linkedin_export_zip(client, data_dir, monkeypatch, sample_profile):
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    fake = FakeIngestionGraph(final_state)
+    monkeypatch.setattr(routes, "build_ingestion_graph", lambda: fake)
+
+    resp = client.post(
+        "/ingest",
+        files=[
+            (
+                "linkedin_export",
+                (
+                    "Basic_LinkedInDataExport.zip",
+                    build_linkedin_export_zip(),
+                    "application/zip",
+                ),
+            )
+        ],
+        data={"job_id": "job-li"},
+    )
+    assert resp.status_code == 200
+
+    # The export reached the graph as a parsed linkedin source...
+    (source,) = fake.received_state["sources"]
+    assert source.source_type == "linkedin"
+    assert source.id == "linkedin:Basic_LinkedInDataExport.zip"
+    assert source.structured_fields["profile"]["Headline"] == "Senior Engineer"
+
+    # ...and the raw archive is archived under the run and indexed.
+    stored = data_dir / "sources" / "job-li" / "linkedin" / "Basic_LinkedInDataExport.zip"
+    assert stored.exists()
+    assert source.stored_path == str(stored)
+    manifest = json.loads((data_dir / "sources" / "job-li" / "manifest.json").read_text())
+    entry = manifest["sources"][0]
+    assert entry["category"] == "linkedin"
+    assert entry["source_id"] == "linkedin:Basic_LinkedInDataExport.zip"
+
+
+def test_ingest_rejects_unknown_linkedin_file_type(client):
+    resp = client.post(
+        "/ingest",
+        files=[("linkedin_export", ("profile.txt", b"hi", "text/plain"))],
+    )
+    assert resp.status_code == 400
+    assert "unsupported LinkedIn export file type" in resp.json()["detail"]
+
+
+def test_ingest_rejects_unreadable_linkedin_export(client, data_dir):
+    resp = client.post(
+        "/ingest",
+        files=[("linkedin_export", ("export.zip", b"not a zip", "application/zip"))],
+        data={"job_id": "job-bad"},
+    )
+    assert resp.status_code == 400
+    assert "unreadable LinkedIn export" in resp.json()["detail"]
+    # The rejected upload is still on disk to inspect (archived before parsing).
+    assert (data_dir / "sources" / "job-bad" / "linkedin" / "export.zip").exists()
 
 
 def test_ingest_without_sources_is_400(client):

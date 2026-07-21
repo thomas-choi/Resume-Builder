@@ -570,13 +570,31 @@ default-branch commits under a matching account email only).
 66 candidates (was 2); 18 private repos included; external section legitimately
 empty for this user.
 
-## Phase 2 — LinkedIn export ingestion (design doc §12 step 5)
+## Phase 2 — LinkedIn export ingestion (design doc §12 step 5) — **implemented 2026-07-21**
 
 1. `src/tools/linkedin_export.py` — accept the official LinkedIn data-export ZIP (or individual CSVs): parse Positions, Education, Skills, Certifications, Recommendations into `SourceDocument`s with `structured_fields`. **No scraping** (ToS), exactly per design doc §3.
 2. Extend `POST /ingest` to accept a `linkedin_export` ZIP upload; register the source in the ingestion graph (extraction prompt gains a LinkedIn variant that trusts `structured_fields` over raw text).
 3. Synthesis already handles multi-source dedupe/conflicts — extend unit tests to cover LinkedIn-vs-CV conflicts (same job, different dates → appears in `conflicts`).
 
 **Tests:** `tests/unit/test_linkedin_export.py` (fixture ZIP/CSVs), extended `test_synthesis.py` conflict cases, extended `test_api.py` upload case.
+
+**As implemented:** one `SourceDocument` per upload (`source_type="linkedin"`,
+`id="linkedin:<filename>"`) carrying the exported rows in `structured_fields`
+*and* a deterministic Markdown rendering in `raw_text`; both are sent to the
+extractor, with the records declared authoritative via a `{structured}` slot
+that stays empty for prose sources (so their prompt is byte-identical to
+Phase 1 — no graph branch was needed). Two real-export quirks the design had
+not anticipated: section files are matched on a **normalized** stem
+(`Recommendations_Received.csv` ≡ `Recommendations Received.csv`), and the
+header row is **located by its columns**, because LinkedIn prefixes several
+CSVs with a free-text `Notes:` preamble. An export with no recognized section,
+a corrupt ZIP, or a non-`.zip`/`.csv` upload → **400**, after the raw upload is
+archived under `data/sources/{run_id}/linkedin/` (archive-before-parse, as for
+CVs). `skills/source-extraction/SKILL.md` gained the two attribution rules the
+export makes necessary: profile skills are self-asserted (never promoted into
+achievements) and recommendations are third-party statements (never restated as
+the person's own claims). No new env vars, no new dependencies. Suite: 128
+unit tests green.
 
 ## Phase 3 — Document Agent: rendering + cover letter (design doc §9, §1)
 

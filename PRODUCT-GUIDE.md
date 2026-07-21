@@ -3,17 +3,20 @@
 ## What this is
 
 An AI-powered personalized resume builder. It ingests your career sources
-(CV files, GitHub, free text) into one canonical **career profile**, then —
+(CV files, LinkedIn data export, GitHub, free text) into one canonical
+**career profile**, then —
 given any job posting — generates a **tailored CV** that emphasizes relevant
 experience **without fabricating anything**.
 
-## Business flows (Phase 1)
+## Business flows (Phases 1–2)
 
 ### 1. Build your career profile
 
 Provide any combination of:
 
 - **CV file(s)** — `.docx` or `.pdf`
+- **LinkedIn data export** — the ZIP you download from LinkedIn (Settings →
+  "Get a copy of your data"), or a single CSV from it
 - **GitHub username** — your own public repos (languages + README excerpts),
   the repos of organizations you belong to or collaborate on, **and** your
   contributions to other people's open-source projects
@@ -60,6 +63,23 @@ Two things follow from how GitHub itself works:
   can't write achievements out of someone else's project you merely had access
   to.
 
+**What LinkedIn contributes to your profile.** Ask LinkedIn for a copy of your
+data and upload the archive as-is; the builder reads your positions, education,
+skills, certifications and the recommendations you received. Nothing is scraped
+— LinkedIn's terms forbid it, and there is no read API for personal apps, so
+your own export is the only way in, and it works whether your profile is public
+or not. Because the export is *records* rather than prose, those fields are
+taken literally: dates, employers and titles come across exactly as LinkedIn
+holds them. Two things are deliberately kept in their place — the skills on
+your profile are treated as skills you claim, never converted into
+achievements, and a recommendation stays a quote from the person who wrote it,
+never re-told as something you say about yourself.
+
+This is also where **conflicts** earn their keep: when your CV and your LinkedIn
+profile disagree about the same job — a start date a year apart, a slightly
+different title — the two entries merge into one, and the disagreement is
+listed for you to settle. The system never picks a side on its own.
+
 Ingestion is **partial-failure tolerant**: if one item in a source can't be
 read cleanly — a GitHub repo with no description, a garbled résumé entry — that
 item alone is skipped and logged, and everything else still lands in your
@@ -96,11 +116,11 @@ Paste a job posting. The system:
 - Keyword mirroring is limited to what your profile evidences.
 - Flagged claims are surfaced, not auto-approved — you are the final gate.
 
-## Current limitations (Phase 1)
+## Current limitations (Phases 1–2)
 
 | Limitation | Planned fix |
 |---|---|
-| No LinkedIn ingestion (official data-export ZIP) | Phase 2 |
+| LinkedIn comes from your own data export — there is no "connect my LinkedIn" login | By design (LinkedIn's terms forbid scraping; no personal-app read API) |
 | Output is structured JSON only — no .docx/PDF rendering, no cover letter | Phase 3 |
 | Review of flags happens client-side (API consumer's responsibility) | Phase 4 server-side human-in-the-loop |
 | No web UI — API only | Phase 4 (React three-panel flow) |

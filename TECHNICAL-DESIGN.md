@@ -59,7 +59,7 @@ Each source gets its own thin ingestion node that normalizes raw input into text
 
 | Source | Method | Notes |
 |---|---|---|
-| **LinkedIn** | User-provided **data export** (Settings → "Get a copy of your data") or manual paste of profile text | LinkedIn's ToS blocks scraping and there's no public profile-read API for personal apps — don't build a scraper. The official export gives you Positions, Education, Skills, Certifications, Recommendations as CSV/JSON. |
+| **LinkedIn** | User-provided **data export** (Settings → "Get a copy of your data") or manual paste of profile text | LinkedIn's ToS blocks scraping and there's no public profile-read API for personal apps — don't build a scraper. The official export gives you Positions, Education, Skills, Certifications, Recommendations as CSV/JSON. Implemented in Phase 2 (`src/tools/linkedin_export.py`) — see below. |
 | **GitHub** | GitHub REST/GraphQL API (`api.github.com`) — repos, README content, languages, commit stats, pinned repos | You already have `api.github.com` in your allowed domains. Pull repo descriptions + top languages + README excerpts, not full source — keep token cost down. Coverage spans owned, organization, and contributed-to repos — see below. |
 | **CV (docx)** | `python-docx` / your docx skill's read path | Extract text preserving section structure (headers as section boundaries). |
 | **CV (PDF)** | `pdfplumber` or the pdf-reading skill | Watch for two-column CVs — plain text extraction can interleave columns; consider layout-aware extraction or page rasterization + vision fallback for complex layouts. |
@@ -158,6 +158,51 @@ but **each organization keeps at least one repo before recency fills the rest** 
 a straight recency sort dropped two 2021-era employers entirely, and a resume
 needs the breadth of employers more than a fifth repo from the current one.
 
+### LinkedIn data-export ingestion (Phase 2, 2026-07-21)
+
+`src/tools/linkedin_export.py` parses the archive the person downloads from
+LinkedIn themselves (or individual CSVs from it). Deterministic, offline, and
+**no scraping** — there is no network call in this module at all, which is the
+design constraint above expressed as code.
+
+One upload → one `SourceDocument` (`source_type="linkedin"`,
+`id="linkedin:<filename>"`) carrying both representations of the same data:
+
+| Field | Contents | Consumer |
+|---|---|---|
+| `structured_fields` | Exported rows verbatim, grouped into `profile`, `positions`, `education`, `skills`, `certifications`, `recommendations_received` | The extraction prompt, as **authoritative records** |
+| `raw_text` | Deterministic Markdown rendering of the same sections | The extraction prompt as readable context; also what a human sees in the archive |
+
+Both are sent. The records are what the model must follow; the rendering keeps
+a LinkedIn source shaped like every other source in the pipeline (and readable
+in `data/sources/{run_id}/`). The duplication costs tokens on a large export
+and is accepted for that reason.
+
+Two properties of the real export drive the parser:
+
+- **File names drift between export versions** (`Recommendations_Received.csv`
+  vs `Recommendations Received.csv`), so a section is matched on a *normalized*
+  stem (lowercased, non-alphanumerics collapsed), not an exact filename.
+  Unrecognized members (ads, messages, connections) are skipped with a DEBUG
+  log rather than guessed at.
+- **Several CSVs open with a free-text `Notes:` preamble** before the header
+  row, so the header is located by its columns (`Company Name`/`Title` for
+  positions, etc.) instead of being assumed to be line 1. Blank cells are
+  dropped rather than stored as `""`, so an absent field stays absent — the
+  same contract §4's nullable-field rules enforce downstream.
+
+An export with no recognizable section raises `ValueError` → HTTP 400, rather
+than ingesting an empty source. The upload is archived *before* parsing (as CVs
+are), so even a rejected export is on disk to inspect.
+
+**Attribution.** Two exported record types are not the person's own claims and
+are labelled as such in the rendering and in `skills/source-extraction/SKILL.md`:
+profile **skills** are self-asserted (a skill, never an achievement), and
+**recommendations** are written by other people (rendered under
+"Recommendations received (written by other people)" with the author named).
+This is the same anti-fabrication discipline the GitHub tier labelling above
+exists to enforce.
+
 ---
 
 ## 4. Stage 2 — Extraction Agent (LLM)
@@ -201,6 +246,17 @@ class CareerProfile(BaseModel):
 ```
 
 Key design choice: **every field keeps a `source` pointer.** This is what makes stage 3's anti-fabrication check possible — you can always trace a bullet back to a real document.
+
+### Structured-source prompt variant (Phase 2, 2026-07-21)
+
+Most sources are prose (a CV, a README, pasted notes) and the model has to read
+them. A LinkedIn data export is not: it is rows the person exported. So
+`extraction_prompt` gained a `{structured}` slot, filled by
+`extraction._structured_block` only when `SourceDocument.structured_fields` is
+present, that hands the model the records as JSON and states they are
+authoritative over the rendered text below them. Prose sources get an empty
+block, so their prompt is byte-for-byte what it was before — one prompt module,
+one node, no LinkedIn-specific branch in the graph.
 
 ### Nullable-field contract (Phase 1.e, 2026-07-21)
 
@@ -396,9 +452,11 @@ indexing them (category, filename, size, sha256). This ties raw inputs → produ
 output, which neither `job_id` (SSE only) nor `profile_id` (storage key) did
 before. A `contextvars`-based `run_id` (`src/utils/logging_setup.py`) tags every
 node's log line `[run:<run_id>]` for cross-step tracing, and
-`SourceDocument.stored_path` links a source back to its archived file. LinkedIn is
-mapped through the existing `free_text` path (no dedicated LinkedIn ingestion —
-that remains §12 Phase 2).
+`SourceDocument.stored_path` links a source back to its archived file. Phase 2
+added the dedicated LinkedIn path: an uploaded data export is archived under the
+same `linkedin/` category (as `<original-name>.zip`, alongside the pasted
+`linkedin-summary.txt` the `free_text` field still produces) and parsed by
+`src/tools/linkedin_export.py`.
 
 ### Tailoring graph (`src/agents/tailoring_graph.py`)
 
@@ -487,6 +545,7 @@ data/
 │   ├── cv/<original-name>        # raw uploaded CV bytes (saved before parsing)
 │   ├── github/github.json        # serialized GitHub SourceDocument
 │   ├── linkedin/linkedin-summary.txt  # the free_text / LinkedIn-summary input
+│   ├── linkedin/<export-name>.zip     # uploaded LinkedIn data export (Phase 2)
 │   └── manifest.json             # index (category, filename, size, sha256) + profile_id/version
 └── output/{run_id}/output.json   # copy of the synthesized profile for the run
 ```

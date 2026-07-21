@@ -113,6 +113,57 @@ def build_minimal_pdf(lines: list[str]) -> bytes:
     return bytes(out)
 
 
+LINKEDIN_CSVS: dict[str, str] = {
+    "Profile.csv": (
+        "First Name,Last Name,Headline,Summary,Geo Location\r\n"
+        "Alice,Smith,Senior Engineer,Backend and data engineering.,London\r\n"
+    ),
+    # LinkedIn prefixes several export files with a free-text note before the
+    # header row — the parser must skip it rather than assume line 1.
+    "Positions.csv": (
+        'Notes:\r\n'
+        '"This file contains your positions."\r\n'
+        "\r\n"
+        "Company Name,Title,Description,Location,Started On,Finished On\r\n"
+        "Acme Corp,Senior Engineer,Built a distributed trading backtester in "
+        "Python,London,Jan 2021,\r\n"
+        "Globex,Engineer,Maintained the billing service,Leeds,Mar 2018,Dec 2020\r\n"
+    ),
+    "Education.csv": (
+        "School Name,Start Date,End Date,Notes,Degree Name,Activities\r\n"
+        "University of Leeds,2014,2018,,BSc Computer Science,Robotics society\r\n"
+    ),
+    "Skills.csv": "Name\r\nPython\r\nPostgreSQL\r\n",
+    "Certifications.csv": (
+        "Name,Url,Authority,Started On,Finished On,License Number\r\n"
+        "AWS Solutions Architect,,Amazon Web Services,Feb 2022,,ABC-123\r\n"
+    ),
+    "Recommendations_Received.csv": (
+        "First Name,Last Name,Company,Job Title,Text,Creation Date,Status\r\n"
+        "Bob,Jones,Acme Corp,CTO,Alice rebuilt our data pipeline end to end.,"
+        "2022-01-05,VISIBLE\r\n"
+    ),
+}
+
+
+def build_linkedin_export_zip(members: dict[str, str] | None = None) -> bytes:
+    """Build an official-shaped LinkedIn data-export ZIP for tests."""
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as archive:
+        for name, text in (members or LINKEDIN_CSVS).items():
+            archive.writestr(name, text)
+    return buf.getvalue()
+
+
+@pytest.fixture
+def sample_linkedin_zip(tmp_path):
+    path = tmp_path / "Basic_LinkedInDataExport.zip"
+    path.write_bytes(build_linkedin_export_zip())
+    return path
+
+
 @pytest.fixture
 def sample_docx(tmp_path):
     path = tmp_path / "resume.docx"

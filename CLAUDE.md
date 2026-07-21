@@ -37,7 +37,7 @@ se | Implementation Detail | Related Files | Test Coverage |`
 
 ## Project status
 
-Phase 1 (core pipeline + FastAPI + Docker) is implemented — see `PLAN.md` for the phase roadmap and `TECHNICAL-DESIGN.md` §13 for implementation notes. The system is an **AI/LLM-powered personalized resume builder**: two LangGraph `StateGraph`s (ingestion and tailoring) behind a FastAPI service, with an anti-fabrication validation gate and a versioned JSON profile store.
+Phase 1 (core pipeline + FastAPI + Docker) and Phase 2 (LinkedIn data-export ingestion) are implemented — see `PLAN.md` for the phase roadmap and `TECHNICAL-DESIGN.md` §13 for implementation notes. The system is an **AI/LLM-powered personalized resume builder**: two LangGraph `StateGraph`s (ingestion and tailoring) behind a FastAPI service, with an anti-fabrication validation gate and a versioned JSON profile store.
 
 ## Commands
 

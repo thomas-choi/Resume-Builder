@@ -1,5 +1,6 @@
 """extract_source node — per-source structured extraction (Haiku)."""
 
+import json
 import logging
 from typing import Any
 
@@ -68,6 +69,7 @@ def extract_one(source: SourceDocument) -> SourceExtraction:
                 extraction_prompt.USER.format(
                     source_type=source.source_type,
                     source_id=source.id,
+                    structured=_structured_block(source),
                     raw_text=source.raw_text,
                 ),
             ),
@@ -92,6 +94,24 @@ def extract_one(source: SourceDocument) -> SourceExtraction:
         "extract[%s]: result:\n%s", source.id, extraction.model_dump_json(indent=2)
     )
     return extraction
+
+
+def _structured_block(source: SourceDocument) -> str:
+    """Render the authoritative-records block for a source that carries one.
+
+    Sources parsed from an official data export (Phase 2: LinkedIn) hand the
+    model exported records rather than prose; those beat the flattened text
+    rendering. Prose sources (CVs, GitHub, free text) get an empty block, so
+    their prompt is byte-for-byte what it was before.
+    """
+    if not source.structured_fields:
+        return ""
+    return extraction_prompt.STRUCTURED.format(
+        source_type=source.source_type,
+        structured_fields=json.dumps(
+            source.structured_fields, indent=2, ensure_ascii=False
+        ),
+    )
 
 
 def _parse_response(response: Any, source_id: str) -> SourceExtraction:
