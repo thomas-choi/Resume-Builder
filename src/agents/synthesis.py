@@ -10,6 +10,7 @@ import logging
 
 from src import config
 from src.agents.llm import make_llm
+from src.agents.skills import resolve_skill
 from src.chains.prompts import synthesis_prompt
 from src.models.schemas import CareerProfile, SourceExtraction
 
@@ -17,15 +18,23 @@ logger = logging.getLogger(__name__)
 
 
 def build_raw_source_map(profile: CareerProfile) -> dict[str, str]:
-    """Map every claim (bullet, project description, skill) to its source id."""
+    """Map every claim (bullet, project description, skill) to its source id.
+
+    Empty claims are skipped: description-less projects (common for GitHub
+    repos) would otherwise all collide on a single ``""`` key and inject a
+    meaningless entry into the map the validation gate reads.
+    """
     source_map: dict[str, str] = {}
     for exp in profile.experiences:
         for bullet in exp.bullets:
-            source_map[bullet] = exp.source
+            if bullet:
+                source_map[bullet] = exp.source
     for proj in profile.projects:
-        source_map[proj.description] = proj.source
+        if proj.description:
+            source_map[proj.description] = proj.source
     for skill in profile.skills:
-        source_map[skill.name] = "skills"
+        if skill.name:
+            source_map[skill.name] = "skills"
     return source_map
 
 
@@ -43,7 +52,7 @@ def synthesize(extractions: list[SourceExtraction]) -> CareerProfile:
     )
     profile: CareerProfile = llm.invoke(
         [
-            ("system", synthesis_prompt.SYSTEM),
+            ("system", synthesis_prompt.SYSTEM.format(skill=resolve_skill("profile-synthesis"))),
             ("user", synthesis_prompt.USER.format(extractions_json=extractions_json)),
         ]
     )

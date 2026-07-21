@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from src import config
 from src.agents.llm import make_llm
+from src.agents.skills import resolve_skill
 from src.chains.prompts import validation_prompt
 from src.models.schemas import (
     CareerProfile,
@@ -44,7 +45,7 @@ def _llm_check(profile: CareerProfile, claim: str) -> _ClaimCheck:
     llm = make_llm(config.VALIDATION_MODEL).with_structured_output(_ClaimCheck)
     return llm.invoke(
         [
-            ("system", validation_prompt.SYSTEM),
+            ("system", validation_prompt.SYSTEM.format(skill=resolve_skill("anti-fabrication"))),
             (
                 "user",
                 validation_prompt.USER.format(

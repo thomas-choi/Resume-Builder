@@ -1,14 +1,10 @@
-"""Prompt for the LLM validation cross-check on low-similarity claims."""
+"""Prompt scaffolding for the LLM validation cross-check on low-similarity claims.
 
-SYSTEM = """You are a strict fact-checker for tailored CVs. Given a claim from a
-tailored CV and the canonical career profile, decide whether the claim is
-fully supported by the profile.
+The fact-checking reasoning lives in the ``anti-fabrication`` SKILL.md, resolved
+into the ``{skill}`` slot by the node.
+"""
 
-A claim is supported only if every factual element (employer, technology,
-metric, scope, achievement) appears in or is directly entailed by the
-profile. Reworded but factually identical claims are supported. Claims
-adding technologies, metrics, or scope not in the profile are NOT
-supported."""
+SYSTEM = "{skill}"
 
 USER = """CAREER PROFILE (JSON):
 {profile_json}

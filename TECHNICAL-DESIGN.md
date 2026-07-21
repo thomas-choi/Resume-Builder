@@ -111,6 +111,55 @@ class CareerProfile(BaseModel):
 
 Key design choice: **every field keeps a `source` pointer.** This is what makes stage 3's anti-fabrication check possible — you can always trace a bullet back to a real document.
 
+### Nullable-field contract (Phase 1.e, 2026-07-21)
+
+The anti-fabrication skill instructs the model to *leave an absent field empty
+rather than invent a value*, so `null` is a **correct** extractor output, not an
+error. The schema is therefore what yields: extraction-facing fields carry a
+`mode="before"` validator (`NullableStr` → `""`, `NullableList` → `[]`, in
+`src/models/schemas.py`) so a `null` coerces instead of rejecting the whole
+payload.
+
+| Model | Null-tolerant fields |
+|---|---|
+| `Experience` | `company`, `title`, `source`, `bullets` |
+| `Project` | `name`, `description` (also defaults to `""`), `source`, `technologies` |
+| `Skill` | `name`, `category` |
+| `JobRequirements` | `required_skills`, `preferred_skills`, `responsibilities`, `keywords_for_ats` |
+
+Models that are **not** LLM-extraction targets — `TailoredCV`, `ValidationFlag`,
+`ValidationResult`, `CoverLetter` — stay strict: a `null` there is a real bug and
+must still raise. `SKILL.md` is deliberately unchanged.
+
+Ripple: `synthesis.build_raw_source_map` skips falsy claims, because once
+descriptions can be `""` every description-less project would otherwise collide
+on a single `""` key in the map the validation gate reads.
+
+### Two-tier extraction resilience (Phase 1.e)
+
+One `github_username` yields exactly **one** `SourceDocument` holding all repos,
+so resilience at the source level cannot save individual repos. Two tiers:
+
+1. **Item-level salvage** (`extract_one`, the primary net). The strict
+   `SourceExtraction` remains the tool schema handed to the model — it is what
+   steers the output — but the call uses `with_structured_output(...,
+   include_raw=True)`, which *surfaces* a `ValidationError` in
+   `{"parsed", "raw", "parsing_error"}` instead of raising. On the failure path
+   the extraction is rebuilt from `raw.tool_calls[0]["args"]` field by field,
+   validating `experiences`/`projects`/`skills` **one element at a time** and
+   dropping only the failures (logged at WARNING with list index, `name`, and
+   the pydantic message). If salvage recovers nothing usable — no tool call,
+   unparseable args, or every item rejected — the original error is **re-raised**:
+   a silently empty profile is worse than a 500.
+2. **Source-level net** (`extract_source`, coarse last resort). A hard failure
+   on one source (provider error, no parseable response at all) is logged and
+   skipped so the surviving sources still produce a profile; if *every* source
+   fails, the error is raised. This does not save individual repos — losing a
+   source here still loses that whole document.
+
+With the nullable-field contract in place tier 1 should rarely fire; it is
+defense-in-depth for the next malformed field, not the primary remedy.
+
 ---
 
 ## 5. Stage 3 — Synthesis Agent (LLM)
@@ -234,7 +283,9 @@ flowchart LR
 - `extract_source` — one Haiku call per `SourceDocument` →
   `SourceExtraction`; the `source` field of every extracted
   experience/project is **overwritten in code** with the document id, so
-  traceability never depends on the model.
+  traceability never depends on the model. Partial failures are salvaged
+  item-by-item and a dead source is skipped rather than failing the run —
+  see §4 "Two-tier extraction resilience".
 - `synthesize_profile` — one Sonnet call merges extractions into a
   `CareerProfile`; dedupe + conflict surfacing happen in the prompt, but
   `raw_source_map` is built **deterministically** from the merged entries'
@@ -295,6 +346,42 @@ and `max_tokens` remain per-call arguments because models are tiered per
 pipeline stage. Temperature is only passed when explicitly configured, since
 current Claude models reject non-default sampling parameters.
 
+### Agent skills (`SKILL.md`, Phase 1.b, 2026-07-20)
+
+Each agent's hand-tuned reasoning (extraction fact/inference rules, synthesis
+dedupe/conflict strategy, job-analysis decomposition, tailoring HARD RULES,
+anti-fabrication cross-check) lives in a versioned **skill** under `skills/`
+rather than a hardcoded prompt string, reusing FUND's skills mechanism verbatim
+(`fund_models/skills.py`, consumed via `scan_skills`). Skills hold *reasoning*
+(strategies, heuristics), never actions.
+
+```
+skills/
+├── source-extraction/SKILL.md   # extraction
+├── profile-synthesis/SKILL.md   # synthesis
+├── job-analysis/SKILL.md        # job_analysis
+├── cv-tailoring/SKILL.md        # tailoring (HARD RULES)
+└── anti-fabrication/SKILL.md    # validation (also composed into tailoring)
+```
+
+Each `SKILL.md` is YAML frontmatter (`name`, `description`) + a Markdown body.
+`src/agents/skills.py` is a thin adapter over `fund_models.skills`:
+`resolve_skill(name)` returns a body with frontmatter stripped (cached per
+`SKILLS_DIR`); `skills_catalog()` returns the frontmatter-only summary
+(`AgentBase.get_skills_context` format) for discovery.
+
+Because the Phase 1 nodes are single-shot `with_structured_output` calls (not
+tool-calling loops), skills are resolved **deterministically by node**: each
+`src/chains/prompts/*_prompt.py` module keeps only structural scaffolding (a
+`{skill}` slot + the `USER` template), and the node prepends
+`resolve_skill("<node-skill>")` into that slot. The tailoring prompt composes
+two skills (`cv-tailoring` + `anti-fabrication`). Resolution degrades
+gracefully: a missing/empty `SKILLS_DIR` yields an empty body, so a node falls
+back to its scaffolding and still runs — which is why the migration is
+behavior-preserving (the skill body is the prior prompt text verbatim). FUND's
+runtime `load_skill` tool and `AgentBase` are **not** used here; adopting them
+for a genuinely tool-calling node is deferred to Phase 4 (§10/§11).
+
 ### Storage schema
 
 Versioned JSON files (single-user; no Postgres):
@@ -317,6 +404,50 @@ data/
 `output/`. `run_id` = one ingest execution; `profile_id` = an evolving profile
 that may span runs. Raw CVs are **retained** here (previously deleted after
 parsing) — see OPERATIONS.md for the retention/privacy note.
+
+### Merge flow (planned — Phase 1.d)
+
+> Design only; not yet implemented. Recorded here so the roadmap and the
+> component design stay in one place (see PLAN.md → Phase 1.d).
+
+Ingestion is last-write-wins: `synthesize_profile` only ever sees the current
+run's extractions, so re-ingesting into the same `profile_id` (Phase 1.c) never
+unions with prior runs. The **merge** flow combines the synthesized snapshots two
+or more prior runs already wrote (`data/output/{run_id}/output.json`) into one
+new profile version — no CV re-parse, no per-source Haiku re-extraction.
+
+```mermaid
+flowchart LR
+    START --> load_run_outputs --> merge_profiles --> store_profile --> END
+```
+
+- `load_run_outputs` — deterministic; a new `run_store.load_output(run_id)`
+  (mirroring `save_output`) loads each requested run's `output.json` into a
+  `CareerProfile`. Missing snapshot → 404.
+- `merge_profiles` — **reuses synthesis**: one `SYNTHESIS_MODEL` call with the
+  `profile-synthesis` skill and structured output `CareerProfile`, over a merge
+  variant of the synthesis USER prompt that frames the inputs as
+  already-synthesized profiles rather than per-source extractions. It dedupes
+  entries describing the same job/project across profiles and **surfaces** cross-
+  profile disagreements into `conflicts` (unioning each input's existing
+  conflicts) — never silently resolving them, exactly as first-pass synthesis
+  does. `raw_source_map` is rebuilt deterministically via
+  `synthesis.build_raw_source_map`; every entry keeps its original `source`, so
+  claim→source traceability is preserved across the merge. A purely deterministic
+  list-union is rejected — it would duplicate the same job across sources and drop
+  conflict surfacing, the core anti-fabrication guarantee.
+- `store_profile` — reused from ingestion. The merge is assigned its own fresh
+  `run_id`; the merged profile is stored as a new version of the target
+  `profile_id` (`profile_store.save_profile`) and copied to
+  `data/output/{run_new}/output.json` (`run_store.save_output`). The merge run's
+  `manifest.json` records `merged_from: [run_ids]` (a new optional field on
+  `write_manifest`) instead of raw source files, and links to the produced
+  `profile_id`/`version`. This keeps `run_id` = one execution (here, one merge)
+  and `profile_id` = the evolving profile, consistent with the rest of §13.
+
+Exposed as `POST /merge` (`{run_ids: [...], profile_id?: ...}`) — a dedicated
+endpoint rather than an `/ingest` mode, since a merge takes no file upload and its
+inputs are prior runs referenced by id.
 
 ### API / SSE
 

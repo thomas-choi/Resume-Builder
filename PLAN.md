@@ -129,6 +129,306 @@ progress) nor `profile_id` (storage key) tied raw inputs to the produced output.
 extended `test_graphs.py` (`store_profile` writes `output/{run_id}/output.json`); extended
 `test_logging_setup.py` (`[run:...]` tag).
 
+#### Phase 1.b — Enhance agents to use `SKILL.md` (FUND skills mechanism)
+
+An enhancement to Phase 1 that moves each agent's hand-tuned reasoning guidance
+(tailoring heuristics, anti-fabrication rules, synthesis dedupe/conflict strategy)
+out of hardcoded prompt strings and into versioned, discoverable **skills** —
+reusing FUND's skill machinery verbatim, the same way `src/agents/llm.py` and
+`src/config.py` already mirror `AgentConfig`/`get_llm`. Skills hold *reasoning*
+(strategies, heuristics, guidelines) — never actions — matching the contract in
+`fund_models/skills.py`'s `load_skill_from_fs` docstring.
+
+- **Reuse `fund_models/skills.py` unchanged** — vendor it (already present, untracked)
+  as a package: add `fund_models/__init__.py`, make it importable (installed/`PYTHONPATH`),
+  and pin `pyyaml` in `requirements.txt` (imported by `skills.py`). No edits to the file —
+  Phase 1.b consumes only `scan_skills()`. `fund_models/agent_base.py` is **out of scope
+  here**: this repo's agents are LangGraph node functions calling module-level `make_llm`
+  (`src/agents/llm.py` already mirrors `AgentBase.get_llm`), not `AgentBase` subclasses, so
+  nothing in Phase 1 instantiates `AgentBase`. Adopting the `AgentBase` class (and with it
+  `_load_skills`/`get_skills_context`/`register_tool` + the runtime `make_load_skill_tool`
+  tool) is deferred to Phase 4, where a tool-calling/DeepAgent node can actually use it.
+- **`skills/` directory** at repo root — the migration **authors a basic starter
+  `SKILL.md` for every one of the five Phase 1 agents**, so no agent is left without one.
+  Each is a real-but-minimal skill: YAML frontmatter (`name`, `description`) + a Markdown
+  body seeded from that agent's existing `*_prompt.py` `SYSTEM` text (so day-one behavior
+  is unchanged and the bodies can be expanded later), in exactly the shape `scan_skills()`
+  parses. One skill per agent:
+  - `skills/source-extraction/SKILL.md` (extraction) — what counts as a fact vs. inference;
+    keep `source` traceable; how to handle sparse/noisy source text.
+  - `skills/profile-synthesis/SKILL.md` (synthesis) — dedupe rules, cross-source conflict
+    surfacing (never silently resolve), `raw_source_map` discipline.
+  - `skills/job-analysis/SKILL.md` (job_analysis) — how to decompose a posting into
+    must-haves vs. nice-to-haves and normalize terminology.
+  - `skills/cv-tailoring/SKILL.md` (tailoring) — the current `tailoring_prompt.SYSTEM`
+    HARD RULES, lifted verbatim into a skill so they are versioned and testable.
+  - `skills/anti-fabrication/SKILL.md` (validation) — the validation cross-check reasoning
+    (source-map + similarity thresholds); also composed into the tailoring node's prompt.
+
+  Net mapping is 1:1 agent→primary skill (tailoring additionally composes
+  `anti-fabrication`), so all five agents have a starter skill to begin from.
+- **`src/agents/skills.py`** — thin project adapter over `fund_models.skills`:
+  `resolve_skill(name) -> str` returns a SKILL.md body (frontmatter stripped) for a
+  given node, cached; `skills_catalog() -> str` returns the frontmatter-only summary
+  (`AgentBase.get_skills_context` format) for discovery. `SKILLS_DIR` resolves from
+  config (default `./skills`), so a missing dir degrades gracefully to today's
+  behavior (empty context → prompts unchanged).
+- **Wire into the structured-output nodes** — these are single-shot
+  `with_structured_output` calls, not tool-calling loops, so skills are resolved
+  **deterministically by node** rather than via the `load_skill` tool: each prompt
+  module gains a `{skill}` slot and the node prepends `resolve_skill("<node-skill>")`
+  to its system prompt. `tailoring_prompt.SYSTEM` becomes a thin wrapper that embeds
+  the `cv-tailoring` + `anti-fabrication` skills, keeping the prior text as the skill
+  body so behavior is unchanged when the skill is present.
+- **Migrate the already-implemented Phase 1 agents** — this is a **retrofit of existing
+  code**, not new agents. Every Phase 1 node currently carries its reasoning inline in a
+  `src/chains/prompts/*_prompt.py` module; each is migrated to source that reasoning from
+  its SKILL.md, one node per skill:
+  - `src/agents/extraction.py` + `extraction_prompt.py` → `source-extraction`
+  - `src/agents/synthesis.py` + `synthesis_prompt.py` → `profile-synthesis`
+  - `src/agents/job_analysis.py` + `job_analysis_prompt.py` → `job-analysis`
+  - `src/agents/tailoring.py` + `tailoring_prompt.py` → `cv-tailoring` (+ `anti-fabrication`)
+  - `src/agents/validation.py` + `validation_prompt.py` → `anti-fabrication`
+
+  Migration is behavior-preserving: the reasoning text moves verbatim from each
+  `*_prompt.py` `SYSTEM` string into its SKILL.md body, and the prompt module keeps only
+  the structural scaffolding (`{skill}` slot + the `USER` template). Because
+  `resolve_skill()` degrades gracefully, a node whose skill is missing falls back to
+  today's behavior — so the migration can land node-by-node without breaking the suite.
+- **Config/env** — add `SKILLS_DIR=./skills` to `src/config.py` and `.env.example`;
+  document that skills are prompt content, not secrets, and ship in the image.
+
+**Tests:** `tests/unit/test_skills.py` — `scan_skills()` finds all shipped SKILL.md
+and returns name/description/path; `resolve_skill()` strips frontmatter and raises on
+unknown name; `skills_catalog()` lists every skill. Extended tests for every migrated
+node — `test_extraction.py`, `test_synthesis.py`, `test_job_analysis.py`,
+`test_tailoring.py`, `test_validation.py` — assert the resolved skill body appears in the
+system prompt passed to the mocked LLM, and that a missing `SKILLS_DIR` leaves the call
+working (graceful degradation, proving behavior-preservation). No new LLM behavior to
+integration-test — the
+subset/no-fabrication invariants in the Phase 1 suites still gate correctness.
+
+**Verification:** `pytest tests/unit/test_skills.py -v` green; run `python -m
+fund_models.skills skills/` and confirm all five skills print with descriptions;
+`POST /tailor` with skills present produces the same no-fabrication behavior as before,
+and temporarily unsetting `SKILLS_DIR` still succeeds.
+
+#### Phase 1.c — Caller-directed `profile_id` on `POST /ingest`
+
+An enhancement to Phase 1 that lets a caller choose which profile an ingest
+writes to, instead of always minting a fresh `profile_id`. Previously `/ingest`
+passed only `{run_id, sources}` into the ingestion graph, so `store_profile`
+always called `save_profile(profile, None)` → a new random `profile_id` every
+run; re-ingesting updated sources into an existing profile was impossible via the
+API even though the storage layer already supported it.
+
+- **New optional `profile_id` form field** on `POST /ingest` (`Form(default=None)`).
+  Reuses existing plumbing — `IngestionState.profile_id` and
+  `profile_store.save_profile(profile, profile_id)` versioning already existed;
+  the route just never populated the field.
+- **Validation** — `profile_id` becomes a directory name under
+  `data/profiles/`, so `_validate_profile_id()` restricts it to
+  `[A-Za-z0-9_-]{1,64}` (no path separators/traversal) and returns **400** on bad
+  input, validated **before** any raw inputs are archived.
+- **Threaded only when provided** — the id is added to the graph `stream_input`
+  solely when supplied, so the omit-it default (mint a fresh id) is unchanged.
+- **Behavior** — existing id → a **new version** is appended (`v{n+1}`); unknown
+  id → created at **v1**; omitted → server mints a fresh id. `profile_id` remains
+  **distinct from `run_id`** (an evolving profile vs. one ingest execution); the
+  two are cross-referenced via `run_store` manifest/output linkage, not equal.
+- **Docs** — `API-REFERENCE.md` (new request field + 400 case),
+  `PRODUCT-GUIDE.md` (re-ingest-into-existing-profile flow).
+
+**Tests:** extended `tests/unit/test_api.py` — `FakeIngestionGraph` records its
+input state; `test_ingest_threads_caller_profile_id_into_graph` (id reaches
+`stream_input`, response echoes it + version), `test_ingest_without_profile_id_lets_store_mint_one`
+(key absent when omitted → default mint), `test_ingest_rejects_unsafe_profile_id`
+(`../../etc/passwd` → 400).
+
+**Verification:** `pytest tests/unit/test_api.py -v` green; `POST /ingest` with a
+`profile_id` for an existing profile returns that id with an incremented
+`version` and writes `data/profiles/{profile_id}/v{n+1}.json`; omitting it still
+mints a fresh id; an invalid id returns 400.
+
+#### Phase 1.d — Merge previous ingests into a new profile version (`POST /merge`)
+
+An enhancement to Phase 1. Every `/ingest` run is last-write-wins: re-ingesting
+to the same `profile_id` (Phase 1.c) produces a version built **only** from that
+run's sources, because `synthesize_profile` sees only the current run's
+extractions and never the prior stored profile. This phase adds an explicit
+**merge** that combines the stored outputs of two or more prior runs into one new
+profile version, preserving cross-source dedupe and conflict surfacing. Merge
+operates over the **synthesized snapshots** each run already wrote
+(`data/output/{run_id}/output.json`) — no CV re-parse and no per-source Haiku
+re-extraction.
+
+- **New `POST /merge` endpoint** — JSON body: `run_ids: list[str]` (≥ 2) +
+  optional `profile_id` (target). `profile_id` is validated with the Phase 1.c
+  `_validate_profile_id` (existing id → new version, omitted → fresh id). Returns
+  the new merge `run_id`, `profile_id`, `version`, and the merged `CareerProfile`
+  (incl. `conflicts`). Unknown / snapshot-less `run_id` → 404; fewer than 2
+  ids → 400; invalid `profile_id` → 400.
+- **Load stored snapshots** — a new `run_store.load_output(run_id) ->
+  CareerProfile` reads each run's `data/output/{run_id}/output.json` (mirrors the
+  existing `save_output`). The route collects the list of prior profiles to merge.
+- **Reuse synthesis for the actual merge** — a `merge_profiles(profiles: list[
+  CareerProfile]) -> CareerProfile` node (in `src/agents/synthesis.py` or a new
+  `src/agents/merge.py`) reuses `SYNTHESIS_MODEL` + the `profile-synthesis` skill
+  (one Sonnet call, structured output `CareerProfile`) to dedupe entries
+  describing the same job/project across the input profiles and **surface**
+  (never silently resolve) cross-profile disagreements, unioning each input
+  profile's existing `conflicts`. `raw_source_map` is rebuilt deterministically
+  via the existing `synthesis.build_raw_source_map`, and every entry keeps its
+  original `source`, so claim→source traceability survives the merge. *(A purely
+  deterministic list-union is rejected: it would duplicate the same job across
+  sources and drop conflict surfacing — the core anti-fabrication guarantee. A
+  merge USER-prompt variant, e.g. `synthesis_prompt.MERGE_USER`, frames the input
+  as "already-synthesized profiles to merge" rather than per-source extractions.)*
+- **New merge run for provenance** — the merge is itself assigned a fresh
+  `run_id`; the merged profile is written to `data/output/{run_new}/output.json`
+  (via existing `run_store.save_output`) and its `manifest.json` records
+  `merged_from: [run_ids]` (new optional field on `run_store.write_manifest`) and
+  links to the produced `profile_id`/`version` via existing `link_profile`. No
+  raw source files are archived under `sources/{run_new}/` — a merge run's inputs
+  are other runs, referenced by id.
+- **Storage** — the merged profile is stored as a new version of the target
+  `profile_id` via `profile_store.save_profile` (reusing Phase 1.c semantics).
+- **Config/env** — none.
+
+**Tests:** `tests/unit/test_merge.py` — `merge_profiles` with a mocked LLM dedupes
+overlapping experiences and surfaces a cross-profile date conflict; `raw_source_map`
+is rebuilt and entry `source` fields are preserved; unioned input `conflicts`
+carried forward. Extended `test_api.py` — `POST /merge` over two seeded run
+outputs returns a new version and the merged profile; unknown `run_id` → 404;
+`< 2` ids → 400; invalid `profile_id` → 400 (Phase 1.c path). Extended
+`test_run_store.py` — `load_output` roundtrip and `merged_from` in the merge
+manifest. No new LLM behavior to integration-test beyond the existing
+synthesis/no-fabrication invariants.
+
+**Verification:** seed two runs (`POST /ingest` a CV → r1; `POST /ingest` a GitHub
+username → r2), then `POST /merge {run_ids:[r1,r2], profile_id: alice}` →
+`GET /profile/alice` latest is the union of both with any conflicting dates in
+`conflicts`; `data/output/{run_new}/output.json` exists and its `manifest.json`
+carries `merged_from: [r1, r2]` linked to `alice`/`v{n}`.
+
+#### Phase 1.e — Null-tolerant extraction schema + item-level salvage — **implemented 2026-07-21**
+
+A bug fix to Phase 1. A real `POST /ingest` (two CVs + `github_username=thomas-choi`)
+failed outright with **HTTP 500** and:
+
+```
+{"detail":"ingestion failed: 3 validation errors for SourceExtraction
+projects.11.description
+  Input should be a valid string [type=string_type, input_value=None, input_type=NoneType]
+projects.13.description  ... (same)
+projects.27.description  ... (same)"}
+```
+
+**Root cause — the skill and the schema contradict each other.**
+`skills/source-extraction/SKILL.md` line 12 instructs the model: *"If a field is absent
+from the document, leave it empty/null"*, and the "Sparse or noisy sources" section
+repeats it. But `Project.description` in `src/models/schemas.py` is a required,
+non-nullable `str`. GitHub repos with no repo description contribute no `Description:`
+line to the source text (`src/tools/github_client.py:59-60`), so the extractor correctly
+emitted `"description": null` for those repos — and Pydantic rejected the **entire**
+`SourceExtraction`. Indices 11/13/27 are repo positions within the single
+`github:thomas-choi` source document (`MAX_REPOS = 30`). The failure was fatal: three
+missing repo descriptions discarded a 30-repo GitHub extraction **and** both parsed CVs,
+because `extract_source` (`src/agents/ingestion_graph.py:33-36`) has no error handling.
+The same latent trap exists on every other required `str` in the extraction-facing
+models. The uploaded CVs *were* archived under `data/sources/{run_id}/` before the
+failure (Phase 1.a), so only the LLM work was lost.
+
+**Granularity note (drives the design below):** one `github_username` produces exactly
+**one** `SourceDocument` containing all repos (`src/api/routes.py:122-123`), and
+`extract_source` iterates over *source documents*. A skip at that level would therefore
+throw away all 30 repos to survive 3 bad ones. Per-repo (per-item) resilience must live
+**inside `extract_one`**, at the point where the LLM payload is validated — which is the
+only place individual projects exist. The source-level guard is kept only as a coarse
+last-resort net for hard failures.
+
+- **Fix 1 — schema tolerates `null` (removes the root cause).** In
+  `src/models/schemas.py`, add a module-level `mode="before"` validator helper
+  (`_blank_if_none` → `"" if v is None else v`, and `_empty_if_none` → `[] if v is None
+  else v`) and apply it to the fields the extractor can legitimately null out:
+  - `Project.description` (also gains a `= ""` default), `Project.name`, `Project.source`
+  - `Experience.company`, `Experience.title`, `Experience.source`
+  - `Skill.name`, `Skill.category`
+  - list fields via `_empty_if_none`: `Experience.bullets`, `Project.technologies`,
+    and the `JobRequirements` list fields (same failure mode on a sparse posting).
+
+  Models that are **not** LLM-extraction targets (`TailoredCV`, `ValidationFlag`,
+  `ValidationResult`, `CoverLetter`) stay strict — a `null` there is a real bug and must
+  still raise. `SKILL.md` is **not** changed: "never invent, leave it empty/null" is the
+  anti-fabrication guarantee, and the schema is what should yield.
+- **Fix 1b — `raw_source_map` collision ripple.** `synthesis.build_raw_source_map`
+  (`src/agents/synthesis.py:20-31`) keys projects by `proj.description`. Once descriptions
+  can be `""`, every description-less project collides on the single `""` key and injects
+  a meaningless entry into the map that the anti-fabrication gate reads
+  (`src/agents/validation.py:73`). Skip falsy `description`/`bullet`/`skill.name` values
+  when building the map.
+- **Fix 2 — item-level salvage in `extract_one`** (`src/agents/extraction.py`). Switch to
+  `with_structured_output(SourceExtraction, include_raw=True)`, which returns
+  `{"parsed", "raw", "parsing_error"}` and **surfaces** the `ValidationError` instead of
+  raising it:
+  - Happy path (`parsing_error is None`) → use `parsed`; behavior identical to today,
+    including the existing `source`-overwrite loop and debug logging.
+  - Failure path → read the raw tool-call args (`raw.tool_calls[0]["args"]`) and rebuild
+    the `SourceExtraction` field by field, validating `experiences` / `projects` / `skills`
+    **one element at a time** (`Model.model_validate(item)`), dropping the ones that fail
+    and logging each at `WARNING` with its list index, its `name` if present, and the
+    pydantic message. For this bug that keeps 27 repos and drops 3.
+  - If salvage recovers nothing usable (no tool call, unparseable args, or every item
+    rejected) → **re-raise the original error**. A silently empty profile is worse than a
+    500.
+  - The strict `SourceExtraction` stays the tool schema handed to the model (it is what
+    steers the output); the lenient handling exists only on the error path. With Fix 1 in
+    place this path should rarely fire — it is defense-in-depth for the next malformed
+    field, not the primary remedy.
+- **Fix 2b — coarse source-level net** in `extract_source`
+  (`src/agents/ingestion_graph.py:33-36`): wrap the per-source call so a hard failure
+  (provider error, no parseable response at all) logs the source id and continues, but
+  raise if **no** source survives. Explicitly *not* the mechanism that saves the repos —
+  losing a source here still means losing the whole GitHub profile.
+- **Config/env** — none. **API contract** — unchanged (no new fields, no new status codes);
+  `/ingest` simply stops 500-ing on this input.
+
+**Tests:**
+- `tests/conftest.py` — `FakeLLM.with_structured_output(schema, include_raw=False)` must
+  accept the kwarg and, when true, return the `{"parsed", "raw", "parsing_error"}`
+  envelope (with a `raw` stub exposing `tool_calls`); existing callers unchanged.
+- `tests/unit/test_schemas.py` (new or extended) — `Project(description=None)` → `""`;
+  `Experience(bullets=None)` → `[]`; `TailoredCV` still rejects `null` (strictness kept
+  where it matters).
+- `tests/unit/test_extraction.py` — regression test reproducing the exact payload (a
+  30-project list with `description=None` at indices 11/13/27 → all 30 survive with
+  `""`); a genuinely malformed project is dropped while its siblings survive and the drop
+  is logged; total salvage failure re-raises; the existing source-overwrite and
+  skill-in-prompt tests still pass.
+- `tests/unit/test_synthesis.py` — two description-less projects do not collide in
+  `raw_source_map`, and no `""` key is emitted.
+- `tests/unit/test_graphs.py` — one dead source is skipped and the run completes with the
+  remaining sources; all-dead raises.
+
+**Verification:** `pytest tests/unit/ -v` green (no regressions across Phases 1–1.d);
+then re-run the failing command against the container —
+
+```bash
+curl -F "cv=@ThomasChoi-Trading-ML-20230910.pdf" -F "cv=@Thomas+Choi+Trading-20240708.docx" \
+     -F "github_username=thomas-choi" -F "profile_id=thomas-main" -F "job_id=merge001" \
+     192.168.0.212:8000/ingest
+```
+
+→ HTTP 200 with a `CareerProfile` whose projects include the previously-rejected repos
+(empty `description`, other fields intact), `data/output/{run_id}/output.json` written,
+and no `string_type` error in the logs.
+
+**Branch:** `fix/extraction-null-tolerance`. **Docs to update on completion:**
+`HISTORY.md` (new top entry), `TECHNICAL-DESIGN.md` §4 (nullable-field contract +
+two-tier extraction resilience), `API-REFERENCE.md` (one-line note: no API change),
+`OPERATIONS.md` (one-line note: no setup change), `PRODUCT-GUIDE.md` (partial extraction
+is logged and salvaged, not fatal).
+
 ## Phase 2 — LinkedIn export ingestion (design doc §12 step 5)
 
 1. `src/tools/linkedin_export.py` — accept the official LinkedIn data-export ZIP (or individual CSVs): parse Positions, Education, Skills, Certifications, Recommendations into `SourceDocument`s with `structured_fields`. **No scraping** (ToS), exactly per design doc §3.
@@ -154,8 +454,9 @@ extended `test_graphs.py` (`store_profile` writes `output/{run_id}/output.json`)
    - **Tailor panel:** paste job post → side-by-side diff of original vs. tailored bullets, `needs_review` flags highlighted, approve/reject each flagged item, then trigger render + download.
 2. **Human review checkpoint server-side:** add a `MemorySaver` checkpointer to the tailoring graph and an `interrupt()` between `validate_cv` and `render_document`; new endpoints `GET /tailor/{tailor_id}/review` (pending flags) and `POST /tailor/{tailor_id}/resume` (approvals in → graph resumes to render). This completes design doc §11: no CV is rendered without the person seeing flagged items.
 3. Serve the built frontend from FastAPI (`StaticFiles`) so it stays one container; multi-stage Dockerfile (node build stage → python runtime stage).
+4. **Adopt `fund_models/agent_base.py` for the tool-calling review node (deferred from Phase 1.b):** the human-in-the-loop resume step is the first genuinely *agentic* (tool-calling) node, so it is implemented as an `AgentBase`/`DeepAgentMixin` subclass. This is where the rest of the FUND skill machinery finally earns its place — `AgentBase._load_skills`/`get_skills_context` load the same `skills/` directory, and `make_load_skill_tool` registers the runtime `load_skill_from_fs` tool so the node can pull a full skill body (e.g. `anti-fabrication`) on demand during the review loop, rather than the deterministic per-node resolution used by the Phase 1.b structured nodes. The Phase 1 nodes stay as functional `make_llm` nodes; only the new agentic node subclasses `AgentBase`.
 
-**Tests:** frontend unit tests with vitest (panel state, diff view, flag approval flow); backend `test_review_flow.py` — interrupt fires on flags, resume renders, no-flag runs skip straight to render; API tests for the two new endpoints.
+**Tests:** frontend unit tests with vitest (panel state, diff view, flag approval flow); backend `test_review_flow.py` — interrupt fires on flags, resume renders, no-flag runs skip straight to render; API tests for the two new endpoints; `test_review_agent.py` — the `AgentBase` review node loads skills and its `load_skill_from_fs` tool returns a known skill body.
 
 ---
 

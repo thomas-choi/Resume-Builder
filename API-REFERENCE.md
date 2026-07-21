@@ -15,8 +15,10 @@ Liveness probe. Returns `{"status": "ok"}`.
 ## POST /ingest
 
 Runs the ingestion graph over the provided sources and stores the resulting
-profile as v1. Each call is tagged with a `run_id` that archives the raw inputs
-under `data/sources/{run_id}/` and a copy of the output under
+profile. By default a fresh `profile_id` is minted and stored as v1; pass
+`profile_id` to direct the result into a specific profile instead. Each call is
+tagged with a `run_id` that archives the raw inputs under
+`data/sources/{run_id}/` and a copy of the output under
 `data/output/{run_id}/output.json` (see OPERATIONS.md → Run tracking & retention).
 
 **Request:** `multipart/form-data`
@@ -27,9 +29,10 @@ under `data/sources/{run_id}/` and a copy of the output under
 | `github_username` | text | no* | Public GitHub profile to ingest |
 | `free_text` | text | no* | Pasted bio/notes passthrough (also the LinkedIn-summary path) |
 | `job_id` | text | no | Client-generated id for SSE progress; subscribe to `GET /ingest/{job_id}/events` before POSTing. Server generates one if omitted. Doubles as the `run_id`. |
+| `profile_id` | text | no | Target profile for the result. **Existing id** → a new version is appended; **new id** → created at v1. Must be 1–64 chars of `[A-Za-z0-9_-]` (else 400). Omitted → the server mints a fresh id. Distinct from `run_id` (which is one execution). |
 
 *At least one of `cv`, `github_username`, `free_text` is required (else 400).
-Unsupported CV extensions → 400. Graph failure → 500.
+Unsupported CV extensions → 400. An invalid `profile_id` → 400. Graph failure → 500.
 
 **Response 200:**
 
@@ -98,6 +101,12 @@ Runs the tailoring graph: job analysis → tailoring → validation.
 `validation.needs_review = true` means at least one claim could not be traced
 to the profile — review the flags before using the CV. Nothing is silently
 dropped or auto-approved in Phase 1.
+
+> **Phase 1.e (2026-07-21) — no API change.** Null-tolerant extraction schemas
+> and item-level salvage are internal: no new fields, parameters, or status
+> codes. `POST /ingest` simply stops returning 500 when a source contains an
+> item the extractor legitimately left empty (e.g. a GitHub repo with no
+> description).
 
 ## Planned (later phases)
 

@@ -20,8 +20,10 @@ def client(data_dir):
 class FakeIngestionGraph:
     def __init__(self, final_state):
         self.final_state = final_state
+        self.received_state = None
 
     def stream(self, state, stream_mode=None):
+        self.received_state = state
         yield {"ingest_sources": {}}
         yield {"extract_source": {}}
         yield {"synthesize_profile": {}}
@@ -128,6 +130,68 @@ def test_ingest_without_sources_is_400(client):
 
 def test_ingest_rejects_unknown_file_type(client):
     resp = client.post("/ingest", files=[("cv", ("resume.txt", b"hi", "text/plain"))])
+    assert resp.status_code == 400
+
+
+def _ingest_docx(client, data, sample_profile, monkeypatch, final_state=None):
+    """POST /ingest with a docx CV and a mocked graph; returns (resp, fake_graph)."""
+    final_state = final_state or {
+        "profile": sample_profile,
+        "profile_id": "abc123",
+        "version": 1,
+    }
+    fake = FakeIngestionGraph(final_state)
+    monkeypatch.setattr(routes, "build_ingestion_graph", lambda: fake)
+    resp = client.post(
+        "/ingest",
+        files=[
+            (
+                "cv",
+                (
+                    "resume.docx",
+                    build_sample_docx(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+            )
+        ],
+        data=data,
+    )
+    return resp, fake
+
+
+def test_ingest_threads_caller_profile_id_into_graph(
+    client, data_dir, monkeypatch, sample_profile
+):
+    # A caller-supplied profile_id directs the result into that profile;
+    # store_profile receives it (existing id → new version).
+    final_state = {"profile": sample_profile, "profile_id": "my-profile", "version": 2}
+    resp, fake = _ingest_docx(
+        client,
+        {"job_id": "job-1", "profile_id": "my-profile"},
+        sample_profile,
+        monkeypatch,
+        final_state,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["profile_id"] == "my-profile"
+    assert resp.json()["version"] == 2
+    assert fake.received_state["profile_id"] == "my-profile"
+
+
+def test_ingest_without_profile_id_lets_store_mint_one(
+    client, data_dir, monkeypatch, sample_profile
+):
+    # Omitting profile_id must not put the key in the graph input, so
+    # save_profile mints a fresh id (default behavior preserved).
+    resp, fake = _ingest_docx(client, {"job_id": "job-1"}, sample_profile, monkeypatch)
+    assert resp.status_code == 200
+    assert "profile_id" not in fake.received_state
+
+
+def test_ingest_rejects_unsafe_profile_id(client, data_dir, monkeypatch, sample_profile):
+    resp, _ = _ingest_docx(
+        client, {"profile_id": "../../etc/passwd"}, sample_profile, monkeypatch
+    )
     assert resp.status_code == 400
 
 

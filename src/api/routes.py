@@ -1,6 +1,7 @@
 """REST + SSE routes for the resume builder API."""
 
 import asyncio
+import re
 import uuid
 from pathlib import Path
 
@@ -43,6 +44,21 @@ class JobRegistry:
 
 jobs = JobRegistry()
 
+# A profile_id becomes a directory name under data/profiles/, so restrict it to
+# safe filename characters (no path separators / traversal).
+_PROFILE_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+
+
+def _validate_profile_id(profile_id: str) -> str:
+    """Sanitize a caller-supplied profile_id or raise HTTP 400."""
+    profile_id = profile_id.strip()
+    if not _PROFILE_ID_RE.fullmatch(profile_id):
+        raise HTTPException(
+            400,
+            "profile_id must be 1-64 characters of letters, digits, '-' or '_'",
+        )
+    return profile_id
+
 
 def _load_upload(run_id: str, upload: UploadFile) -> tuple[SourceDocument, dict]:
     """Archive an uploaded CV under the run's sources dir, then parse it.
@@ -76,6 +92,7 @@ async def ingest(
     github_username: str | None = Form(default=None),
     free_text: str | None = Form(default=None),
     job_id: str | None = Form(default=None),
+    profile_id: str | None = Form(default=None),
 ) -> dict:
     """Run the ingestion graph over the provided sources.
 
@@ -84,11 +101,17 @@ async def ingest(
     progress; otherwise a server-generated job_id is returned. The same id is
     used as the `run_id`: raw inputs are archived under
     `data/sources/{run_id}/` and the output copy under `data/output/{run_id}/`.
+
+    Pass `profile_id` to direct the result into a specific profile: an existing
+    one gets a new version appended, a new id is created at v1. Omit it and the
+    server mints a fresh profile_id (the default).
     """
     # Allocate the run/correlation id up front so raw inputs can be archived
     # before parsing (and before the graph runs). job_id doubles as run_id.
     run_id = job_id or uuid.uuid4().hex[:12]
     set_run_id(run_id)
+    if profile_id is not None:
+        profile_id = _validate_profile_id(profile_id)
 
     sources: list[SourceDocument] = []
     manifest_entries: list[dict] = []
@@ -133,7 +156,11 @@ async def ingest(
         set_run_id(run_id)
         graph = build_ingestion_graph()
         state: dict = {}
-        stream_input = {"run_id": run_id, "sources": sources}
+        stream_input: dict = {"run_id": run_id, "sources": sources}
+        if profile_id:
+            # store_profile threads this to save_profile: existing id → new
+            # version, unknown id → created at v1.
+            stream_input["profile_id"] = profile_id
         for update in graph.stream(stream_input, stream_mode="updates"):
             for node, node_state in update.items():
                 publish({"event": "node", "data": node})

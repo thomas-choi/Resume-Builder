@@ -32,6 +32,7 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_T
 | `TAILORING_MODEL` | no | `claude-sonnet-5` | Job analysis + CV tailoring model |
 | `VALIDATION_MODEL` | no | `claude-sonnet-5` | Anti-fabrication LLM cross-check (override to `claude-opus-4-8` for max precision) |
 | `DATA_DIR` | no | `./data` | Root of the versioned JSON profile store |
+| `SKILLS_DIR` | no | `./skills` | Directory of per-agent `SKILL.md` reasoning skills (FUND skills mechanism). Prompt **content**, not secrets — ships in the image, safe to commit. A missing/empty dir degrades gracefully: each agent falls back to its inline prompt scaffolding and the pipeline still runs |
 | `LOG_LEVEL` | no | `INFO` | Root log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`); unknown values fall back to `INFO`. `DEBUG` traces the ingestion pipeline: GitHub repo list + full source document, extraction inputs/results, synthesis payload/profile (noisy libs — httpx/httpcore/urllib3/watchfiles/openai — stay capped at INFO) |
 | `LOG_FILE` | no | unset | Log file path (e.g. `./logs/app.log`); unset = console only. Rotates at 10 MB keeping 3 backups; parent dir auto-created; uvicorn access/error logs are routed there too |
 | `VALIDATION_SIMILARITY_THRESHOLD` | no | `0.55` | difflib ratio below which a tailored bullet triggers the LLM cross-check |
@@ -188,3 +189,8 @@ and its inputs/outputs are archived under `DATA_DIR`:
   `grep '\[run:<run_id>\]' logs/app.log`.
 - **Disk growth:** sources + output accumulate per run; prune old `run_id`
   directories periodically.
+- **Partial extractions (Phase 1.e) — no setup change.** No new env vars or
+  dependencies. Dropped items and skipped sources are logged at `WARNING`
+  (`extract[<source_id>]: dropped projects[11] …`, `extraction failed for
+  source …`), so a run that returns 200 with fewer entries than expected is
+  diagnosable from the log: `grep 'extract\[' logs/app.log`.

@@ -6,6 +6,7 @@ unsourced skill -> flagged; exact bullet -> passes without any LLM call.
 
 import pytest
 
+from src import config
 from src.agents import validation
 from src.agents.validation import _ClaimCheck
 from src.models.schemas import Experience, Project, TailoredCV
@@ -123,3 +124,22 @@ def test_fabricated_project_is_flagged(monkeypatch, sample_profile):
 def test_best_similarity_sanity(sample_profile, claim, expected_min):
     bullets = [b for e in sample_profile.experiences for b in e.bullets]
     assert validation._best_similarity(claim, bullets) >= expected_min
+
+
+def test_anti_fabrication_skill_body_in_cross_check_prompt(monkeypatch, sample_profile):
+    fake = FakeLLM(_ClaimCheck(supported=True, reason="ok"))
+    monkeypatch.setattr(validation, "make_llm", lambda model, **kw: fake)
+    # A low-similarity claim forces the LLM cross-check, exercising the prompt.
+    validation.validate(sample_profile, _cv(["Ran a national logistics program"]))
+    system_prompt = fake.calls[0][0][1]
+    assert "strict fact-checker for tailored CVs" in system_prompt
+    assert "Bias toward flagging" in system_prompt
+
+
+def test_validation_cross_check_degrades_without_skills(monkeypatch, sample_profile):
+    monkeypatch.setattr(config, "SKILLS_DIR", "/nonexistent/skills")
+    fake = FakeLLM(_ClaimCheck(supported=True, reason="ok"))
+    monkeypatch.setattr(validation, "make_llm", lambda model, **kw: fake)
+    result = validation.validate(sample_profile, _cv(["Ran a national logistics program"]))
+    assert result.passed  # LLM said supported; call worked with skill absent
+    assert "strict fact-checker" not in fake.calls[0][0][1]

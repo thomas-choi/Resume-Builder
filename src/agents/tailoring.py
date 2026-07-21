@@ -4,6 +4,7 @@ import json
 
 from src import config
 from src.agents.llm import make_llm
+from src.agents.skills import resolve_skill
 from src.chains.prompts import tailoring_prompt
 from src.models.schemas import CareerProfile, JobRequirements, TailoredCV
 
@@ -13,7 +14,13 @@ def tailor(profile: CareerProfile, requirements: JobRequirements) -> TailoredCV:
     llm = make_llm(config.TAILORING_MODEL).with_structured_output(TailoredCV)
     return llm.invoke(
         [
-            ("system", tailoring_prompt.SYSTEM),
+            (
+                "system",
+                tailoring_prompt.SYSTEM.format(
+                    cv_tailoring_skill=resolve_skill("cv-tailoring"),
+                    anti_fabrication_skill=resolve_skill("anti-fabrication"),
+                ),
+            ),
             (
                 "user",
                 tailoring_prompt.USER.format(

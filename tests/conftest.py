@@ -15,27 +15,49 @@ from src.models.schemas import (
 )
 
 
+class RawMessage:
+    """Minimal stand-in for an AIMessage carrying structured-output tool calls."""
+
+    def __init__(self, args: dict | None = None, name: str = "SourceExtraction"):
+        self.tool_calls = [] if args is None else [{"name": name, "args": args}]
+
+
 class FakeLLM:
     """Stands in for ChatAnthropic().with_structured_output(...).
 
     `responses` may be a single object (returned every call), a list
     (returned in order), or a callable(messages) -> object.
+
+    With `include_raw=True` the response is wrapped in the
+    `{"parsed", "raw", "parsing_error"}` envelope LangChain returns. A response
+    that is already such a dict (used to simulate a validation failure) is
+    passed through untouched.
     """
 
     def __init__(self, responses):
         self.responses = responses
         self.calls: list = []
+        self.include_raw = False
 
-    def with_structured_output(self, schema):
+    def with_structured_output(self, schema, include_raw: bool = False):
+        self.include_raw = include_raw
         return self
 
     def invoke(self, messages):
         self.calls.append(messages)
         if callable(self.responses):
-            return self.responses(messages)
-        if isinstance(self.responses, list):
-            return self.responses.pop(0)
-        return self.responses
+            response = self.responses(messages)
+        elif isinstance(self.responses, list):
+            response = self.responses.pop(0)
+        else:
+            response = self.responses
+        if not self.include_raw or isinstance(response, dict):
+            return response
+        return {
+            "parsed": response,
+            "raw": RawMessage(response.model_dump()),
+            "parsing_error": None,
+        }
 
 
 @pytest.fixture

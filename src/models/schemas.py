@@ -2,9 +2,32 @@
 
 Mirrors TECHNICAL-DESIGN.md §4 (CareerProfile), §6 (JobRequirements),
 §7 (TailoredCV), plus ValidationResult and conflict surfacing.
+
+Extraction-facing models coerce `null` to an empty value on the fields the
+extractor may legitimately omit: the anti-fabrication skill tells the model to
+leave absent fields empty rather than invent them, so the schema — not the
+skill — is what yields. Models that are not LLM-extraction targets
+(`TailoredCV`, `ValidationFlag`, `ValidationResult`, `CoverLetter`) stay
+strict, because a `null` there is a real bug.
 """
 
-from pydantic import BaseModel, Field
+from typing import Annotated, Any
+
+from pydantic import BaseModel, BeforeValidator, Field
+
+
+def _blank_if_none(v: Any) -> Any:
+    """Coerce an extractor-emitted `null` into an empty string."""
+    return "" if v is None else v
+
+
+def _empty_if_none(v: Any) -> Any:
+    """Coerce an extractor-emitted `null` into an empty list."""
+    return [] if v is None else v
+
+
+NullableStr = Annotated[str, BeforeValidator(_blank_if_none)]
+NullableList = Annotated[list[str], BeforeValidator(_empty_if_none)]
 
 
 class SourceDocument(BaseModel):
@@ -18,27 +41,28 @@ class SourceDocument(BaseModel):
 
 
 class Experience(BaseModel):
-    company: str
-    title: str
+    company: NullableStr
+    title: NullableStr
     start_date: str | None = None
     end_date: str | None = None
     location: str | None = None
-    bullets: list[str] = Field(default_factory=list)  # verbatim-ish, not embellished
-    source: str  # source document id, e.g. "cv_docx:resume.docx"
+    # verbatim-ish, not embellished
+    bullets: NullableList = Field(default_factory=list)
+    source: NullableStr  # source document id, e.g. "cv_docx:resume.docx"
 
 
 class Project(BaseModel):
-    name: str
-    description: str
-    technologies: list[str] = Field(default_factory=list)
+    name: NullableStr
+    description: NullableStr = ""  # GitHub repos often have none
+    technologies: NullableList = Field(default_factory=list)
     role: str | None = None
     url: str | None = None
-    source: str
+    source: NullableStr
 
 
 class Skill(BaseModel):
-    name: str
-    category: str  # "language" | "framework" | "domain" | "tool"
+    name: NullableStr
+    category: NullableStr  # "language" | "framework" | "domain" | "tool"
     evidence_count: int = 1  # how many sources/repos/roles support this
 
 
@@ -80,11 +104,11 @@ class CareerProfile(BaseModel):
 class JobRequirements(BaseModel):
     title: str
     company: str | None = None
-    required_skills: list[str] = Field(default_factory=list)
-    preferred_skills: list[str] = Field(default_factory=list)
-    responsibilities: list[str] = Field(default_factory=list)
+    required_skills: NullableList = Field(default_factory=list)
+    preferred_skills: NullableList = Field(default_factory=list)
+    responsibilities: NullableList = Field(default_factory=list)
     seniority: str | None = None
-    keywords_for_ats: list[str] = Field(default_factory=list)
+    keywords_for_ats: NullableList = Field(default_factory=list)
 
 
 class TailoredCV(BaseModel):

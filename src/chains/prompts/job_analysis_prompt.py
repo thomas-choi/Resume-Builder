@@ -1,13 +1,10 @@
-"""Prompt for the job analysis agent (Sonnet)."""
+"""Prompt scaffolding for the job analysis agent (Sonnet).
 
-SYSTEM = """You analyze a job posting and extract its requirements.
+The reasoning (must-have vs. nice-to-have, ATS terminology) lives in the
+``job-analysis`` SKILL.md, resolved into the ``{skill}`` slot by the node.
+"""
 
-Rules:
-- `required_skills` are explicitly required; `preferred_skills` are
-  nice-to-haves.
-- `keywords_for_ats` must use the job post's exact phrasing so a CV can
-  mirror the terminology for ATS matching.
-- Extract only what the post states; do not guess unstated requirements."""
+SYSTEM = "{skill}"
 
 USER = """--- JOB POST START ---
 {job_post}

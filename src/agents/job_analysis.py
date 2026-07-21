@@ -2,6 +2,7 @@
 
 from src import config
 from src.agents.llm import make_llm
+from src.agents.skills import resolve_skill
 from src.chains.prompts import job_analysis_prompt
 from src.models.schemas import JobRequirements
 
@@ -11,7 +12,7 @@ def analyze(job_post: str) -> JobRequirements:
     llm = make_llm(config.TAILORING_MODEL).with_structured_output(JobRequirements)
     return llm.invoke(
         [
-            ("system", job_analysis_prompt.SYSTEM),
+            ("system", job_analysis_prompt.SYSTEM.format(skill=resolve_skill("job-analysis"))),
             ("user", job_analysis_prompt.USER.format(job_post=job_post)),
         ]
     )

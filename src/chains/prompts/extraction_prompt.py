@@ -1,15 +1,13 @@
-"""Prompt for the per-source extraction agent (Haiku)."""
+"""Prompt scaffolding for the per-source extraction agent (Haiku).
 
-SYSTEM = """You extract structured career data from one raw source document.
+The reasoning lives in the ``source-extraction`` SKILL.md, resolved into the
+``{skill}`` slot by the node. Only the runtime ``{source_id}`` binding — which
+depends on the document being extracted — stays here.
+"""
 
-Rules:
-- Extract only what is literally present in the document. Never invent,
-  embellish, or infer employers, dates, titles, skills, or achievements.
-- Keep bullet text as close to verbatim as possible.
-- Set the `source` field of every experience and project to exactly: {source_id}
-- If a field is absent from the document, leave it empty/null.
-- For GitHub sources, treat repositories as projects; infer skills only from
-  explicitly listed languages and technologies."""
+SYSTEM = """{skill}
+
+- Set the `source` field of every experience and project to exactly: {source_id}"""
 
 USER = """Source type: {source_type}
 Source id: {source_id}

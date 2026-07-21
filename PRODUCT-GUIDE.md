@@ -32,6 +32,19 @@ generated profile, so any result can be traced back to what produced it or
 re-examined later. (Your uploaded résumés are retained on disk as part of this —
 see OPERATIONS.md for the retention/privacy details.)
 
+Ingestion is **partial-failure tolerant**: if one item in a source can't be
+read cleanly — a GitHub repo with no description, a garbled résumé entry — that
+item alone is skipped and logged, and everything else still lands in your
+profile. Previously a single unreadable entry failed the whole upload. Skipped
+items are recorded in the run's logs, so nothing disappears silently; if a
+source is *entirely* unreadable it is dropped with the rest of the run
+continuing, and only a run where nothing at all could be read fails outright.
+
+By default each ingest creates a brand-new profile. To instead fold fresh
+sources into a profile you already have — say you land a new role and want to
+re-ingest an updated résumé — pass that profile's id when ingesting; the result
+is stored as a new version of it rather than a separate profile.
+
 ### 2. Review and edit the profile
 
 Fetch the profile, fix anything (including resolving surfaced conflicts), and

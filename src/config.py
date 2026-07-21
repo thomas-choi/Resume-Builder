@@ -30,6 +30,11 @@ VALIDATION_MODEL: str = os.getenv("VALIDATION_MODEL", "claude-sonnet-5")
 
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
 
+# Directory holding the versioned agent skills (SKILL.md per agent). Skills are
+# prompt *content* (reasoning strategies/heuristics), not secrets, and ship in
+# the image. A missing dir degrades gracefully to inline-prompt behavior.
+SKILLS_DIR: Path = Path(os.getenv("SKILLS_DIR", "./skills"))
+
 # Logging: level name (DEBUG/INFO/WARNING/ERROR); unset LOG_FILE = console only
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE: Path | None = Path(os.environ["LOG_FILE"]) if os.getenv("LOG_FILE") else None

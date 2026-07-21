@@ -46,7 +46,7 @@ def fetch_github_profile(username: str, client: httpx.Client | None = None) -> S
         repos_resp.raise_for_status()
         repos = [r for r in repos_resp.json() if not r.get("fork")]
         logger.debug(
-            "github[%s]: %d non-fork repos: %s",
+            "** github[%s]: %d non-fork repos: %s",
             username,
             len(repos),
             [r["name"] for r in repos],

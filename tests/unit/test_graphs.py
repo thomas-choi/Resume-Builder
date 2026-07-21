@@ -49,6 +49,41 @@ def test_ingestion_graph_saves_output_copy_for_run(monkeypatch, data_dir, sample
     assert payload["profile"]["name"] == "Alice Smith"
 
 
+def test_ingestion_graph_skips_a_dead_source(monkeypatch, data_dir, sample_profile):
+    def flaky(source):
+        if source.id == "dead":
+            raise RuntimeError("provider exploded")
+        return SourceExtraction(name="Alice Smith")
+
+    monkeypatch.setattr(extraction, "extract_one", flaky)
+    monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
+
+    graph = ingestion_graph.build_ingestion_graph()
+    state = graph.invoke(
+        {
+            "sources": [
+                SourceDocument(id="dead", source_type="github", raw_text="repos"),
+                SourceDocument(id="alive", source_type="free_text", raw_text="Alice"),
+            ]
+        }
+    )
+
+    assert state["profile"].name == "Alice Smith"
+    assert len(state["extractions"]) == 1
+
+
+def test_ingestion_graph_raises_when_every_source_fails(monkeypatch, data_dir):
+    def dead(source):
+        raise RuntimeError("provider exploded")
+
+    monkeypatch.setattr(extraction, "extract_one", dead)
+
+    graph = ingestion_graph.build_ingestion_graph()
+    doc = SourceDocument(id="free_text", source_type="free_text", raw_text="Alice ...")
+    with pytest.raises(RuntimeError, match="provider exploded"):
+        graph.invoke({"sources": [doc]})
+
+
 def test_ingestion_graph_rejects_empty_sources(data_dir):
     graph = ingestion_graph.build_ingestion_graph()
     doc = SourceDocument(id="free_text", source_type="free_text", raw_text="   ")
