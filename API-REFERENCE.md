@@ -26,7 +26,7 @@ tagged with a `run_id` that archives the raw inputs under
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `cv` | file(s) | no* | One or more `.docx` / `.pdf` CVs |
-| `github_username` | text | no* | Public GitHub profile to ingest |
+| `github_username` | text | no* | Public GitHub profile to ingest — owned repos, org/collaborator repos, and contributions to external repos (public data only) |
 | `free_text` | text | no* | Pasted bio/notes passthrough (also the LinkedIn-summary path) |
 | `job_id` | text | no | Client-generated id for SSE progress; subscribe to `GET /ingest/{job_id}/events` before POSTing. Server generates one if omitted. Doubles as the `run_id`. |
 | `profile_id` | text | no | Target profile for the result. **Existing id** → a new version is appended; **new id** → created at v1. Must be 1–64 chars of `[A-Za-z0-9_-]` (else 400). Omitted → the server mints a fresh id. Distinct from `run_id` (which is one execution). |
@@ -107,6 +107,21 @@ dropped or auto-approved in Phase 1.
 > codes. `POST /ingest` simply stops returning 500 when a source contains an
 > item the extractor legitimately left empty (e.g. a GitHub repo with no
 > description).
+
+> **Phase 1.f (2026-07-21) — no API change.** Broader GitHub coverage (org
+> repos + contributions to repos the user doesn't own) is internal to the
+> ingestion tool: `POST /ingest` takes the same `github_username` and returns
+> the same `CareerProfile`, with more of it populated. Coverage is tuned by the
+> `GITHUB_INCLUDE_CONTRIBUTIONS` / `GITHUB_MAX_EXTERNAL_REPOS` env vars, not by
+> request fields.
+
+> **Phase 1.g (2026-07-21) — no API change.** Private org membership discovery
+> (self-token) and the commit probe that keeps organization repos honest are
+> internal to the ingestion tool: `POST /ingest` takes the same
+> `github_username` and returns the same `CareerProfile`. Whether private repos
+> are read is an operator setting (`GITHUB_INCLUDE_PRIVATE`), never a request
+> field — the endpoint still accepts no caller-supplied credential, so it can
+> only ever reach private data belonging to the configured token's own account.
 
 ## Planned (later phases)
 

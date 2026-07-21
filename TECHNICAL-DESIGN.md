@@ -60,12 +60,103 @@ Each source gets its own thin ingestion node that normalizes raw input into text
 | Source | Method | Notes |
 |---|---|---|
 | **LinkedIn** | User-provided **data export** (Settings → "Get a copy of your data") or manual paste of profile text | LinkedIn's ToS blocks scraping and there's no public profile-read API for personal apps — don't build a scraper. The official export gives you Positions, Education, Skills, Certifications, Recommendations as CSV/JSON. |
-| **GitHub** | GitHub REST/GraphQL API (`api.github.com`) — repos, README content, languages, commit stats, pinned repos | You already have `api.github.com` in your allowed domains. Pull repo descriptions + top languages + README excerpts, not full source — keep token cost down. |
+| **GitHub** | GitHub REST/GraphQL API (`api.github.com`) — repos, README content, languages, commit stats, pinned repos | You already have `api.github.com` in your allowed domains. Pull repo descriptions + top languages + README excerpts, not full source — keep token cost down. Coverage spans owned, organization, and contributed-to repos — see below. |
 | **CV (docx)** | `python-docx` / your docx skill's read path | Extract text preserving section structure (headers as section boundaries). |
 | **CV (PDF)** | `pdfplumber` or the pdf-reading skill | Watch for two-column CVs — plain text extraction can interleave columns; consider layout-aware extraction or page rasterization + vision fallback for complex layouts. |
 | **Free text / paste** | Passthrough | e.g. person pastes bio or notes directly. |
 
 Output of this stage: a list of `SourceDocument { source_type, raw_text, structured_fields? }`.
+
+### GitHub source coverage & the attribution contract (Phase 1.f, 2026-07-21)
+
+`/users/{u}/repos?type=owner` returns *only* repos under the personal username,
+so work done inside organizations and contributions to other people's repos —
+for many engineers the majority of their real output — were invisible. The
+client (`src/tools/github_client.py`) now collects three tiers:
+
+| Tier | Source | Detail fetched |
+|---|---|---|
+| **Owned** | the repo listing below, partitioned by `owner.login == u` | description, primary language, stars, `languages`, README excerpt |
+| **Organization / collaborator** | the same listing's non-owned rows that pass the contribution probe, attributed to their owner; the org listing distinguishes *member of* from *collaborator on* | same as owned |
+| **External contributions** | with `GITHUB_TOKEN`: GraphQL `user.repositoriesContributedTo(includeUserRepositories:false)` + `contributionsCollection.commitContributionsByRepository` (⚠️ defaults to the **last 12 months** — looped per year); without: REST `GET /search/issues?q=author:{u}+type:pr+is:merged`, aggregated per repo | contribution scope ("6 merged PRs; 41 commits") + PR titles, and **no README excerpt** |
+
+Forks stay excluded — a fork is not evidence; the merged PR it produced is.
+`GET /search/commits` is rejected: it counts forks and mirrors (57,068 "commits"
+for a user with 778 real commit contributions).
+
+**Attribution contract (anti-fabrication).** Rendering `pallets/flask` under the
+same bare `## Repository:` heading as the user's own project invites synthesis
+to credit them with the whole framework. So the source document is structured
+into explicitly labelled sections — `## Owned repositories`,
+`## Organization repositories (member of|collaborator on <org>)`, and
+`## Contributions to external repositories (not owned by the user)` — external
+entries are marked `(owned by others)` and carry only the contribution
+evidence, and `skills/source-extraction/SKILL.md` gains an "Ownership vs.
+contribution" rule: a contribution to a repo the user does not own is evidence
+of *that contribution*, never of authorship or ownership of the project. README
+excerpts are quoted line-by-line (`> `) because READMEs carry their own `##`
+headings, which would otherwise read as section boundaries of this document and
+blur the very labelling the contract depends on.
+
+**Budget & degradation.** READMEs/languages are fetched only for owned and org
+repos; external repos are ranked by contribution volume (not `updated`) and
+capped by `GITHUB_MAX_EXTERNAL_REPOS`; the merged-PR search is paged once. A
+403/429 on search logs a `WARNING` and degrades to owned + org repos rather than
+failing the ingest, and `GITHUB_INCLUDE_CONTRIBUTIONS=false` skips the extra
+calls entirely.
+
+### Membership privacy & the contribution probe (Phase 1.g, 2026-07-21)
+
+Phase 1.f was verified against public API responses, which hid two facts that
+made its organization tier both incomplete and noisy.
+
+**Private membership is the default.** `GET /users/{u}/orgs` returns *public*
+memberships only. For the reference account it returned `[]` while the user
+belonged to five organizations — so tier 2 could only ever surface the handful of
+public org repos that happened to appear in the public repo listing, and the
+document silently understated the user's entire employment history. Worse, the
+14 repos Phase 1.f proudly labelled "external contributions **not owned by the
+user**" were mostly repos of the user's *own companies*: unable to see the
+affiliation, the client had inverted the attribution and undersold them.
+
+The fix is a **self-token** path. `GET /user` resolves the token's identity on
+every run; when it matches the ingested username the client switches to the
+viewer endpoints, which see private memberships and private repos:
+
+| | Third-party / no token | Self-token |
+|---|---|---|
+| Orgs | `GET /users/{u}/orgs` (public only) | `GET /user/orgs` |
+| Repos | `GET /users/{u}/repos?type=all` | `GET /user/repos?affiliation=owner,organization_member,collaborator` (paged) |
+
+The identity check is what makes this safe: a token issued to anyone other than
+the ingested username never reaches a viewer endpoint, so it cannot surface a
+third party's private data. `GITHUB_INCLUDE_PRIVATE=false` keeps private repos
+out of the document while still discovering the memberships, and private repos
+that are included are rendered with a `Visibility: private` line so tailoring
+never offers one as a public portfolio link.
+
+**Access is not contribution.** The same listing exposes the opposite failure:
+`affiliation=collaborator` returns every repo the user was ever invited to. For
+the reference account that was 88 repos, of which the user had committed to
+exactly **one**. Rendering them all would hand the extractor 87 other people's
+projects to write achievements from — a fabrication risk larger than the one the
+labelled sections were built to solve. Every non-owned repo therefore has to
+prove itself:
+
+- repos already proven by the merged-PR search or the GraphQL commit counts pass
+  for free;
+- the rest cost one `GET /repos/{full}/commits?author={u}` probe each, bounded by
+  `GITHUB_MAX_CONTRIBUTION_PROBES`; anything unproven is dropped, never assumed.
+
+The GraphQL commit map was evaluated as the sole filter and rejected: it found 8
+of the 26 repos the user had really committed to, because
+`contributionsCollection` counts only default-branch commits under a matching
+account email. The REST probe found all 26.
+
+Survivors are capped by `GITHUB_MAX_ORG_REPOS`, most recent contribution first,
+but **each organization keeps at least one repo before recency fills the rest** —
+a straight recency sort dropped two 2021-era employers entirely, and a resume
+needs the breadth of employers more than a fifth repo from the current one.
 
 ---
 

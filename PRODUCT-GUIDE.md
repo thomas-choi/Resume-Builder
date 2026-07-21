@@ -14,7 +14,9 @@ experience **without fabricating anything**.
 Provide any combination of:
 
 - **CV file(s)** — `.docx` or `.pdf`
-- **GitHub username** — public repos, languages, and README excerpts
+- **GitHub username** — your own public repos (languages + README excerpts),
+  the repos of organizations you belong to or collaborate on, **and** your
+  contributions to other people's open-source projects
 - **Free text** — pasted bio or notes
 
 The system extracts structured data from each source, merges duplicates
@@ -31,6 +33,32 @@ the exact files/inputs you provided are archived, alongside a copy of the
 generated profile, so any result can be traced back to what produced it or
 re-examined later. (Your uploaded résumés are retained on disk as part of this —
 see OPERATIONS.md for the retention/privacy details.)
+
+**What GitHub contributes to your profile.** Beyond the repos under your own
+username, the profile picks up work you did inside organizations and pull
+requests you merged into projects you don't own (e.g. a well-known open-source
+framework). Those are recorded strictly as *contributions* — the merged PRs and
+commit counts are your evidence, and the project itself is never presented as
+yours; a README from someone else's project is deliberately not read in. Repos
+you forked are ignored (forking is not evidence of work; the PR it produced is).
+
+Two things follow from how GitHub itself works:
+
+- **Your organizations are found even when your membership is private.** Private
+  is GitHub's default, and it makes an account look like it belongs to no
+  organization at all. If the configured GitHub token is *your own*, the builder
+  reads your memberships and private repos directly, so company work counts. A
+  token belonging to someone else is never used this way — nobody's private data
+  is reachable by typing their username. If you'd rather keep private repos out
+  of the profile entirely, your operator can set `GITHUB_INCLUDE_PRIVATE=false`;
+  your organizations are still discovered, just not their private repos. Private
+  repos that are included are marked as such, so a tailored CV never offers one
+  as a portfolio link you couldn't actually share.
+- **Being added to a repo is not the same as working on it.** Most people have
+  been invited to many repos they never touched. An organization or collaborator
+  repo only enters your profile if you actually committed to it, so the builder
+  can't write achievements out of someone else's project you merely had access
+  to.
 
 Ingestion is **partial-failure tolerant**: if one item in a source can't be
 read cleanly — a GitHub repo with no description, a garbled résumé entry — that
@@ -77,4 +105,6 @@ Paste a job posting. The system:
 | Review of flags happens client-side (API consumer's responsibility) | Phase 4 server-side human-in-the-loop |
 | No web UI — API only | Phase 4 (React three-panel flow) |
 | Two-column PDF CVs may extract with interleaved text | Later improvement |
+| Private repos and private org memberships are reachable only when the configured `GITHUB_TOKEN` is the ingested user's own | Multi-user ingestion needs a caller-supplied token (deferred credential decision) |
+| An organization repo you worked on only via a non-default branch, or under a different commit email, may not be recognized as yours | Later improvement (branch-aware contribution probe) |
 | Single-user storage (local JSON files, no accounts) | By design for now |

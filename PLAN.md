@@ -429,6 +429,147 @@ two-tier extraction resilience), `API-REFERENCE.md` (one-line note: no API chang
 `OPERATIONS.md` (one-line note: no setup change), `PRODUCT-GUIDE.md` (partial extraction
 is logged and salvaged, not fatal).
 
+#### Phase 1.f — GitHub ingestion beyond personally-owned repos — **implemented 2026-07-21**
+
+An enhancement to Phase 1. `fetch_github_profile` calls
+`/users/{u}/repos?type=owner` (`src/tools/github_client.py:44`), which **by
+definition** returns only repos under the personal username. Work done inside
+organizations, and contributions to other people's repos, are invisible to the
+profile — for many candidates that is the majority of their real engineering
+output. Verified against the live API with a representative user: `type=owner`
+→ 31 repos, **0** external; the same user has 3 public org/collaborator repos and
+1052 merged PRs across repos such as `pallets/flask`, `pypa/pip`,
+`readthedocs/readthedocs.org`.
+
+**API surface (each endpoint below was verified live before being planned):**
+
+| Source | Endpoint | Token | Notes |
+|---|---|---|---|
+| Org / collaborator repos | `GET /users/{u}/repos?type=all` | no | owner + member; `type=member` alone returns just the external ones |
+| Public org memberships | `GET /users/{u}/orgs` | no | only orgs the user made public |
+| Contributions to others' repos | `GET /search/issues?q=author:{u}+type:pr+is:merged` | no | per-PR `repository_url`, title, state; 10 req/min unauth, 30 auth |
+| Contributed-repo list (richer) | GraphQL `user.repositoriesContributedTo(includeUserRepositories:false)` | **yes** | all-time, not owned by user, with description/language/stars in one call |
+| Per-repo commit counts | GraphQL `contributionsCollection.commitContributionsByRepository` | **yes** | ⚠️ **defaults to the last 12 months** — must loop `from`/`to` per year for full history |
+| Private / internal repos | `GET /user/repos?affiliation=...` | user's own token | **out of scope** — unreachable for a third-party username; see below |
+
+`GET /search/commits?q=author:{u}` is **rejected**: it counts forks and mirrors
+and reported 57,068 commits for a user with 778 real commit contributions.
+
+- **Fix 1 — include org / collaborator repos.** `type=owner` → `type=all`, and
+  partition the result by `repo["owner"]["login"]`: repos owned by `username` are
+  *owned*, the rest are *member* repos. Fetch `/users/{u}/orgs` so the source text
+  can name the organizations. Forks stay excluded (a fork is not evidence; the
+  merged PR it produced is — see Fix 2).
+- **Fix 2 — contributions to repos the user neither owns nor is a member of.**
+  Two interchangeable providers behind one internal function, selected by token
+  presence so the no-token path still improves:
+  - **With `GITHUB_TOKEN`** — one GraphQL call for `repositoriesContributedTo`
+    (repo name, description, primary language, stars) plus
+    `commitContributionsByRepository` looped over the user's active years for
+    per-repo commit counts.
+  - **Without a token** — REST merged-PR search, aggregated per repo into a count
+    plus the first *N* PR titles.
+
+  Either way each external repo yields a **contribution scope** — "6 merged PRs;
+  41 commits" — and the PR titles, which are the actual resume-grade evidence.
+- **Fix 3 — attribution discipline (anti-fabrication).** Today every repo is
+  rendered under a bare `## Repository: <name>` heading with its description and
+  README excerpt (`src/tools/github_client.py:56-85`). Applied unchanged to
+  `pallets/flask`, that reads as *the user's project* and invites synthesis to
+  credit them with the whole framework — the exact failure
+  `skills/anti-fabrication/SKILL.md` exists to prevent. Therefore the source
+  document is restructured into three explicitly-labelled sections:
+  `## Owned repositories`, `## Organization repositories (member of <org>)`, and
+  `## Contributions to external repositories (not owned by the user)`. Repos in
+  the third section carry their contribution scope and **no README excerpt** —
+  a README describes the project, not the contribution. Correspondingly
+  `skills/source-extraction/SKILL.md` gains one rule: a contribution to a repo the
+  user does not own is evidence of *that contribution*, never of authorship or
+  ownership of the project.
+- **Fix 4 — call and token budget.** Every repo currently costs 2 extra calls
+  (languages + readme) and up to 1500 README chars, and `MAX_REPOS = 30` truncates
+  by `updated` — which would silently drop the most interesting external repos.
+  So: README + languages are fetched **only** for owned and org-member repos;
+  external repos are sorted by contribution count (not `updated`) and capped by a
+  separate `MAX_EXTERNAL_REPOS`; the merged-PR search is paged once, not
+  exhaustively. A 403/429 from the search endpoint degrades to "owned + org repos
+  only" with a `WARNING`, never a failed ingest.
+- **Private / internal org repos — explicitly out of scope, and documented as
+  such.** They are reachable only when `GITHUB_TOKEN` is *the user's own* token
+  carrying `repo` scope with org SSO authorized, via
+  `GET /user/repos?affiliation=owner,collaborator,organization_member`. Since
+  `/ingest` takes a bare `github_username` and the server token is an operator
+  credential, silently returning private repos for whichever username is typed
+  would be wrong. Accepting a caller-supplied token is deferred (it is a
+  credential-handling decision, not a GitHub-API one).
+- **Config/env** — `GITHUB_INCLUDE_CONTRIBUTIONS=true` (kill switch for the extra
+  search/GraphQL calls) and `GITHUB_MAX_EXTERNAL_REPOS=15`, added to
+  `src/config.py` and `.env.example`. `GITHUB_TOKEN` stays optional but its
+  description changes: it now unlocks richer contribution data, not just rate
+  limits. **API contract** — unchanged; `/ingest` takes the same
+  `github_username` and returns the same `CareerProfile`, with more of it
+  populated.
+
+**Tests:** `tests/unit/test_github_client.py` — extend the existing
+`httpx.MockTransport` handler (no network) to serve `type=all` with a mixed
+owned/org payload, `/users/{u}/orgs`, and a `/search/issues` page; assert the
+three section headings appear, that an org repo is attributed to its org, that an
+external repo shows its merged-PR count and titles but **no README excerpt**,
+that forks are still excluded, and that a 403 on search still yields a document
+containing the owned repos. A token-present case stubs the GraphQL POST and
+asserts the contributed-repo list is used instead of the search path.
+`tests/unit/test_extraction.py` — a source document containing an external-repo
+section does not produce a `Project` attributed to the user (the anti-fabrication
+invariant, mocked LLM asserting the prompt carries the not-owned framing).
+
+**Verification:** `pytest tests/unit/ -v` green (no regressions across
+Phases 1–1.e); then, against the container, `POST /ingest` with
+`github_username=thomas-choi` → the returned `CareerProfile` includes work from
+repos outside `thomas-choi/*`, each external item's `source` traceable to
+`github:thomas-choi`, and `data/sources/{run_id}/github/github.json` showing the
+three labelled sections. Re-run with `GITHUB_INCLUDE_CONTRIBUTIONS=false` → the
+document degrades to owned + org repos only. Unset `GITHUB_TOKEN` → the REST
+search path produces a comparable (smaller) contribution list.
+
+**Branch:** `feat/github-org-contributions`. **Docs to update on completion:**
+`HISTORY.md` (new top entry), `TECHNICAL-DESIGN.md` §3 (GitHub source coverage +
+the owned/member/contributed attribution contract), `OPERATIONS.md` (two new env
+vars; `GITHUB_TOKEN` rationale; GitHub rate-limit note), `PRODUCT-GUIDE.md` (org
+and open-source contributions now appear in the profile; private repos do not and
+why), `API-REFERENCE.md` (one-line note: no API change).
+
+#### Phase 1.g — Private org membership + "access is not contribution" — **implemented 2026-07-21**
+
+Follow-up to 1.f, prompted by reviewing its live output. Two GitHub behaviours
+invalidated assumptions 1.f was built on:
+
+1. **`GET /users/{u}/orgs` lists public memberships only, and private is the
+   default.** It returned `[]` for `thomas-choi` while he belongs to 5 orgs. The
+   consequence was not just a gap: 14 repos belonging to his *own companies* had
+   been labelled "external contributions **not owned by the user**", inverting
+   the attribution 1.f existed to protect. 1.f's premise that `GITHUB_TOKEN` is a
+   third-party operator credential was also false — `GET /user` shows the
+   configured token is the ingested user's own.
+2. **`affiliation=collaborator` returns every repo the user was ever invited
+   to** — 88 for this account, with commits in exactly 1.
+
+**Implemented:** a self-token path (`GET /user` identity check → `/user/orgs` +
+paged `/user/repos?affiliation=owner,organization_member,collaborator`), gated so
+a token belonging to anyone but the ingested username never reaches a viewer
+endpoint; a commit probe (`GET /repos/{full}/commits?author={u}`, evidence-first,
+budget-bounded) that every non-owned repo must pass; and an org cap that seeds
+one repo per organization before filling by recency, so an old employer is not
+evicted by a busy current one. GraphQL `contributionsCollection` was evaluated as
+the sole contribution filter and rejected (8 of 26 true positives — it counts
+default-branch commits under a matching account email only).
+
+**Config/env:** `GITHUB_INCLUDE_PRIVATE=true`, `GITHUB_MAX_CONTRIBUTION_PROBES=150`,
+`GITHUB_MAX_ORG_REPOS=20`. **API contract** — unchanged.
+
+**Result:** 5 org memberships found (was 0); 20 org repos across 5 employers from
+66 candidates (was 2); 18 private repos included; external section legitimately
+empty for this user.
+
 ## Phase 2 — LinkedIn export ingestion (design doc §12 step 5)
 
 1. `src/tools/linkedin_export.py` — accept the official LinkedIn data-export ZIP (or individual CSVs): parse Positions, Education, Skills, Certifications, Recommendations into `SourceDocument`s with `structured_fields`. **No scraping** (ToS), exactly per design doc §3.

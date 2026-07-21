@@ -8,7 +8,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 ANTHROPIC_API_KEY: str | None = os.getenv("ANTHROPIC_API_KEY")
+# Optional. Raises GitHub rate limits *and* unlocks the richer GraphQL
+# contribution data (repositoriesContributedTo + per-repo commit counts).
 GITHUB_TOKEN: str | None = os.getenv("GITHUB_TOKEN")
+
+# GitHub ingestion: whether to look beyond owned/org repos for contributions to
+# other people's repos (extra search/GraphQL calls — set false to disable), and
+# how many such external repos to keep (ranked by contribution volume).
+GITHUB_INCLUDE_CONTRIBUTIONS: bool = os.getenv(
+    "GITHUB_INCLUDE_CONTRIBUTIONS", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+GITHUB_MAX_EXTERNAL_REPOS: int = int(os.getenv("GITHUB_MAX_EXTERNAL_REPOS", "15"))
+
+# Private repos (personal and organization) are read only when GITHUB_TOKEN
+# belongs to the very username being ingested — never for a third party. Their
+# names, descriptions and READMEs then reach the extraction LLM, so set false to
+# keep ingestion to public data only.
+GITHUB_INCLUDE_PRIVATE: bool = os.getenv(
+    "GITHUB_INCLUDE_PRIVATE", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Organization/collaborator repos are kept only when the user actually committed
+# to them, which costs one commit probe per candidate repo; these cap the probe
+# budget and how many surviving repos are rendered (most recent first).
+GITHUB_MAX_CONTRIBUTION_PROBES: int = int(
+    os.getenv("GITHUB_MAX_CONTRIBUTION_PROBES", "150")
+)
+GITHUB_MAX_ORG_REPOS: int = int(os.getenv("GITHUB_MAX_ORG_REPOS", "20"))
 
 # LLM provider config (same method as FUND's AgentConfig / get_llm)
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic")

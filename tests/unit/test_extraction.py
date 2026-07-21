@@ -2,12 +2,14 @@
 
 import logging
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
 from src import config
 from src.agents import extraction
 from src.models.schemas import Experience, Project, SourceDocument, SourceExtraction
+from src.tools.github_client import API_BASE, fetch_github_profile
 from tests.conftest import FakeLLM, RawMessage
 
 
@@ -162,3 +164,63 @@ def test_extraction_degrades_without_skills(monkeypatch, tmp_path):
     assert "Fact vs. inference" not in system_prompt
     # Runtime scaffolding is unaffected by the missing skill.
     assert "cv_docx:resume.docx" in system_prompt
+
+
+def _github_doc_with_external_section() -> SourceDocument:
+    """A real GitHub source document containing an external-contribution section."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/users/alice/repos":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": "backtester",
+                        "full_name": "alice/backtester",
+                        "owner": {"login": "alice"},
+                        "description": "Backtesting engine",
+                        "fork": False,
+                    }
+                ],
+            )
+        if path == "/search/issues":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "title": "Fix request context teardown",
+                            "repository_url": f"{API_BASE}/repos/pallets/flask",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404, json={"message": "not found"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url=API_BASE)
+    return fetch_github_profile("alice", client=client)
+
+
+def test_external_repo_section_carries_not_owned_framing(monkeypatch):
+    # Anti-fabrication: a contribution to someone else's repo must reach the
+    # model labelled as a contribution, never as one of the user's projects.
+    monkeypatch.setattr(config, "GITHUB_TOKEN", None)
+    monkeypatch.setattr(config, "GITHUB_INCLUDE_CONTRIBUTIONS", True)
+    fake = FakeLLM(SourceExtraction(name="Alice Smith"))
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    extraction.extract_one(_github_doc_with_external_section())
+
+    system_prompt, user_prompt = fake.calls[0][0][1], fake.calls[0][1][1]
+    # The source-extraction skill's ownership rule is in the system prompt.
+    assert "Ownership vs. contribution" in system_prompt
+    assert "authorship or ownership of the project" in system_prompt
+    # The document itself labels the external section and the owned one apart.
+    assert "## Owned repositories" in user_prompt
+    assert (
+        "## Contributions to external repositories (not owned by the user)"
+        in user_prompt
+    )
+    assert "pallets/flask (owned by others)" in user_prompt
+    assert "Contribution scope: 1 merged pull request" in user_prompt

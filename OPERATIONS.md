@@ -20,7 +20,12 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_T
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | yes* | — | LLM calls with the default `anthropic` provider |
-| `GITHUB_TOKEN` | no | — | Raises GitHub API rate limits for `github_username` ingestion |
+| `GITHUB_TOKEN` | no | — | Raises GitHub API rate limits **and** unlocks richer contribution data for `github_username` ingestion: with a token the client uses GraphQL `repositoriesContributedTo` (all-time, with description/language/stars) plus per-repo commit counts; without one it falls back to the REST merged-PR search. If the token belongs to **the very username being ingested** it additionally unlocks private org memberships and private repos (see "GitHub coverage" below); for any other username those endpoints are never used |
+| `GITHUB_INCLUDE_CONTRIBUTIONS` | no | `true` | Kill switch for the extra search/GraphQL calls that find contributions to repos the user doesn't own. `false` → the source document degrades to owned + organization repos only |
+| `GITHUB_MAX_EXTERNAL_REPOS` | no | `15` | How many external (contributed-to) repos to keep, ranked by contribution volume (merged PRs + commits), not recency |
+| `GITHUB_INCLUDE_PRIVATE` | no | `true` | Whether private repos are ingested on the self-token path. Their names, descriptions and README excerpts then reach the extraction LLM and are stored under `data/sources/`. `false` → public repos only, while private **org membership** is still discovered |
+| `GITHUB_MAX_CONTRIBUTION_PROBES` | no | `150` | Budget for the `GET /repos/{full}/commits?author=` probes that prove a non-owned repo was actually worked on. Repos beyond the budget are dropped, never assumed |
+| `GITHUB_MAX_ORG_REPOS` | no | `20` | How many organization/collaborator repos to render, newest contribution first. Each organization keeps at least one repo before recency fills the rest, so an old employer is not evicted by a busy current one |
 | `LLM_PROVIDER` | no | `anthropic` | Provider switch (same method as FUND `get_llm`): `anthropic`, `openai`, `google`, `nvidia`, `llamacpp`, `deepseek`, `openrouter`. Non-Anthropic providers need their `langchain-*` package installed and `*_MODEL` vars set to that provider's model ids. Packages for `anthropic`, `openai`, `google`, `nvidia`, and `llamacpp` ship in `requirements.txt`; `deepseek`/`openrouter` need a manual `pip install`. For `deepseek` the factory disables thinking mode per request — DeepSeek thinking models reject the forced tool call that structured output requires. |
 | `LLM_API_KEY` | no | falls back to `ANTHROPIC_API_KEY` | Provider API key (*required if `LLM_PROVIDER` isn't `anthropic`) |
 | `LLM_TEMPERATURE` | no | unset | Sampling temperature; leave unset for current Claude models (they reject non-default sampling params). For local/OSS providers set ~`0.2` — low temperature keeps the extraction and validation stages factual, which the anti-fabrication gate depends on |
@@ -39,6 +44,44 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_T
 
 Secrets live in `.env` (gitignored) and are loaded via `python-dotenv`; never
 commit or hardcode them.
+
+## GitHub coverage and rate limits
+
+`github_username` ingestion collects three tiers, each labelled separately in
+the source document (see TECHNICAL-DESIGN.md §3):
+
+1. repos owned by the username,
+2. repos owned by organizations the user belongs to or collaborates on **and has
+   committed to**,
+3. repos the user only **contributed** to (merged PRs / commits).
+
+**Self-token vs. third-party token.** `GET /users/{u}/orgs` lists only *public*
+organization memberships, and GitHub's default for a membership is private — so
+a user who belongs to five organizations can look org-less. When `GITHUB_TOKEN`
+belongs to the very username being ingested, the client instead uses the viewer
+endpoints `GET /user/orgs` and `GET /user/repos?affiliation=owner,organization_member,collaborator`,
+which see private memberships and private repos. Identity is checked with
+`GET /user` on every run: a token for anyone else falls back to the public
+endpoints, so a third party's private data can never be reached. Set
+`GITHUB_INCLUDE_PRIVATE=false` to keep private repos out of the source document
+while still discovering the memberships.
+
+**Access is not contribution.** `affiliation=collaborator` returns every repo the
+user was ever invited to — in practice mostly repos they never touched. Each
+non-owned repo therefore has to prove a commit via
+`GET /repos/{full}/commits?author={u}` before it is rendered; repos already
+proven by the merged-PR search or the GraphQL commit counts skip the probe.
+
+**Rate limits.** Unauthenticated: 60 core req/h and **10 search req/min**;
+with `GITHUB_TOKEN`: 5000 core req/h and 30 search req/min. Each owned/org repo
+costs 2 extra calls (languages + README) plus at most 1 commit probe; external
+repos cost none. The merged-PR search is fetched as a single page. Every
+degradation path logs a `WARNING` and keeps the ingest alive: a 403/429 on the
+search drops the external section, and a 403/429 on a commit probe stops the
+sweep and drops the remaining organization repos. Set
+`GITHUB_INCLUDE_CONTRIBUTIONS=false` to skip the search/GraphQL calls entirely,
+`GITHUB_MAX_CONTRIBUTION_PROBES` to bound the probes, and
+`GITHUB_MAX_EXTERNAL_REPOS` / `GITHUB_MAX_ORG_REPOS` to bound the sections.
 
 ## Running the server
 
