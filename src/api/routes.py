@@ -7,6 +7,7 @@ from pathlib import Path
 
 import anyio
 from fastapi import APIRouter, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -17,12 +18,17 @@ from src.tools.docx_reader import read_docx
 from src.tools.github_client import fetch_github_profile, free_text_source
 from src.tools.linkedin_export import read_linkedin_export
 from src.tools.pdf_reader import read_pdf
-from src.utils import profile_store, run_store
+from src.utils import document_store, profile_store, run_store
 from src.utils.logging_setup import set_run_id
 
 router = APIRouter()
 
 _DONE = {"event": "done"}
+
+_MEDIA_TYPES = {
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "pdf": "application/pdf",
+}
 
 
 class JobRegistry:
@@ -272,11 +278,25 @@ class TailorRequest(BaseModel):
     profile_id: str
     job_post: str
     version: int | None = None
+    render: bool = False
+    cover_letter: bool = False
+    approve_flagged: bool = False
 
 
 @router.post("/tailor")
 async def tailor(request: TailorRequest) -> dict:
-    """Run the tailoring graph: job analysis -> tailoring -> validation."""
+    """Run the tailoring graph: job analysis -> tailoring -> validation -> render.
+
+    Set `render` to also produce document files (`.docx`, plus `.pdf` when
+    LibreOffice is available), downloadable from
+    `GET /document/{tailor_id}`. Set `cover_letter` to generate one alongside
+    the CV; it is returned in the response either way, and rendered too when
+    `render` is set.
+
+    Rendering is gated by the validation result: when `validation.needs_review`
+    is true nothing is written, and `render_skipped` explains why. Review the
+    flags, then re-run with `approve_flagged` to render regardless.
+    """
     try:
         profile = profile_store.load_profile(request.profile_id, request.version)
     except FileNotFoundError as exc:
@@ -284,14 +304,64 @@ async def tailor(request: TailorRequest) -> dict:
     if not request.job_post.strip():
         raise HTTPException(400, "job_post must not be empty")
 
+    tailor_id = uuid.uuid4().hex[:12]
+
     def run_graph() -> dict:
         graph = build_tailoring_graph()
-        return graph.invoke({"profile": profile, "job_post": request.job_post})
+        return graph.invoke(
+            {
+                "profile": profile,
+                "job_post": request.job_post,
+                "tailor_id": tailor_id,
+                "render": request.render,
+                "want_cover_letter": request.cover_letter,
+                "approved": request.approve_flagged,
+            }
+        )
 
     state = await anyio.to_thread.run_sync(run_graph)
-    return {
+    cover_letter = state.get("cover_letter")
+    documents = state.get("documents") or []
+    response = {
         "profile_id": request.profile_id,
+        "tailor_id": tailor_id,
         "job_requirements": state["job_requirements"].model_dump(),
         "tailored_cv": state["tailored_cv"].model_dump(),
         "validation": state["validation"].model_dump(),
+        "cover_letter": cover_letter.model_dump() if cover_letter else None,
+        "documents": [
+            {**doc, "url": f"/document/{tailor_id}?kind={doc['kind']}&format={doc['format']}"}
+            for doc in documents
+        ],
+        "render_skipped": state.get("render_skipped"),
     }
+    # Persist the result next to the documents so a download can be traced back
+    # to the claims the validation gate checked (and Phase 4 can resume from it).
+    document_store.save_result(
+        tailor_id,
+        {k: v for k, v in response.items() if k != "documents"},
+    )
+    return response
+
+
+@router.get("/document/{tailor_id}")
+def get_document(tailor_id: str, kind: str = "cv", format: str = "docx") -> FileResponse:
+    """Download a document rendered by `POST /tailor`.
+
+    Args:
+        tailor_id: The `tailor_id` returned by `POST /tailor`.
+        kind: `cv` (default) or `cover_letter`.
+        format: `docx` (default) or `pdf`.
+
+    Returns:
+        The file. 404 when that document was not rendered — because `render`
+        was not set, the validation gate skipped it, or (for `pdf`) LibreOffice
+        was unavailable.
+    """
+    try:
+        path = document_store.find_document(tailor_id, kind, format)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return FileResponse(path, filename=path.name, media_type=_MEDIA_TYPES[format])

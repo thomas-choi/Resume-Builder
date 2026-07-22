@@ -52,8 +52,27 @@ EXTRACTION_MODEL: str = os.getenv("EXTRACTION_MODEL", "claude-haiku-4-5-20251001
 SYNTHESIS_MODEL: str = os.getenv("SYNTHESIS_MODEL", "claude-sonnet-5")
 TAILORING_MODEL: str = os.getenv("TAILORING_MODEL", "claude-sonnet-5")
 VALIDATION_MODEL: str = os.getenv("VALIDATION_MODEL", "claude-sonnet-5")
+# The cover letter reuses the tailoring tier unless overridden — it is the same
+# "re-frame profile facts for one posting" task, under the same no-fabrication rules.
+COVER_LETTER_MODEL: str = os.getenv("COVER_LETTER_MODEL", TAILORING_MODEL)
 
 DATA_DIR: Path = Path(os.getenv("DATA_DIR", "./data"))
+
+# Document rendering (Phase 3). The renderer is pure Python (python-docx); PDF
+# is produced by converting the rendered .docx with headless LibreOffice, which
+# is installed in the Docker image but optional locally — a missing binary
+# degrades to "docx only" with a WARNING, never a failed tailoring run.
+DOCX_TEMPLATE: Path | None = (
+    Path(os.environ["DOCX_TEMPLATE"]) if os.getenv("DOCX_TEMPLATE") else None
+)
+RENDER_PDF: bool = os.getenv("RENDER_PDF", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+LIBREOFFICE_BIN: str = os.getenv("LIBREOFFICE_BIN", "soffice")
+LIBREOFFICE_TIMEOUT_S: int = int(os.getenv("LIBREOFFICE_TIMEOUT_S", "120"))
 
 # Directory holding the versioned agent skills (SKILL.md per agent). Skills are
 # prompt *content* (reasoning strategies/heuristics), not secrets, and ship in

@@ -8,7 +8,7 @@ An AI-powered personalized resume builder. It ingests your career sources
 given any job posting — generates a **tailored CV** that emphasizes relevant
 experience **without fabricating anything**.
 
-## Business flows (Phases 1–2)
+## Business flows (Phases 1–3)
 
 ### 1. Build your career profile
 
@@ -110,18 +110,43 @@ Paste a job posting. The system:
 3. **validates** every generated claim against your profile — anything that
    can't be traced back is flagged `needs_review` for you to approve or reject.
 
+### 4. Get the documents (and a cover letter)
+
+Ask for it and the same request also produces the files you actually send: a
+**Word CV** and, where the server has LibreOffice, a **PDF** of it. The layout
+is fixed and plain — your name and contact details, the headline and summary
+written for this posting, then the selected experience, projects and skills —
+and it contains only what the tailored CV already contained; the internal notes
+about *why* each item was picked are never printed.
+
+Optionally you also get a **cover letter** for the same posting, written from
+the facts already selected for the CV. It is bound by the same rule as
+everything else: no claim it makes is new. Two things it will not do — invent
+reasons you want the job or opinions about the company, and repeat a
+recommendation someone wrote about you as if you had said it yourself.
+
+**Nothing flagged gets rendered.** If validation raised a flag, no file is
+written and the response tells you why. You read the flags, and if you're happy
+with them you re-run and say so explicitly — approving is a decision you make,
+never a default. Documents stay downloadable afterwards by the id of that
+tailoring run, so you can come back for the PDF later.
+
 ## Guardrails you can rely on
 
 - No new employers, dates, titles, or skills are ever invented.
 - Keyword mirroring is limited to what your profile evidences.
 - Flagged claims are surfaced, not auto-approved — you are the final gate.
+- A CV with unresolved flags is never turned into a finished document until you
+  say so.
 
-## Current limitations (Phases 1–2)
+## Current limitations (Phases 1–3)
 
 | Limitation | Planned fix |
 |---|---|
 | LinkedIn comes from your own data export — there is no "connect my LinkedIn" login | By design (LinkedIn's terms forbid scraping; no personal-app read API) |
-| Output is structured JSON only — no .docx/PDF rendering, no cover letter | Phase 3 |
+| One fixed CV layout; styling is only customizable by supplying a base Word template | Later improvement (multiple layouts) |
+| PDF depends on LibreOffice being installed server-side; without it you get the .docx only | By design — the .docx is the guaranteed output |
+| Approving flagged claims means re-running the tailoring request (costing the AI calls again) rather than resuming where it paused | Phase 4 server-side human-in-the-loop |
 | Review of flags happens client-side (API consumer's responsibility) | Phase 4 server-side human-in-the-loop |
 | No web UI — API only | Phase 4 (React three-panel flow) |
 | Two-column PDF CVs may extract with interleaved text | Later improvement |

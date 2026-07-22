@@ -1,8 +1,8 @@
-"""Job analysis + tailoring agents with mocked LLMs."""
+"""Job analysis + tailoring + cover-letter agents with mocked LLMs."""
 
 from src import config
 from src.agents import job_analysis, tailoring
-from src.models.schemas import Experience, JobRequirements, TailoredCV
+from src.models.schemas import CoverLetter, Experience, JobRequirements, TailoredCV
 from tests.conftest import FakeLLM
 
 
@@ -96,3 +96,57 @@ def test_tailoring_degrades_without_skills(monkeypatch, sample_profile):
     system_prompt = fake.calls[0][0][1]
     assert "HARD RULES" not in system_prompt
     assert "strict fact-checker" not in system_prompt
+
+
+def _cover_letter() -> CoverLetter:
+    return CoverLetter(
+        greeting="Dear Hiring Manager,",
+        body_paragraphs=["I built a distributed trading backtester in Python."],
+        closing="Sincerely,",
+    )
+
+
+def test_cover_letter_sees_profile_requirements_and_tailored_cv(
+    monkeypatch, sample_profile
+):
+    fake = FakeLLM(_cover_letter())
+    monkeypatch.setattr(tailoring, "make_llm", lambda model, **kw: fake)
+
+    letter = tailoring.generate_cover_letter(
+        sample_profile,
+        JobRequirements(title="Backend Engineer", required_skills=["Python"]),
+        _tailored_cv(),
+    )
+
+    assert letter.greeting == "Dear Hiring Manager,"
+    user_prompt = fake.calls[0][1][1]
+    assert "Acme Corp" in user_prompt  # profile facts
+    assert "Backend Engineer" in user_prompt  # job requirements
+    assert "Senior Backend Engineer" in user_prompt  # the tailored CV's headline
+    # Internal-only fields never reach the prompt.
+    assert "raw_source_map" not in user_prompt
+    assert "relevance_notes" not in user_prompt
+
+
+def test_cover_letter_composes_its_skill_and_anti_fabrication(
+    monkeypatch, sample_profile
+):
+    fake = FakeLLM(_cover_letter())
+    monkeypatch.setattr(tailoring, "make_llm", lambda model, **kw: fake)
+    tailoring.generate_cover_letter(
+        sample_profile, JobRequirements(title="Backend Engineer"), _tailored_cv()
+    )
+    system_prompt = fake.calls[0][0][1]
+    assert "You write a cover letter" in system_prompt  # cover-letter
+    assert "strict fact-checker for tailored CVs" in system_prompt  # anti-fabrication
+
+
+def test_cover_letter_degrades_without_skills(monkeypatch, sample_profile):
+    monkeypatch.setattr(config, "SKILLS_DIR", "/nonexistent/skills")
+    fake = FakeLLM(_cover_letter())
+    monkeypatch.setattr(tailoring, "make_llm", lambda model, **kw: fake)
+    letter = tailoring.generate_cover_letter(
+        sample_profile, JobRequirements(title="Backend Engineer"), _tailored_cv()
+    )
+    assert letter.closing == "Sincerely,"
+    assert "You write a cover letter" not in fake.calls[0][0][1]

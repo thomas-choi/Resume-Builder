@@ -5,10 +5,12 @@ import pytest
 from src.agents import extraction, ingestion_graph, synthesis, tailoring_graph
 from src.agents import job_analysis, tailoring, validation
 from src.models.schemas import (
+    CoverLetter,
     JobRequirements,
     SourceDocument,
     SourceExtraction,
     TailoredCV,
+    ValidationFlag,
     ValidationResult,
 )
 
@@ -91,14 +93,38 @@ def test_ingestion_graph_rejects_empty_sources(data_dir):
         graph.invoke({"sources": [doc]})
 
 
-def test_tailoring_graph_runs_all_nodes(monkeypatch, sample_profile):
+def _mock_tailoring_nodes(monkeypatch, validation_result=None):
+    """Mock every LLM-backed tailoring node; returns a call recorder."""
     req = JobRequirements(title="Backend Engineer")
     cv = TailoredCV(headline="Engineer", summary="Pitch.")
-    monkeypatch.setattr(job_analysis, "analyze", lambda job_post: req)
-    monkeypatch.setattr(tailoring, "tailor", lambda profile, requirements: cv)
-    monkeypatch.setattr(
-        validation, "validate", lambda profile, cv: ValidationResult(passed=True)
-    )
+    letter = CoverLetter(greeting="Dear Hiring Manager,", closing="Sincerely,")
+    calls: list[str] = []
+
+    def analyze(job_post):
+        calls.append("analyze")
+        return req
+
+    def tailor(profile, requirements):
+        calls.append("tailor")
+        return cv
+
+    def validate(profile, cv):
+        calls.append("validate")
+        return validation_result or ValidationResult(passed=True)
+
+    def cover_letter(profile, requirements, cv):
+        calls.append("cover_letter")
+        return letter
+
+    monkeypatch.setattr(job_analysis, "analyze", analyze)
+    monkeypatch.setattr(tailoring, "tailor", tailor)
+    monkeypatch.setattr(validation, "validate", validate)
+    monkeypatch.setattr(tailoring, "generate_cover_letter", cover_letter)
+    return calls
+
+
+def test_tailoring_graph_runs_all_nodes(monkeypatch, sample_profile):
+    _mock_tailoring_nodes(monkeypatch)
 
     graph = tailoring_graph.build_tailoring_graph()
     state = graph.invoke({"profile": sample_profile, "job_post": "A job post"})
@@ -106,3 +132,64 @@ def test_tailoring_graph_runs_all_nodes(monkeypatch, sample_profile):
     assert state["job_requirements"].title == "Backend Engineer"
     assert state["tailored_cv"].headline == "Engineer"
     assert state["validation"].passed
+    # Rendering was not requested, so nothing was written.
+    assert state["documents"] == []
+    assert state["render_skipped"] == "rendering not requested"
+
+
+def test_tailoring_graph_skips_the_cover_letter_by_default(monkeypatch, sample_profile):
+    calls = _mock_tailoring_nodes(monkeypatch)
+    graph = tailoring_graph.build_tailoring_graph()
+    state = graph.invoke({"profile": sample_profile, "job_post": "A job post"})
+    assert "cover_letter" not in calls
+    assert "cover_letter" not in state
+
+
+def test_tailoring_graph_writes_and_renders_a_cover_letter(
+    monkeypatch, data_dir, sample_profile
+):
+    from src import config
+
+    monkeypatch.setattr(config, "RENDER_PDF", False)  # no LibreOffice in unit tests
+    calls = _mock_tailoring_nodes(monkeypatch)
+
+    graph = tailoring_graph.build_tailoring_graph()
+    state = graph.invoke(
+        {
+            "profile": sample_profile,
+            "job_post": "A job post",
+            "tailor_id": "tailor-graph",
+            "render": True,
+            "want_cover_letter": True,
+        }
+    )
+
+    assert calls == ["analyze", "tailor", "validate", "cover_letter"]
+    assert state["cover_letter"].greeting == "Dear Hiring Manager,"
+    assert {d["kind"] for d in state["documents"]} == {"cv", "cover_letter"}
+    assert (data_dir / "documents" / "tailor-graph" / "cv.docx").exists()
+
+
+def test_tailoring_graph_render_is_gated_by_validation_flags(
+    monkeypatch, data_dir, sample_profile
+):
+    flagged = ValidationResult(
+        passed=False,
+        needs_review=True,
+        flags=[ValidationFlag(item="Ran a team of 40", kind="bullet", reason="unsourced")],
+    )
+    _mock_tailoring_nodes(monkeypatch, validation_result=flagged)
+
+    graph = tailoring_graph.build_tailoring_graph()
+    state = graph.invoke(
+        {
+            "profile": sample_profile,
+            "job_post": "A job post",
+            "tailor_id": "tailor-flagged",
+            "render": True,
+        }
+    )
+
+    assert state["documents"] == []
+    assert "need review" in state["render_skipped"]
+    assert not (data_dir / "documents" / "tailor-flagged").exists()

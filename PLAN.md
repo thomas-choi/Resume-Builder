@@ -596,7 +596,7 @@ achievements) and recommendations are third-party statements (never restated as
 the person's own claims). No new env vars, no new dependencies. Suite: 128
 unit tests green.
 
-## Phase 3 — Document Agent: rendering + cover letter (design doc §9, §1)
+## Phase 3 — Document Agent: rendering + cover letter (design doc §9, §1) — **implemented 2026-07-21**
 
 1. `src/tools/docx_renderer.py` + `src/agents/document.py` — pure rendering (no LLM) of `TailoredCV` → `.docx` from a bundled template (name/contact header, summary, experiences, projects, skills); PDF via `libreoffice --headless` in the Docker image (add to Dockerfile).
 2. Add `render_document` node to the tailoring graph after `validate_cv` (skipped when validation flags exist and caller hasn't approved).
@@ -604,6 +604,33 @@ unit tests green.
 4. API: `POST /tailor` gains `render: bool` + `cover_letter: bool` flags; new `GET /document/{tailor_id}` returns the .docx/.pdf file.
 
 **Tests:** `tests/unit/test_docx_renderer.py` (render fixture `TailoredCV`, re-open with python-docx and assert content/ordering), `test_document_agent.py` (skip-on-flags behavior), cover-letter prompt unit test (mocked LLM), extended API tests. PDF conversion covered by an integration test (needs LibreOffice, runs in Docker).
+
+**As implemented:** the render decision and the layout are separate modules —
+`src/agents/document.py` owns `skip_reason()` (the gate) and
+`src/tools/docx_renderer.py` only draws, so neither can be tested through the
+other. Three things the plan had not settled:
+
+- **Approval needed a request field.** "Skipped when validation flags exist and
+  the caller hasn't approved" has no meaning without a way to approve, so
+  `POST /tailor` gained `approve_flagged` alongside `render`/`cover_letter` —
+  otherwise a flagged run could never render at all in Phase 3.
+- **`TailoredCV` has no name or contact**, so the renderer takes them from the
+  `CareerProfile` (`render_cv(cv, path, name, contact)`); the schema was left
+  alone rather than duplicating identity onto every tailored CV.
+- **"A bundled template" became an optional one.** `DOCX_TEMPLATE` points at a
+  base `.docx` supplying styles/letterhead and the renderer always *appends*
+  content, so no placeholder-substitution engine exists; unset, python-docx's
+  default template is used, and a template lacking `Heading 1`/`List Bullet`
+  degrades to bold/plain paragraphs instead of raising.
+
+Also added beyond the plan: `src/utils/document_store.py` (third store, keyed by
+`tailor_id`, with filenames fixed per kind/format so a download cannot escape
+its directory, plus a `tailor.json` provenance copy) and a `cover-letter`
+SKILL.md composed with `anti-fabrication`, per the Phase 1.b pattern. PDF
+conversion runs LibreOffice with a throwaway `-env:UserInstallation` profile
+(HOME is not reliably writable in a container) and degrades to docx-only on a
+missing/failing binary. Suite: 166 unit tests green; the PDF integration test
+passes inside the built image.
 
 ## Phase 4 — Review UI + human-in-the-loop (design doc §10 frontend, §8 interrupt, §11 guardrails)
 

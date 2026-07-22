@@ -5,6 +5,11 @@
 - Python 3.11+ (local development)
 - Docker + Docker Compose (deployment)
 - An Anthropic API key (default provider) — or a local llama.cpp server (see [Local LLM via llama.cpp](#local-llm-via-llamacpp))
+- **Optional, for PDF output:** LibreOffice (`libreoffice-writer`, providing
+  `soffice`). It is installed in the Docker image; locally, without it the API
+  still returns `.docx` and logs a warning instead of a PDF — install it with
+  `sudo apt install libreoffice-writer`, or set `RENDER_PDF=false` to skip the
+  attempt entirely
 
 ## Local setup
 
@@ -35,12 +40,17 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_T
 | `EXTRACTION_MODEL` | no | `claude-haiku-4-5-20251001` | Per-source extraction model |
 | `SYNTHESIS_MODEL` | no | `claude-sonnet-5` | Profile synthesis model |
 | `TAILORING_MODEL` | no | `claude-sonnet-5` | Job analysis + CV tailoring model |
+| `COVER_LETTER_MODEL` | no | `TAILORING_MODEL` | Cover-letter model — same task and same no-fabrication rules as tailoring, so it follows that tier unless set |
 | `VALIDATION_MODEL` | no | `claude-sonnet-5` | Anti-fabrication LLM cross-check (override to `claude-opus-4-8` for max precision) |
 | `DATA_DIR` | no | `./data` | Root of the versioned JSON profile store |
 | `SKILLS_DIR` | no | `./skills` | Directory of per-agent `SKILL.md` reasoning skills (FUND skills mechanism). Prompt **content**, not secrets — ships in the image, safe to commit. A missing/empty dir degrades gracefully: each agent falls back to its inline prompt scaffolding and the pipeline still runs |
 | `LOG_LEVEL` | no | `INFO` | Root log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`); unknown values fall back to `INFO`. `DEBUG` traces the ingestion pipeline: GitHub repo list + full source document, extraction inputs/results, synthesis payload/profile (noisy libs — httpx/httpcore/urllib3/watchfiles/openai — stay capped at INFO) |
 | `LOG_FILE` | no | unset | Log file path (e.g. `./logs/app.log`); unset = console only. Rotates at 10 MB keeping 3 backups; parent dir auto-created; uvicorn access/error logs are routed there too |
 | `VALIDATION_SIMILARITY_THRESHOLD` | no | `0.55` | difflib ratio below which a tailored bullet triggers the LLM cross-check |
+| `DOCX_TEMPLATE` | no | — | Path to a base `.docx` supplying styles/theme/letterhead for rendered documents. Content is always appended by the renderer, so the template needs no placeholders; one lacking the built-in `Heading 1`/`List Bullet` styles degrades to bold/plain paragraphs. A configured-but-missing path logs a WARNING and falls back to the default template |
+| `RENDER_PDF` | no | `true` | Whether to convert each rendered `.docx` to PDF with headless LibreOffice. `false` → `.docx` only, no subprocess call |
+| `LIBREOFFICE_BIN` | no | `soffice` | The headless converter binary. Installed in the Docker image (`libreoffice-writer`); if it is missing or fails locally the PDF is skipped with a WARNING and the `.docx` is still returned |
+| `LIBREOFFICE_TIMEOUT_S` | no | `120` | Per-conversion timeout; on timeout the PDF is skipped, never the run |
 
 Secrets live in `.env` (gitignored) and are loaded via `python-dotenv`; never
 commit or hardcode them.
@@ -183,6 +193,18 @@ pytest -m integration        # end-to-end against real Anthropic API (needs ANTH
 
 Unit tests are the default (`pytest.ini` excludes the `integration` marker).
 
+The integration suite also covers PDF conversion against a real LibreOffice
+(`tests/integration/test_pdf_render.py`), which needs no API key but does need
+a working `soffice` — it skips otherwise. To run it where it is guaranteed to
+be present, use the image:
+
+```bash
+docker compose build
+docker run --rm -v "$PWD/tests:/app/tests" -v "$PWD/pytest.ini:/app/pytest.ini" \
+  resume-builder-api sh -c "pip install -q pytest && \
+    python -m pytest tests/integration/test_pdf_render.py -m integration"
+```
+
 ## Smoke test
 
 ```bash
@@ -193,7 +215,21 @@ curl -F "cv=@resume.docx" -F "linkedin_export=@Basic_LinkedInDataExport.zip" \
   localhost:8000/ingest
 curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
   -d '{"profile_id": "<id from ingest>", "job_post": "<paste job post>"}'
+# ...and with rendered documents + a cover letter
+curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
+  -d '{"profile_id": "<id>", "job_post": "<paste job post>",
+       "render": true, "cover_letter": true}'
+TAILOR_ID=<tailor_id from the response>
+curl -o cv.docx "localhost:8000/document/$TAILOR_ID"
+curl -o cv.pdf  "localhost:8000/document/$TAILOR_ID?format=pdf"
+curl -o cover-letter.docx "localhost:8000/document/$TAILOR_ID?kind=cover_letter"
 ```
+
+If the response carries `"render_skipped": "... need review"`, the validation
+gate blocked the render: read `validation.flags`, then re-run the same request
+with `"approve_flagged": true` to render anyway. A missing `cv.pdf` (404) with
+a present `cv.docx` means LibreOffice was unavailable — check the log for
+`skipping PDF`.
 
 Profiles land in `data/profiles/{profile_id}/v{n}.json` with a `latest`
 pointer file. Each `/ingest` call also returns a `run_id` and archives its
@@ -225,17 +261,28 @@ and its inputs/outputs are archived under `DATA_DIR`:
 | `data/sources/{run_id}/manifest.json` | Index of inputs (category, filename, size, sha256) linked to `profile_id`/`version` |
 | `data/output/{run_id}/output.json` | Copy of the synthesized profile |
 
+Each `POST /tailor` execution is likewise tagged with a `tailor_id`:
+
+| Path | Contents |
+|---|---|
+| `data/documents/{tailor_id}/cv.docx` / `cv.pdf` | The rendered CV (PDF only when LibreOffice ran) |
+| `data/documents/{tailor_id}/cover-letter.docx` / `.pdf` | The rendered cover letter, when one was requested |
+| `data/documents/{tailor_id}/tailor.json` | The run's tailored CV, validation result and cover letter — always written, even when nothing was rendered |
+
 - **Retention / privacy:** raw CVs are now **retained** on disk (previously they
   were parsed from a temp file and immediately deleted). Treat `data/sources/`
   as sensitive PII — it holds original résumés and pasted personal summaries.
   `data/` is gitignored; back it up and purge it per your retention policy.
-  There is no API for deleting a run yet — remove `data/sources/{run_id}` and
-  `data/output/{run_id}` directories manually.
+  There is no API for deleting a run yet — remove `data/sources/{run_id}`,
+  `data/output/{run_id}` and `data/documents/{tailor_id}` directories manually.
+  Rendered documents are PII too: a `.docx`/`.pdf` under `data/documents/` is a
+  finished résumé complete with contact details, and it is served by
+  `GET /document/{tailor_id}` to anyone who can reach the API and knows the id.
 - **Log correlation:** with `LOG_FILE` set, every pipeline log line is tagged
   `[run:<run_id>]`, so a single run is greppable across steps:
   `grep '\[run:<run_id>\]' logs/app.log`.
-- **Disk growth:** sources + output accumulate per run; prune old `run_id`
-  directories periodically.
+- **Disk growth:** sources + output accumulate per run and documents per
+  tailoring run; prune old `run_id` / `tailor_id` directories periodically.
 - **LinkedIn exports (Phase 2) — no setup change.** No new env vars and no new
   dependencies (`zipfile`/`csv` are stdlib); parsing is offline, so no outbound
   request and no credential is involved. Operationally the one thing to know is

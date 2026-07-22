@@ -7,8 +7,14 @@ from fastapi.testclient import TestClient
 
 from src.api import routes
 from src.api.main import create_app
-from src.models.schemas import JobRequirements, TailoredCV, ValidationResult
-from src.utils import profile_store
+from src.models.schemas import (
+    CoverLetter,
+    JobRequirements,
+    TailoredCV,
+    ValidationFlag,
+    ValidationResult,
+)
+from src.utils import document_store, profile_store
 from tests.conftest import build_linkedin_export_zip, build_sample_docx
 
 
@@ -33,8 +39,10 @@ class FakeIngestionGraph:
 class FakeTailoringGraph:
     def __init__(self, final_state):
         self.final_state = final_state
+        self.received_state = None
 
     def invoke(self, state):
+        self.received_state = state
         return {**state, **self.final_state}
 
 
@@ -295,6 +303,147 @@ def test_tailor_endpoint(client, monkeypatch, sample_profile):
     body = resp.json()
     assert body["tailored_cv"]["headline"] == "Senior Engineer"
     assert body["validation"]["passed"] is True
+    # Phase 3 defaults: no rendering, no cover letter.
+    assert body["documents"] == []
+    assert body["cover_letter"] is None
+    assert body["tailor_id"]
+
+
+def _tailor(client, monkeypatch, sample_profile, body, final_state=None):
+    """POST /tailor with a mocked graph; returns (response, fake_graph)."""
+    profile_id, _ = profile_store.save_profile(sample_profile)
+    fake = FakeTailoringGraph(
+        final_state
+        or {
+            "job_requirements": JobRequirements(title="Backend Engineer"),
+            "tailored_cv": TailoredCV(headline="Senior Engineer", summary="Pitch."),
+            "validation": ValidationResult(passed=True),
+        }
+    )
+    monkeypatch.setattr(routes, "build_tailoring_graph", lambda: fake)
+    resp = client.post(
+        "/tailor", json={"profile_id": profile_id, "job_post": "job post", **body}
+    )
+    return resp, fake
+
+
+def test_tailor_threads_render_flags_into_the_graph(client, monkeypatch, sample_profile):
+    resp, fake = _tailor(
+        client,
+        monkeypatch,
+        sample_profile,
+        {"render": True, "cover_letter": True, "approve_flagged": True},
+    )
+    assert resp.status_code == 200
+    state = fake.received_state
+    assert state["render"] is True
+    assert state["want_cover_letter"] is True
+    assert state["approved"] is True
+    assert state["tailor_id"] == resp.json()["tailor_id"]
+
+
+def test_tailor_returns_documents_with_download_urls(client, monkeypatch, sample_profile):
+    resp, _ = _tailor(
+        client,
+        monkeypatch,
+        sample_profile,
+        {"render": True},
+        final_state={
+            "job_requirements": JobRequirements(title="Backend Engineer"),
+            "tailored_cv": TailoredCV(headline="Senior Engineer", summary="Pitch."),
+            "validation": ValidationResult(passed=True),
+            "documents": [
+                {"kind": "cv", "format": "docx", "filename": "cv.docx", "size_bytes": 9}
+            ],
+            "render_skipped": None,
+        },
+    )
+    body = resp.json()
+    tailor_id = body["tailor_id"]
+    assert body["documents"] == [
+        {
+            "kind": "cv",
+            "format": "docx",
+            "filename": "cv.docx",
+            "size_bytes": 9,
+            "url": f"/document/{tailor_id}?kind=cv&format=docx",
+        }
+    ]
+
+
+def test_tailor_reports_a_skipped_render(client, monkeypatch, sample_profile):
+    resp, _ = _tailor(
+        client,
+        monkeypatch,
+        sample_profile,
+        {"render": True},
+        final_state={
+            "job_requirements": JobRequirements(title="Backend Engineer"),
+            "tailored_cv": TailoredCV(headline="Senior Engineer", summary="Pitch."),
+            "validation": ValidationResult(
+                passed=False,
+                needs_review=True,
+                flags=[
+                    ValidationFlag(item="Ran a team of 40", kind="bullet", reason="x")
+                ],
+            ),
+            "documents": [],
+            "render_skipped": "1 validation flag(s) need review",
+        },
+    )
+    body = resp.json()
+    assert body["documents"] == []
+    assert "need review" in body["render_skipped"]
+
+
+def test_tailor_returns_and_persists_the_cover_letter(
+    client, data_dir, monkeypatch, sample_profile
+):
+    resp, _ = _tailor(
+        client,
+        monkeypatch,
+        sample_profile,
+        {"cover_letter": True},
+        final_state={
+            "job_requirements": JobRequirements(title="Backend Engineer"),
+            "tailored_cv": TailoredCV(headline="Senior Engineer", summary="Pitch."),
+            "validation": ValidationResult(passed=True),
+            "cover_letter": CoverLetter(
+                greeting="Dear Hiring Manager,",
+                body_paragraphs=["I would like to apply."],
+                closing="Sincerely,",
+            ),
+        },
+    )
+    body = resp.json()
+    assert body["cover_letter"]["greeting"] == "Dear Hiring Manager,"
+    # The run's result is saved beside its documents for traceability.
+    saved = json.loads(
+        (data_dir / "documents" / body["tailor_id"] / "tailor.json").read_text()
+    )
+    assert saved["tailor_id"] == body["tailor_id"]
+    assert saved["cover_letter"]["closing"] == "Sincerely,"
+
+
+def test_get_document_serves_a_rendered_file(client, data_dir):
+    path = document_store.document_path("tailor-1", "cv", "docx")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"docx bytes")
+
+    resp = client.get("/document/tailor-1")  # kind=cv, format=docx by default
+    assert resp.status_code == 200
+    assert resp.content == b"docx bytes"
+    assert "cv.docx" in resp.headers["content-disposition"]
+
+
+def test_get_document_404s_when_not_rendered(client, data_dir):
+    assert client.get("/document/tailor-1").status_code == 404
+    assert client.get("/document/tailor-1", params={"format": "pdf"}).status_code == 404
+
+
+def test_get_document_rejects_unknown_kind_and_unsafe_id(client, data_dir):
+    assert client.get("/document/tailor-1", params={"kind": "portfolio"}).status_code == 400
+    assert client.get("/document/..%2F..%2Fetc").status_code in (400, 404)
 
 
 def test_ingest_events_sse_streams_progress(client):

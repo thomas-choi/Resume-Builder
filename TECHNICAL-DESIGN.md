@@ -379,6 +379,53 @@ If using LangGraph, this is a natural `interrupt()` point — surface flagged it
 
 Renders `TailoredCV` → `.docx` (and/or PDF) using a template. This is a pure rendering step, no LLM — use `python-docx` with a template + style, or Claude's own docx skill if this is running inside Claude Code/Claude.ai rather than as a standalone service.
 
+### Rendering & the render gate (Phase 3, 2026-07-21)
+
+Implemented as two pieces, deliberately split so the decision and the drawing
+are separately testable:
+
+- **`src/tools/docx_renderer.py` — pure layout.** Everything it writes already
+  exists in the `TailoredCV` / `CoverLetter` that the validation gate checked,
+  so the renderer never adds, rewrites, or infers content; it only lays it out.
+  Section order is fixed and mirrors the schema (name/contact header → headline
+  → summary → experiences → projects → skills). `relevance_notes` is internal
+  tailoring reasoning and is **not** rendered; empty sections are omitted
+  entirely rather than emitted as empty headings.
+- **`src/agents/document.py` — the gate.** `skip_reason()` answers *whether*
+  rendering may happen; `render_documents()` drives the renderer. A CV whose
+  claims validation could not trace back to the profile must not quietly become
+  a polished file someone sends out, so a run with `needs_review` flags renders
+  **nothing** unless the caller passes `approve_flagged` (Phase 3's review is
+  client-side — the caller has already seen `validation.flags` in the response;
+  Phase 4 replaces this with a graph `interrupt()`).
+
+**Templates.** `DOCX_TEMPLATE` optionally points at a base `.docx` supplying
+styles/theme/letterhead; content is always *appended* by the renderer, so no
+placeholder-substitution engine is needed. A template lacking the built-in
+`Heading 1` / `List Bullet` styles degrades to bold/plain paragraphs instead of
+raising, and a configured-but-missing template falls back to python-docx's
+default with a WARNING.
+
+**PDF.** A second, separable step: the rendered `.docx` is converted by headless
+LibreOffice (`LIBREOFFICE_BIN`, shipped in the Docker image as
+`libreoffice-writer`), invoked with a throwaway `-env:UserInstallation` profile
+because `HOME` is not reliably writable in a container. A missing binary, a
+non-zero exit, or a timeout logs a WARNING and yields `None` — the `.docx` is
+the guaranteed output and a PDF is never allowed to fail a tailoring run.
+`RENDER_PDF=false` skips the attempt outright.
+
+### Cover letter (design doc §1's optional second output)
+
+`tailoring.generate_cover_letter` is an LLM node (`COVER_LETTER_MODEL`,
+defaulting to `TAILORING_MODEL`) producing the `CoverLetter` schema. It is given
+the profile, the `JobRequirements` **and** the already-tailored CV: that CV is
+the set of facts deemed relevant to this posting, so the letter *connects* them
+rather than re-selecting from scratch. It composes the `cover-letter` skill with
+`anti-fabrication` (same pattern as tailoring), so the letter is bound by the
+same no-invention rules as the CV — plus two rules the letter form makes
+necessary: no inventing motivations or claims about the company, and no
+restating third-party recommendations as the candidate's own claims.
+
 ---
 
 ## 10. Tech stack (matches your FUND stack)
@@ -462,12 +509,21 @@ same `linkedin/` category (as `<original-name>.zip`, alongside the pasted
 
 ```mermaid
 flowchart LR
-    START --> analyze_job --> tailor_cv --> validate_cv --> END
+    START --> analyze_job --> tailor_cv --> validate_cv
+    validate_cv -->|want_cover_letter| write_cover_letter --> render_document
+    validate_cv -->|otherwise| render_document
+    render_document --> END
 ```
 
 - `analyze_job` — Sonnet → `JobRequirements`.
 - `tailor_cv` — Sonnet with hard no-fabrication rules in the system prompt →
   `TailoredCV`.
+- `write_cover_letter` (Phase 3) — Sonnet → `CoverLetter`; reached only via the
+  conditional edge, i.e. when the caller asked for one, so the default path
+  costs no extra LLM call.
+- `render_document` (Phase 3) — no LLM; renders `.docx`/PDF into
+  `data/documents/{tailor_id}/`. Renders nothing when the caller did not ask
+  (`render`) or when the gate blocks it, reporting why in `render_skipped`.
 - `validate_cv` — layered gate: (a) exact `raw_source_map` hit passes;
   (b) difflib similarity vs. original bullets ≥ threshold
   (`VALIDATION_SIMILARITY_THRESHOLD`, default 0.55) passes; (c) anything
@@ -475,6 +531,12 @@ flowchart LR
   returned as `needs_review` flags. Skill/experience/project membership
   checks are fully deterministic. In Phases 1–3 human review of flags is
   client-side; Phase 4 upgrades to a LangGraph `interrupt()` + checkpointer.
+  Phase 3 gave the flags teeth: they now block `render_document` until the
+  caller approves them (§9).
+
+State carries `tailor_id` (one `/tailor` execution, the key of the document
+store), the caller's `render` / `want_cover_letter` / `approved` flags, and the
+results `cover_letter`, `documents`, `render_skipped`.
 
 ### Model tiering (env-configurable, `src/config.py`)
 
@@ -483,6 +545,7 @@ flowchart LR
 | Extraction | `EXTRACTION_MODEL` | `claude-haiku-4-5-20251001` |
 | Synthesis | `SYNTHESIS_MODEL` | `claude-sonnet-5` |
 | Job analysis + tailoring | `TAILORING_MODEL` | `claude-sonnet-5` |
+| Cover letter | `COVER_LETTER_MODEL` | `TAILORING_MODEL` (same task, same rules) |
 | Validation cross-check | `VALIDATION_MODEL` | `claude-sonnet-5` (override to `claude-opus-4-8` for max precision) |
 
 Every LLM node uses `make_llm(...).with_structured_output(<PydanticModel>)`
@@ -510,7 +573,8 @@ skills/
 ├── profile-synthesis/SKILL.md   # synthesis
 ├── job-analysis/SKILL.md        # job_analysis
 ├── cv-tailoring/SKILL.md        # tailoring (HARD RULES)
-└── anti-fabrication/SKILL.md    # validation (also composed into tailoring)
+├── anti-fabrication/SKILL.md    # validation (also composed into tailoring + cover letter)
+└── cover-letter/SKILL.md        # cover letter (Phase 3): shape + register
 ```
 
 Each `SKILL.md` is YAML frontmatter (`name`, `description`) + a Markdown body.
@@ -547,12 +611,19 @@ data/
 │   ├── linkedin/linkedin-summary.txt  # the free_text / LinkedIn-summary input
 │   ├── linkedin/<export-name>.zip     # uploaded LinkedIn data export (Phase 2)
 │   └── manifest.json             # index (category, filename, size, sha256) + profile_id/version
-└── output/{run_id}/output.json   # copy of the synthesized profile for the run
+├── output/{run_id}/output.json   # copy of the synthesized profile for the run
+└── documents/{tailor_id}/        # rendered documents (Phase 3, src/utils/document_store.py)
+    ├── cv.docx / cv.pdf
+    ├── cover-letter.docx / cover-letter.pdf
+    └── tailor.json               # the run's tailored CV, validation result, cover letter
 ```
 
 `profile_store.py` owns `profiles/`; `run_store.py` owns `sources/` and
-`output/`. `run_id` = one ingest execution; `profile_id` = an evolving profile
-that may span runs. Raw CVs are **retained** here (previously deleted after
+`output/`; `document_store.py` owns `documents/`. `run_id` = one ingest
+execution; `tailor_id` = one `/tailor` execution; `profile_id` = an evolving
+profile that may span runs. Document filenames are fixed per (kind, format) and
+`tailor_id` is restricted to `[A-Za-z0-9_-]{1,64}`, so a `GET /document` request
+can never address a path outside its own directory. Raw CVs are **retained** here (previously deleted after
 parsing) — see OPERATIONS.md for the retention/privacy note.
 
 ### Merge flow (planned — Phase 1.d)
@@ -606,5 +677,9 @@ Long-running ingestion progress is streamed per-node over SSE using an
 in-process job registry (`dict[job_id, asyncio.Queue]`); the graph runs in a
 worker thread and publishes node names via `loop.call_soon_threadsafe`. The
 client may supply its own `job_id` form field so it can subscribe before
-POSTing. Everything ships in **one Docker container** (python:3.11-slim,
-uvicorn on 0.0.0.0:8000, `data/` volume-mounted).
+POSTing. `POST /tailor` is synchronous (no SSE) and, since Phase 3, returns a
+`tailor_id` whose rendered files are downloaded from
+`GET /document/{tailor_id}?kind=&format=` — served with `FileResponse` from the
+document store, 404 when that file was not rendered. Everything ships in **one
+Docker container** (python:3.11-slim + `libreoffice-writer` for PDF, uvicorn on
+0.0.0.0:8000, `data/` volume-mounted).

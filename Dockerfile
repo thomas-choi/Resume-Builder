@@ -2,6 +2,14 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# libreoffice-writer supplies the headless `soffice` used by
+# src/tools/docx_renderer.convert_to_pdf to turn rendered .docx into PDF.
+# Without it the API still returns .docx (PDF conversion degrades with a
+# warning) — set RENDER_PDF=false to skip it deliberately.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libreoffice-writer \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

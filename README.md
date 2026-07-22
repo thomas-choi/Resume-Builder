@@ -18,7 +18,7 @@ flowchart LR
         A[CV / LinkedIn / GitHub / free text] --> B[extract per source<br/>Haiku] --> C[synthesize profile<br/>Sonnet] --> D[(versioned JSON store)]
     end
     subgraph Tailoring
-        D --> E[analyze job post] --> F[tailor CV<br/>no-fabrication rules] --> G[validation gate<br/>source map + similarity + LLM check]
+        D --> E[analyze job post] --> F[tailor CV<br/>no-fabrication rules] --> G[validation gate<br/>source map + similarity + LLM check] --> H[render .docx / PDF<br/>+ optional cover letter]
     end
 ```
 
@@ -26,7 +26,7 @@ flowchart LR
 - **Conflict surfacing** — when sources disagree (e.g. two start dates), the
   conflict is returned to you, never silently resolved.
 - **Validation gate** — tailored claims that can't be traced to your profile
-  come back as `needs_review` flags.
+  come back as `needs_review` flags, and block rendering until you approve them.
 
 ## Setup
 
@@ -71,7 +71,18 @@ curl -X PUT localhost:8000/profile/<profile_id> -H 'content-type: application/js
 curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
      -d '{"profile_id": "<profile_id>", "job_post": "<paste the job posting>"}'
 # -> tailored_cv + validation.flags (review anything with needs_review: true)
+
+# 4. Same call, but also render the documents and write a cover letter
+curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
+     -d '{"profile_id": "<profile_id>", "job_post": "<paste the job posting>",
+          "render": true, "cover_letter": true}'
+# -> ... + tailor_id + documents[] (nothing is rendered while flags need review)
+curl -o cv.docx "localhost:8000/document/<tailor_id>"
+curl -o cv.pdf  "localhost:8000/document/<tailor_id>?format=pdf"
 ```
+
+PDF output needs LibreOffice (shipped in the Docker image); without it you get
+the `.docx` and a warning in the log.
 
 ## Tests
 
