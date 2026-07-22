@@ -101,14 +101,34 @@ profile is durable: re-tailoring for new job posts never re-runs ingestion.
 
 ### 3. Tailor a CV for a job post
 
-Paste a job posting. The system:
+Paste a job posting — the whole ad, as you copied it, no cleaning up needed —
+and say which profile to use. That one request runs the whole way through:
 
-1. extracts the job's requirements and ATS keywords,
-2. selects and re-orders your most relevant experiences/projects (subset, not
-   everything), mirroring the job's terminology only where your actual
-   experience supports it,
-3. **validates** every generated claim against your profile — anything that
-   can't be traced back is flagged `needs_review` for you to approve or reject.
+1. **Read the posting.** The job ad is turned into a structured list of what the
+   employer actually wants: must-have skills, nice-to-haves, seniority, the
+   responsibilities, and the exact phrasing worth mirroring for applicant
+   tracking systems.
+2. **Choose what to say.** Your profile is matched against that list: a
+   *subset* of your experience and projects is selected and re-ordered by
+   relevance — not everything you've ever done — and bullets are re-worded
+   toward the posting's language, but only where the underlying fact supports
+   it. Nothing new is added.
+3. **Check every claim.** Each bullet, skill, job and project in the draft is
+   traced back to your profile. Exact matches and obvious re-wordings pass
+   quietly; anything that can't be traced gets a second, stricter check and is
+   returned to you as a **flag** explaining what couldn't be supported.
+4. **Write a cover letter** (only if you asked for one) from the facts just
+   selected for the CV.
+5. **Render the documents** (only if you asked for them) — see step 4 below —
+   unless there are flags, in which case nothing is written until you approve.
+
+You get back the tailored CV, the flags, and the documents in one response. Your
+profile is untouched by all of this, so you can tailor the same profile to as
+many postings as you like; ingestion never runs again.
+
+**What it costs you in time:** two AI calls for the CV, plus one for each claim
+that needed the stricter check, plus one if you asked for a cover letter — a
+typical run is a few seconds to a minute.
 
 ### 4. Get the documents (and a cover letter)
 

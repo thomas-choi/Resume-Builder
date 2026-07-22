@@ -538,6 +538,96 @@ State carries `tailor_id` (one `/tailor` execution, the key of the document
 store), the caller's `render` / `want_cover_letter` / `approved` flags, and the
 results `cover_letter`, `documents`, `render_skipped`.
 
+### From job description to targeted CV: one request, step by step
+
+§6–§9 describe each stage in isolation. This is the whole path a single job
+description takes, from the HTTP request to a downloadable file — the order
+things happen in, what each step reads and writes, and where a run can stop.
+
+```mermaid
+sequenceDiagram
+    participant C as Caller
+    participant API as POST /tailor
+    participant PS as profile_store
+    participant G as tailoring graph
+    participant LLM as LLM provider
+    participant DS as document_store
+
+    C->>API: {profile_id, job_post, render, cover_letter}
+    API->>PS: load_profile(profile_id, version)
+    PS-->>API: CareerProfile (404 if unknown)
+    API->>API: mint tailor_id, validate job_post
+    API->>G: invoke(state) in a worker thread
+    G->>LLM: analyze_job — JD + job-analysis skill
+    LLM-->>G: JobRequirements
+    G->>LLM: tailor_cv — profile + requirements + cv-tailoring/anti-fabrication
+    LLM-->>G: TailoredCV
+    G->>G: validate_cv — source map, then similarity
+    G->>LLM: cross-check (only claims below threshold)
+    LLM-->>G: supported? + reason
+    opt cover_letter requested
+        G->>LLM: write_cover_letter — profile + requirements + tailored CV
+        LLM-->>G: CoverLetter
+    end
+    G->>DS: render_document (blocked while flags need review)
+    DS-->>G: documents[]
+    G-->>API: final state
+    API->>DS: save_result → tailor.json
+    API-->>C: tailored_cv + validation + documents[] + render_skipped
+    C->>API: GET /document/{tailor_id}?kind=&format=
+```
+
+| # | Step | Where | Model / skill | In → out |
+|---|---|---|---|---|
+| 0 | Accept the request | `src/api/routes.py:tailor` | — | `TailorRequest` → loaded `CareerProfile` + a fresh `tailor_id`. Unknown profile/version → **404**; blank `job_post` → **400**. The graph then runs in a worker thread (`anyio.to_thread.run_sync`) so the event loop stays free |
+| 1 | `analyze_job` | `src/agents/job_analysis.py` | `TAILORING_MODEL` + `job-analysis` | Raw JD text (fenced by `--- JOB POST START/END ---`) → `JobRequirements`. The posting is never regex-parsed; the model splits must-haves from nice-to-haves and lifts ATS phrasing |
+| 2 | `tailor_cv` | `src/agents/tailoring.py` | `TAILORING_MODEL` + `cv-tailoring` **+** `anti-fabrication` | Full profile JSON + requirements JSON → `TailoredCV`. Selects a *subset* of experiences/projects, re-orders bullets, mirrors the posting's terminology only where a profile fact supports it |
+| 3 | `validate_cv` | `src/agents/validation.py` | `VALIDATION_MODEL` + `anti-fabrication`, **only** for step 3c | Profile + tailored CV → `ValidationResult`. Three layers, cheapest first (below) |
+| 4 | `write_cover_letter` *(optional)* | `src/agents/tailoring.py` | `COVER_LETTER_MODEL` + `cover-letter` **+** `anti-fabrication` | Profile + requirements + the tailored CV (minus `relevance_notes`) → `CoverLetter`. Reached only via the conditional edge, so the default path never pays for it |
+| 5 | `render_document` | `src/agents/tailoring_graph.py` → `src/agents/document.py` | none (no LLM) | Tailored CV (+ letter) → files in `data/documents/{tailor_id}/`, or `render_skipped` explaining why nothing was written |
+| 6 | Respond & persist | `src/api/routes.py:tailor` | — | Final state → JSON response (each document carries a ready-made `url`), and `tailor.json` is written beside the files |
+| 7 | Download | `GET /document/{tailor_id}` | — | `kind`/`format` → the file, served from the document store |
+
+**Step 3 in detail — the gate is layered so most claims cost nothing.** For every
+bullet in the tailored CV:
+
+1. **exact hit** in `CareerProfile.raw_source_map` → passes, no model call;
+2. else **difflib similarity** against every original profile bullet — a ratio
+   ≥ `VALIDATION_SIMILARITY_THRESHOLD` (0.55) is treated as a rewording and
+   passes;
+3. else **one LLM cross-check** for that claim alone; "not supported" becomes a
+   `ValidationFlag` carrying the similarity score.
+
+Skills, experiences and projects never reach the model at all: they are checked
+deterministically for membership in the profile (skill name, `(company, title)`,
+project name — all case-insensitive). `needs_review` is simply "any flag at
+all".
+
+**Where a run stops.** Only three places, all of them explicit in the response:
+
+- **404/400 at step 0** — nothing ran, nothing was charged.
+- **Flags at step 3** — the pipeline still completes and returns the full
+  `tailored_cv` and `flags`, but step 5 writes **nothing** and sets
+  `render_skipped`. Re-running with `approve_flagged` is what unblocks it.
+- **`render: false`** (the default) — steps 1–3 run, step 5 no-ops with
+  `render_skipped: "rendering not requested"`. This is the JSON-only path Phases
+  1–2 had.
+
+**Cost per request:** two LLM calls minimum (steps 1 and 2), plus one per claim
+that falls through to step 3c, plus one if a cover letter was asked for. The
+profile is read from storage, so ingestion never re-runs — the same profile can
+be tailored to any number of postings.
+
+**Two properties worth noting, because they are easy to assume otherwise:**
+
+- `raw_source_map` is **excluded** from the tailoring prompt
+  (`model_dump(exclude={"raw_source_map"})`). It is the validator's evidence
+  index, so the generator never sees the map its output will be scored against.
+- The **cover letter is not re-validated**. Step 3 runs before step 4 and only
+  over the `TailoredCV`; the letter is constrained by its skill and by being
+  handed the already-tailored facts, but no deterministic gate re-checks it.
+  Rendering it is still blocked by the CV's flags.
+
 ### Model tiering (env-configurable, `src/config.py`)
 
 | Stage | Env var | Default |

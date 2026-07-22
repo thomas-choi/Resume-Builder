@@ -93,6 +93,11 @@ call returns when rendering is done. Ingestion is not re-run: the profile is
 loaded from the store, so the same profile can be re-tailored to any number of
 job posts cheaply.
 
+For what each of those nodes reads and writes — and the three places a run can
+stop — see [TECHNICAL-DESIGN.md § "From job description to targeted
+CV"](TECHNICAL-DESIGN.md#from-job-description-to-targeted-cv-one-request-step-by-step).
+The worked `curl` example below covers the same path from the caller's side.
+
 **Request:** JSON
 
 | Field | Type | Required | Meaning |
