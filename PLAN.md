@@ -941,7 +941,7 @@ or ruled out against a live API before being written down.
   repos are in the profile. `ProfilePanel.tsx` has no `projects` markup at all —
   nor `education`, `certifications` or `contact` (see 6.d).
 
-### 6.a — A Reset button that clears the whole screen
+### 6.a — A Reset button that clears the whole screen — **implemented 2026-07-22**
 
 **Problem.** There is no way to start over short of reloading the browser. Every
 piece of session state is component-local and unreachable from the parent:
@@ -971,7 +971,7 @@ true, typing into the free-text box, loading a profile, then clicking "Clear
 everything" leaves the active-profile line gone and the inputs empty; with
 `confirm` stubbed false nothing changes.
 
-### 6.b — Clearing the screen when a new profile is built
+### 6.b — Clearing the screen when a new profile is built — **implemented 2026-07-22**
 
 **Problem.** "Build profile" starts a new profile but the previous one's output
 stays on screen. Three distinct stale-state paths, all confirmed by reading the
@@ -1005,6 +1005,27 @@ components:
 ingest and still staged after a failed one; the skipped/success banner survives
 the clear. `App.test.tsx` — a tailor result rendered for profile A is absent
 after the active profile becomes B.
+
+**As implemented (6.b + 6.a).** Both landed as written — 6.b first, then 6.a on
+top of it, as the sequencing note prescribes. Two things the plan had not
+settled:
+
+- **Sibling keys must be distinct.** `key={downstreamKey}` on both
+  `ProfilePanel` and `TailorPanel` gives two children of one parent the same
+  key; React then duplicates or omits them, and the first test run showed the
+  *cleared* profile still on screen because of it. The keys are prefixed
+  (`profile-`, `tailor-`, `sources-`) so each identifies one panel.
+- **A cleared cache is a separate assertion from a remount.** `queryClient
+  .clear()` is the only reason the profile does not flash straight back after
+  the remount, so the test asserts the profile *name* is gone rather than just
+  the active-profile line — the line disappears from `setProfileId(null)`
+  alone, and would pass even with the cache left full.
+
+Also: `githubUsername` is deliberately **not** cleared on success, unlike the
+files, token, free text and target-profile id — re-running the same account
+after adding a CV is a normal thing to do, and the field is not a secret.
+Suite: 61 vitest green (from 55); the 230 Python unit tests are untouched and
+still green.
 
 ### 6.c — "Could not load X: Failed to fetch" wipes a profile that loaded fine
 

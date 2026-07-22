@@ -133,6 +133,66 @@ describe("SourcesPanel", () => {
     expect(vi.mocked(api.ingest).mock.calls[1][0].githubToken).toBe("ghp-secret");
   });
 
+  it("clears the staged inputs after a successful run, keeping the banner", async () => {
+    // Clicking "Build profile" twice must not silently re-ingest the same CVs.
+    vi.spyOn(api, "ingest").mockResolvedValue(ingestResponse);
+    const user = userEvent.setup();
+    renderWithClient(<SourcesPanel onIngested={() => {}} />);
+
+    await user.upload(screen.getByLabelText(/CV files/), new File(["a"], "CV.docx"));
+    await user.upload(
+      screen.getByLabelText(/LinkedIn data export/),
+      new File(["b"], "Export.zip"),
+    );
+    await user.type(screen.getByLabelText(/Anything else/), "Some notes");
+    await user.type(screen.getByLabelText("GitHub token (optional)"), "ghp-secret");
+    await user.type(screen.getByLabelText(/existing profile/), "alice");
+    await user.click(screen.getByRole("button", { name: "Build profile" }));
+
+    expect(await screen.findByText(/ready/)).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Staged CV files" })).toBeNull();
+    expect(screen.queryByRole("list", { name: "Staged LinkedIn exports" })).toBeNull();
+    expect(screen.getByLabelText(/Anything else/)).toHaveValue("");
+    expect(screen.getByLabelText("GitHub token (optional)")).toHaveValue("");
+    expect(screen.getByLabelText(/existing profile/)).toHaveValue("");
+  });
+
+  it("keeps the staged files when the run fails", async () => {
+    // Re-picking every file after a 500 is the wrong price for a server error.
+    vi.spyOn(api, "ingest").mockRejectedValue(new Error("ingestion failed"));
+    const user = userEvent.setup();
+    renderWithClient(<SourcesPanel onIngested={() => {}} />);
+
+    await user.upload(screen.getByLabelText(/CV files/), new File(["a"], "CV.docx"));
+    await user.type(screen.getByLabelText(/Anything else/), "Some notes");
+    await user.click(screen.getByRole("button", { name: "Build profile" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("ingestion failed");
+    expect(screen.getByRole("list", { name: "Staged CV files" })).toHaveTextContent(
+      "CV.docx",
+    );
+    expect(screen.getByLabelText(/Anything else/)).toHaveValue("Some notes");
+  });
+
+  it("keeps the skipped-repo banner after the inputs are cleared", async () => {
+    vi.spyOn(api, "ingest").mockResolvedValue({
+      ...ingestResponse,
+      source_errors: [
+        { source: "github:alice", repo: "alice/repo-4", reason: "no tool call" },
+      ],
+    });
+    const user = userEvent.setup();
+    renderWithClient(<SourcesPanel onIngested={() => {}} />);
+    await user.upload(screen.getByLabelText(/CV files/), new File(["a"], "CV.docx"));
+    await user.click(screen.getByRole("button", { name: "Build profile" }));
+
+    expect(await screen.findByRole("list", { name: "Skipped items" })).toHaveTextContent(
+      "alice/repo-4",
+    );
+    expect(screen.getByText(/1 skipped/)).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Staged CV files" })).toBeNull();
+  });
+
   it("subscribes to progress before posting, and lists the nodes it hears", async () => {
     let emit: (node: string) => void = () => {};
     vi.spyOn(api, "subscribeToIngest").mockImplementation((_jobId, onNode) => {

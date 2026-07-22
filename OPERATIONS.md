@@ -443,6 +443,12 @@ Each `POST /tailor` execution is likewise tagged with a `tailor_id`:
   (`extract[<source_id>]: dropped projects[11] …`, `extraction failed for
   source …`), so a run that returns 200 with fewer entries than expected is
   diagnosable from the log: `grep 'extract\[' logs/app.log`.
+- **Session clearing (Phases 6.a/6.b) — no setup change.** No env vars, no
+  dependencies and no `vite.config.ts` change: "Clear everything" and the
+  clear-on-new-profile behaviour are browser-side state only. Worth knowing
+  when a user says they "cleared" their data — nothing under `data/` is
+  touched, so profiles, runs and documents are all still there and reloadable
+  by id; deleting them is still the manual prune described above.
 - **Skipped repos are reported, not just logged (Phase 5.c).** Anything the
   extractor could not read comes back in `source_errors` on the `/ingest`
   response and as `warning` events on the SSE stream, and the UI lists it. A

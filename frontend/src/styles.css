@@ -25,7 +25,8 @@ body {
   margin: 0 0 0.5rem;
 }
 
-.app > header form {
+.app > header form,
+.app > header .controls {
   display: flex;
   gap: 0.5rem;
   align-items: center;

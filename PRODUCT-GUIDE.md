@@ -122,6 +122,28 @@ While an ingest runs you can watch it happen — each step (reading your sources
 extracting facts, merging them into a profile, saving it) reports as it
 finishes, so a long GitHub or LinkedIn ingest is not a blank screen.
 
+**A finished run empties the form; a failed one does not.** When the profile is
+built, the staged files, the pasted notes, the GitHub token and the
+existing-profile id are cleared, so clicking "Build profile" a second time
+cannot quietly ingest the same CVs again. What stays on screen is the report of
+the run that just finished — the step list, the profile id and version, and any
+skipped repositories. If the run *fails*, everything you staged stays staged:
+a server error should not cost you the work of picking every file again.
+
+**Starting a new profile clears the old one's output.** The moment the active
+profile changes, the review screen and the tailoring screen are emptied — you
+never see the previous profile's headline or conflicts under the new profile's
+id, and the previous tailored CV, its diff and its download links go with it.
+Those links pointed at the earlier document; leaving them up invites
+downloading the wrong CV.
+
+**"Clear everything" starts a fresh session.** The button beside the profile
+loader empties every panel at once — staged files, the GitHub token, pasted
+notes, the loaded profile and its unsaved edits, the tailored CV and its
+downloads. It asks for confirmation first, because unsaved profile edits are
+among the things it discards. It only clears the *screen*: every profile,
+run and document remains on the server and can be loaded again by id.
+
 ### 2. Review and edit the profile
 
 Fetch the profile, fix anything, and save it back — every save creates a new

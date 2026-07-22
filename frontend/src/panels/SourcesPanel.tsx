@@ -103,7 +103,18 @@ export function SourcesPanel({ onIngested }: Props) {
       unsubscribe.current?.();
       unsubscribe.current = null;
     },
-    onSuccess: (data) => onIngested(data.profile_id),
+    onSuccess: (data) => {
+      // Clear the inputs on success only. A *failed* run keeps everything
+      // staged — otherwise a 500 costs the user every file they picked. The
+      // progress list and the outcome banner (including the skipped repos)
+      // survive either way; they describe the run that just happened.
+      setCvFiles([]);
+      setLinkedinFiles([]);
+      setFreeText("");
+      setGithubToken("");
+      setProfileId("");
+      onIngested(data.profile_id);
+    },
   });
 
   // The response is authoritative once it lands; the SSE warnings only fill the

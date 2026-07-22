@@ -607,6 +607,32 @@ Two decisions worth recording:
   lower-cased name — the same key `validation.py` and `review.py` use, so a
   project the UI marks flagged is the one the gate flagged, never a near-miss
   of the client's own invention.
+- **Panel state lifecycle is expressed as remounts (Phases 6.a/6.b).** Only one
+  piece of state is shared — the active `profile_id` in `App.tsx`. Everything
+  else (staged files, the GitHub token, the edited draft, the tailored result
+  and its download links) is component-local and unreachable from the parent, so
+  "start over" is not a prop threaded through four components and a dozen
+  `useState`s that would drift as the panels gain fields. Instead:
+  - `<SourcesPanel key={"sources-" + sessionKey}>` — a `sessionKey` counter
+    bumped by **Clear everything**, which also calls
+    `useQueryClient().clear()` (without it the remounted `ProfilePanel`
+    redraws the previous profile instantly from cache) and is guarded by a
+    `window.confirm`, since unsaved edits and a typed token go with it.
+  - `<ProfilePanel>` / `<TailorPanel>` are keyed on **`sessionKey` + the active
+    profile id**, so a new profile remounts both. That closes two windows at
+    once: `ProfilePanel` used to keep rendering the *old* profile's headline
+    under the *new* id between the id changing and the fetch landing (its
+    `draft` updates only when data arrives), and `TailorPanel.result` was never
+    reset at all — its diff, its pending review and its download links (which
+    carry the old `tailor_id`) survived the change of profile. Sibling keys are
+    prefixed because two children of one parent may not share a key.
+  - **Inputs clear on success, never on click.** `SourcesPanel` empties the
+    staged files, free text, token and target-profile id in the mutation's
+    `onSuccess`, so a second "Build profile" cannot silently re-ingest the same
+    CVs — but a *failed* run keeps everything staged, because re-picking every
+    file is the wrong price for a 500. The progress list and the outcome banner
+    (including the skipped repos) survive the clear: they describe the run that
+    just finished, not the next one.
 
 `Conflict.resolution` (`str | None`) is the one schema addition: conflicts are
 kept after resolution, not deleted — the record of who-said-what and what was

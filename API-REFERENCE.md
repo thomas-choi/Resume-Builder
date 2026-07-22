@@ -594,6 +594,13 @@ that arrives in Phase 4.
 > already in the `GET /profile/{id}` and `POST /tailor` responses documented
 > here, and none of them changed shape.
 
+> **Phases 6.a and 6.b (2026-07-22) — no API change.** "Clear everything" and
+> the clearing of the screen when a new profile is built are browser-side state
+> lifecycle only: no endpoint, request field, response field or status code
+> here changed, and nothing stored on the server is deleted by either — a
+> cleared screen still leaves every profile, run and document exactly where it
+> was, retrievable by id.
+
 > **Configurable UI dev-server address (2026-07-21) — no API change.** The Vite
 > dev server's bind address (`UI_HOST`/`UI_PORT`) and proxy target (`API_URL`)
 > are frontend tooling only. Every endpoint, path and response here is
