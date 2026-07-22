@@ -5,8 +5,14 @@ unless noted. Schemas referenced below are defined in `src/models/schemas.py`.
 
 ## GET /
 
-Redirects (307) to `/docs` — FastAPI's interactive Swagger UI, the
-browser-friendly way to explore and try every endpoint below.
+Serves the review UI (Phase 4) when a built frontend is present at
+`FRONTEND_DIR` (default `./frontend/dist`, and always the case in the Docker
+image). Its static assets are served from the same origin, so the browser calls
+the endpoints below directly.
+
+Without a build — a backend-only checkout, or `uvicorn` before `npm run build`
+— `/` redirects (307) to `/docs`, FastAPI's interactive Swagger UI. Every API
+route keeps its path in both modes.
 
 ## GET /healthz
 
@@ -87,11 +93,11 @@ mechanism). Body: full `CareerProfile` JSON. 404 if the profile doesn't exist.
 
 Generates a CV targeted at one job description, from a stored profile. Runs the
 tailoring graph
-`analyze_job → tailor_cv → validate_cv → [write_cover_letter] → render_document`
+`analyze_job → tailor_cv → validate_cv → prepare_review → human_review → [write_cover_letter] → render_document`
 (`src/agents/tailoring_graph.py`) synchronously — there is no SSE variant, the
-call returns when rendering is done. Ingestion is not re-run: the profile is
-loaded from the store, so the same profile can be re-tailored to any number of
-job posts cheaply.
+call returns when rendering is done, **or when the run pauses for human
+review**. Ingestion is not re-run: the profile is loaded from the store, so the
+same profile can be re-tailored to any number of job posts cheaply.
 
 For what each of those nodes reads and writes — and the three places a run can
 stop — see [TECHNICAL-DESIGN.md § "From job description to targeted
@@ -107,7 +113,7 @@ The worked `curl` example below covers the same path from the caller's side.
 | `version` | int \| null | no | Profile version to use; defaults to the latest |
 | `render` | bool | no (`false`) | Also render document files (`.docx`, plus `.pdf` when LibreOffice is available), downloadable from `GET /document/{tailor_id}` |
 | `cover_letter` | bool | no (`false`) | Also generate a cover letter. Returned as JSON either way; rendered too when `render` is set. Costs one extra LLM call |
-| `approve_flagged` | bool | no (`false`) | Render even though validation raised flags. Only meaningful with `render` — see "The render gate" below |
+| `approve_flagged` | bool | no (`false`) | Accept every validation flag up front: the run does **not** pause for review and renders regardless. Only meaningful with `render` — see "The render gate" below |
 
 ```json
 {"profile_id": "5f3c…", "job_post": "<pasted job post text>", "version": 2,
@@ -168,7 +174,10 @@ empty or whitespace-only; `422` malformed body (missing field / wrong type).
     {"kind": "cv", "format": "docx", "filename": "cv.docx",
      "size_bytes": 37421, "url": "/document/a1b2c3d4e5f6?kind=cv&format=docx"}
   ],
-  "render_skipped": null
+  "render_skipped": null,
+  "review_required": false,
+  "review": null,
+  "review_url": null
 }
 ```
 
@@ -181,8 +190,13 @@ Notes on the output:
   meant to be rendered into the CV, and the document renderer omits it.
 - `validation.needs_review = true` means at least one claim could not be traced
   back to `CareerProfile.raw_source_map` — review `flags` before using the CV.
-  Nothing is silently dropped or auto-approved; through Phase 3 the review is
-  the caller's responsibility (Phase 4 moves it server-side).
+  Nothing is silently dropped or auto-approved. When `render` was requested the
+  run pauses on those flags rather than returning them for the client to
+  honour (see "The render gate").
+- `review_required`, `review`, `review_url` (Phase 4) describe that pause:
+  `review` is the `ReviewRequest` the graph is waiting on, and the run stays
+  paused until `POST /tailor/{tailor_id}/resume`. All three are `null`/`false`
+  on a run that did not pause.
 - `tailor_id` identifies this run; it is the key for `GET /document/{tailor_id}`
   and the directory name under `data/documents/`.
 - `cover_letter` is `null` unless `cover_letter: true` was requested.
@@ -194,10 +208,94 @@ Notes on the output:
 
 **The render gate.** Rendering is refused while `validation.needs_review` is
 true: a claim the validator could not trace must not silently become a polished
-file. The response still contains the full `tailored_cv` and `flags`, so review
-them, then re-run the identical request with `"approve_flagged": true` to
-render anyway. (Re-running costs the LLM calls again; Phase 4 replaces this
-with a resumable server-side review.)
+file. What happens next depends on the request:
+
+| Request | Behaviour |
+|---|---|
+| `render: true`, flags raised | The graph **pauses** at `human_review`: `review_required: true`, `review` holds the flagged items, `documents` is empty. Answer with `POST /tailor/{tailor_id}/resume` — the same run then renders. |
+| `render: true`, `approve_flagged: true` | No pause; every flag is accepted and the CV renders as-is. |
+| `render: false` | Nothing can be rendered, so nothing is gated: flags come back in `validation` for inspection and no review is requested. |
+
+Pausing (rather than returning and asking the caller to re-run) matters twice
+over: the run is not charged for a second round of LLM calls, and the CV that
+renders is byte-for-byte the one that was reviewed — a re-run would produce a
+different draft than the one a person approved.
+
+## GET /tailor/{tailor_id}/review
+
+The flagged items a paused run is waiting on (Phase 4).
+
+**Path:** `tailor_id` — from the tailor response. Restricted to
+`[A-Za-z0-9_-]{1,64}`.
+
+**Response 200:**
+
+```json
+{
+  "pending": true,
+  "tailor_id": "a1b2c3d4e5f6",
+  "brief": "Plain-prose explanation of each flag, written by the review agent",
+  "items": [
+    {"id": "flag-0",
+     "item": "Ran a team of 40 engineers",
+     "kind": "bullet | skill | experience | project",
+     "reason": "No profile bullet mentions managing a team",
+     "similarity": 0.21,
+     "closest_profile_text": "Led migration of the data pipeline to PostgreSQL",
+     "source": "cv_docx:resume.docx"}
+  ]
+}
+```
+
+- `id` is what a decision refers to; it is stable for the life of the run.
+- `closest_profile_text` / `source` are the nearest sourced claim the gate
+  could find, so the reviewer can judge without re-reading the whole profile.
+  Both are `null` when nothing was close.
+- `brief` is written by the tool-calling review agent and is `""` when the
+  agent is disabled (`REVIEW_AGENT_ENABLED=false`) or its call failed — the
+  items are what gate rendering, never the prose.
+- `pending: false` means the review was already answered (or its checkpoint was
+  lost to a restart): the record is served from
+  `data/documents/{tailor_id}/review.json`, but `resume` will refuse it.
+
+**Errors:** `400` unsafe `tailor_id`; `404` that run never paused for review.
+
+## POST /tailor/{tailor_id}/resume
+
+Answers a pending review; the same run continues to the cover letter and
+rendering.
+
+**Request:** JSON
+
+| Field | Type | Required | Meaning |
+|---|---|---|---|
+| `approvals` | object | no (`{}`) | `ReviewItem.id` → keep it (`true`) or remove it (`false`) |
+| `approve_all` | bool | no (`false`) | Keep every flagged item |
+| `notes` | string | no (`""`) | Free text recorded with the decision |
+
+```bash
+curl -s -X POST "localhost:8000/tailor/$TAILOR_ID/resume" \
+     -H 'Content-Type: application/json' \
+     -d '{"approvals": {"flag-0": true, "flag-1": false},
+          "notes": "Kubernetes was never used in production."}'
+```
+
+**Anything not approved is removed from the CV** — not just from
+`highlighted_skills` / `bullets` / `selected_experiences` / `selected_projects`,
+but also from the `summary` and `headline` prose that may restate it (whole
+sentences naming a rejected claim are dropped; a headline that names one falls
+back to the profile's own headline). An item left out of `approvals` counts as
+**not** approved: silence is not consent for a claim the gate could not trace.
+
+**Response 200:** the same shape as `POST /tailor`, now with
+`review_required: false`, the pruned `tailored_cv`, `documents`, and a
+`validation` whose `needs_review` is `false` and whose `flags` list only the
+items the person chose to keep (kept for provenance — a human accepting a claim
+is not the gate having traced it).
+
+**Errors:** `400` unsafe `tailor_id`; `409` no review pending — it was already
+resumed, never paused, or the server restarted (the checkpointer is
+in-process; see OPERATIONS.md).
 
 ### Worked example — end to end
 
@@ -210,10 +308,10 @@ CV"](TECHNICAL-DESIGN.md#from-job-description-to-targeted-cv-one-request-step-by
 |---|---|
 | 1 — ingest | the *ingestion* graph (once; not part of tailoring) |
 | 2 — save the JD | none — local file handling |
-| 3 — tailor | 0 accept → 1 `analyze_job` → 2 `tailor_cv` → 3 `validate_cv` → 4 `write_cover_letter` → 5 `render_document` → 6 respond |
+| 3 — tailor | 0 accept → 1 `analyze_job` → 2 `tailor_cv` → 3 `validate_cv` → 4 `prepare_review`/`human_review` (pauses here if flagged) → 5 `write_cover_letter` → 6 `render_document` → 7 respond |
 | 4 — read the result | none — reads the response you already have |
-| 5 — approve, if flagged | re-runs 1–5 with the gate open |
-| 6 — download | 7 `GET /document` |
+| 5 — answer the review, if it paused | resumes the *same* run from 4 onward |
+| 6 — download | 8 `GET /document` |
 
 **Step 1 — get a `profile_id`.** Tailoring reads a stored profile, so you need
 one ingest first. Keep the id; every later job post reuses it.
@@ -294,22 +392,27 @@ jq -e '.validation.needs_review | not' tailored.json >/dev/null \
   || jq -r '.validation.flags[] | "[\(.kind)] \(.item)\n    → \(.reason) (similarity \(.similarity // "n/a"))"' tailored.json
 ```
 
-**Step 5 — approve, only if it was flagged.** When flags exist, `documents` is
-empty and `render_skipped` says so — the files were deliberately not written.
-Read the flags from step 4 first; if you accept them, re-run the *same* request
-with the gate open (a fresh `tailor_id`, and the LLM calls happen again):
+**Step 5 — answer the review, only if it paused.** When flags exist the run
+stops before rendering: `review_required` is `true`, `documents` is empty, and
+`review.items` holds what a person has to decide on. Read them (step 4 already
+has them; `GET /tailor/$TAILOR_ID/review` re-fetches), then resume the *same*
+run — same `tailor_id`, no further LLM calls for the CV:
 
 ```bash
-jq -e '.validation.needs_review' tailored.json >/dev/null && {
-  curl -s -X POST localhost:8000/tailor \
+jq -e '.review_required' tailored.json >/dev/null && {
+  jq -r '.review.brief, (.review.items[] | "\(.id)  [\(.kind)] \(.item)")' tailored.json
+
+  # Keep the first flagged item, drop everything else. An id you leave out is
+  # removed from the CV — silence is not approval.
+  curl -s -X POST "localhost:8000/tailor/$TAILOR_ID/resume" \
     -H 'Content-Type: application/json' \
-    -d "$(jq -n --arg pid "$PROFILE_ID" --rawfile job job.txt \
-            '{profile_id: $pid, job_post: $job, render: true, cover_letter: true,
-              approve_flagged: true}')" \
+    -d '{"approvals": {"flag-0": true}}' \
     -o tailored.json
-  TAILOR_ID=$(jq -r '.tailor_id' tailored.json)
 }
 ```
+
+To skip the pause entirely — you have already decided to accept whatever the
+gate finds — send `"approve_flagged": true` with the original request in step 3.
 
 **Step 6 — download the documents.**
 
@@ -441,6 +544,12 @@ that arrives in Phase 4.
 > Phase 1/2 caller's request behaves exactly as before — the only response
 > change it sees is the four added keys.
 
+> **Configurable UI dev-server address (2026-07-21) — no API change.** The Vite
+> dev server's bind address (`UI_HOST`/`UI_PORT`) and proxy target (`API_URL`)
+> are frontend tooling only. Every endpoint, path and response here is
+> unchanged, and in production there is no dev server: the API serves the built
+> bundle on its own host/port.
+
 ## GET /document/{tailor_id}
 
 Downloads a document rendered by `POST /tailor`.
@@ -473,11 +582,22 @@ curl -s -o cv.docx "localhost:8000/document/$TAILOR_ID"
 curl -s -o cover-letter.pdf "localhost:8000/document/$TAILOR_ID?kind=cover_letter&format=pdf"
 ```
 
-Documents persist under `data/documents/{tailor_id}/` (alongside a `tailor.json`
-copy of the run's CV, validation result and cover letter), so the same URL keeps
-working after a restart. There is no listing or deletion endpoint yet — the
-`documents` array in the tailor response is the index.
+Documents persist under `data/documents/{tailor_id}/`, alongside a `tailor.json`
+copy of the run's CV, validation result and cover letter and — for a run that
+paused — a `review.json` copy of the items the person was shown. The same URL
+keeps working after a restart. There is no listing or deletion endpoint yet —
+the `documents` array in the tailor response is the index.
 
 ## Planned (later phases)
 
-- Phase 4: `GET /tailor/{id}/review`, `POST /tailor/{id}/resume` (server-side human-in-the-loop).
+Every endpoint in the design doc is now implemented. Known gaps, none of which
+have an endpoint yet:
+
+- **Pending reviews do not survive a restart.** The checkpointer is an
+  in-process `MemorySaver`, so a paused run's `resume` returns `409` after the
+  server is restarted; `GET .../review` still serves the archived record.
+  A durable checkpointer (SQLite/Postgres) would remove the caveat.
+- **No listing endpoints** for profiles, runs or documents — ids come from the
+  response that created them.
+- **Single-user.** There is no authentication and no per-user partitioning; any
+  caller can read any `profile_id` or `tailor_id` they can name.

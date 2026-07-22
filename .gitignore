@@ -222,3 +222,8 @@ data/
 
 # Runtime log files (LOG_FILE + rotated backups)
 logs/
+
+# Node / frontend build (Phase 4 review UI)
+node_modules/
+frontend/dist/
+npm-debug.log*

@@ -44,6 +44,12 @@ This maps cleanly onto your existing Orchestrator/Analytic/Coding-style agent pa
                                               └──────────┬─────────┘
                                                           ▼
                                               ┌───────────────────┐
+                                              │ Review Agent       │
+                                              │ (interrupt() for a │
+                                              │  human on flags)   │
+                                              └──────────┬─────────┘
+                                                          ▼
+                                              ┌───────────────────┐
                                               │ Document Agent     │
                                               │ (docx/pdf render)  │
                                               └───────────────────┘
@@ -373,6 +379,11 @@ This is the piece worth not skipping. A second, separate LLM call (or even non-L
 
 If using LangGraph, this is a natural `interrupt()` point — surface flagged items to the user for approval before rendering, consistent with the human-in-the-loop pattern you used in your earlier LangChain agent work.
 
+**Implemented in Phase 4** — `human_review` sits between `validate_cv` and
+rendering and calls `interrupt()`, so the run pauses with its state
+checkpointed instead of handing the decision back to the client. See
+"Human-in-the-loop review" under §13.
+
 ---
 
 ## 9. Stage 7 — Document Agent
@@ -436,12 +447,47 @@ restating third-party recommendations as the candidate's own claims.
 - **Models:** Haiku for extraction (cheap, high-volume, per-source), Sonnet for synthesis + tailoring (needs judgment), optionally Opus for the validation/anti-hallucination pass since precision matters most there — the same tiering strategy you're already using for subagent cost control.
 - **Frontend:** could reuse your React/Vite/TanStack scaffold — a simple 3-panel UI: sources → profile review/edit → job post + generated CV diff view.
 
+### Frontend as built (Phase 4, 2026-07-21)
+
+React 19 + Vite + TanStack Query in `frontend/`, TypeScript throughout, exactly
+the three panels above (`frontend/src/panels/`):
+
+| Panel | Reads/writes | Notes |
+|---|---|---|
+| `SourcesPanel` | `POST /ingest`, `GET /ingest/{job_id}/events` | Subscribes to the SSE stream *before* POSTing, so no node event is missed. Generates its own `job_id` for that reason |
+| `ProfilePanel` | `GET`/`PUT /profile/{id}` | Edits a local draft (a slow save never fights the typing); each conflict's chosen value is recorded in the new `Conflict.resolution` field |
+| `TailorPanel` | `POST /tailor`, `GET /document/{id}` | Side-by-side profile-vs-tailored bullet table; hands a paused run to `ReviewPanel` |
+| `ReviewPanel` | `POST /tailor/{id}/resume` | Per-item Keep/Remove, defaulting to Remove — the same default as the server |
+
+Two decisions worth recording:
+
+- **The UI ships inside the API image.** A multi-stage `Dockerfile` builds the
+  bundle in a `node:20-slim` stage and copies `dist/` into the Python runtime,
+  which mounts it at `/` (`FRONTEND_DIR`). One container, one origin, no CORS,
+  and no Node in the shipped image. Without a build, `/` still redirects to
+  `/docs`, so a backend-only checkout is unaffected.
+- **The dev server's address is configuration, not code.** Because production
+  has no Vite server at all, the only place a host/port matters is development —
+  so `vite.config.ts` reads `UI_HOST`/`UI_PORT` (bind address) separately from
+  `API_URL` (proxy target), defaulting to loopback:5173 so nothing is exposed by
+  accident, with `strictPort` on so a busy port fails instead of quietly moving.
+  These live in the shell, not `.env`: the backend never reads them.
+- **The diff similarity is display-only.** `frontend/src/lib/diff.ts` scores
+  bullets with a bigram Dice coefficient purely to label them
+  unchanged/reworded/new. The authoritative judgement stays server-side
+  (difflib + LLM cross-check); anything the gate flagged renders as flagged
+  whatever the client scores.
+
+`Conflict.resolution` (`str | None`) is the one schema addition: conflicts are
+kept after resolution, not deleted — the record of who-said-what and what was
+chosen is the point.
+
 ---
 
 ## 11. Guardrails worth building in from day one
 
 - **Traceability everywhere** — every generated sentence should be attributable to a source document. This isn't optional polish; it's what keeps the tailored CV honest.
-- **Human review checkpoint** before final render — don't auto-send a generated CV without the person seeing it.
+- **Human review checkpoint** before final render — don't auto-send a generated CV without the person seeing it. *(Phase 4: enforced by the graph itself — `human_review` interrupts before rendering whenever a flagged run would produce a document, and unapproved claims are removed rather than shipped.)*
 - **Conflict surfacing, not silent resolution** — if LinkedIn says one date and the CV says another, ask, don't guess.
 - **No keyword-stuffing beyond what's true** — mirroring job-post terminology is fine; claiming unlisted skills is not.
 
@@ -509,18 +555,24 @@ same `linkedin/` category (as `<original-name>.zip`, alongside the pasted
 
 ```mermaid
 flowchart LR
-    START --> analyze_job --> tailor_cv --> validate_cv
-    validate_cv -->|want_cover_letter| write_cover_letter --> render_document
-    validate_cv -->|otherwise| render_document
+    START --> analyze_job --> tailor_cv --> validate_cv --> prepare_review --> human_review
+    human_review -.->|"interrupt(): flags + render"| PAUSED[["paused — awaiting a person"]]
+    PAUSED -.->|"Command(resume=decision)"| human_review
+    human_review -->|want_cover_letter| write_cover_letter --> render_document
+    human_review -->|otherwise| render_document
     render_document --> END
 ```
 
 - `analyze_job` — Sonnet → `JobRequirements`.
 - `tailor_cv` — Sonnet with hard no-fabrication rules in the system prompt →
   `TailoredCV`.
+- `prepare_review` / `human_review` (Phase 4) — the human-in-the-loop
+  checkpoint; see the section below. Both are no-ops unless the run would
+  otherwise render flagged claims.
 - `write_cover_letter` (Phase 3) — Sonnet → `CoverLetter`; reached only via the
   conditional edge, i.e. when the caller asked for one, so the default path
-  costs no extra LLM call.
+  costs no extra LLM call. Phase 4 moved this edge *after* `human_review`, so
+  the letter can only draw on claims that survived the review.
 - `render_document` (Phase 3) — no LLM; renders `.docx`/PDF into
   `data/documents/{tailor_id}/`. Renders nothing when the caller did not ask
   (`render`) or when the gate blocks it, reporting why in `render_skipped`.
@@ -529,14 +581,113 @@ flowchart LR
   (`VALIDATION_SIMILARITY_THRESHOLD`, default 0.55) passes; (c) anything
   below threshold goes to an LLM cross-check; unsupported claims are
   returned as `needs_review` flags. Skill/experience/project membership
-  checks are fully deterministic. In Phases 1–3 human review of flags is
-  client-side; Phase 4 upgrades to a LangGraph `interrupt()` + checkpointer.
-  Phase 3 gave the flags teeth: they now block `render_document` until the
-  caller approves them (§9).
+  checks are fully deterministic. Phase 3 gave the flags teeth (they block
+  `render_document`, §9); Phase 4 turned that block into a pause a person
+  answers.
 
 State carries `tailor_id` (one `/tailor` execution, the key of the document
-store), the caller's `render` / `want_cover_letter` / `approved` flags, and the
-results `cover_letter`, `documents`, `render_skipped`.
+store *and* the checkpointer thread id), the caller's `render` /
+`want_cover_letter` / `approved` flags, the results `cover_letter`,
+`documents`, `render_skipped`, and the Phase 4 `review_request` /
+`review_decision`.
+
+### Human-in-the-loop review (Phase 4, 2026-07-21)
+
+Phases 1–3 reviewed flags **client-side**: `/tailor` returned
+`validation.flags`, and a caller who still wanted a document re-ran the whole
+graph with `approve_flagged=true`. Two things were wrong with that. It is a
+convention, not a guarantee — a client that ignores the flags renders anyway.
+And re-running re-tailors: the CV that renders is a *different draft* from the
+one that was reviewed, at the cost of a second set of LLM calls.
+
+`prepare_review` + `human_review` close both holes with LangGraph's
+`interrupt()`:
+
+```mermaid
+sequenceDiagram
+    participant U as Reviewer (UI or curl)
+    participant API as FastAPI
+    participant G as Tailoring graph
+    participant CP as MemorySaver
+    U->>API: POST /tailor {render: true}
+    API->>G: invoke(state, thread_id=tailor_id)
+    G->>G: analyze_job → tailor_cv → validate_cv
+    G->>G: prepare_review — flags found, brief written
+    G->>G: human_review — interrupt()
+    G->>CP: checkpoint state
+    G-->>API: __interrupt__ [ReviewRequest]
+    API-->>U: 200 {review_required: true, review: {...}}
+    Note over U: decides per item
+    U->>API: POST /tailor/{id}/resume {approvals}
+    API->>G: invoke(Command(resume=decision), thread_id=tailor_id)
+    CP-->>G: restore the exact reviewed state
+    G->>G: apply_decision → prune → render_document
+    G-->>API: documents
+    API-->>U: 200 {documents: [...]}
+```
+
+- **When it pauses.** Only when all three hold: `render` was requested,
+  `validation.needs_review` is true, and the caller did not pre-approve. A run
+  that renders nothing has nothing to gate, and `approve_flagged=true` keeps
+  the Phase 3 path working unchanged.
+- **What the person sees** (`ReviewRequest`) — one `ReviewItem` per flag with a
+  stable `id`, the flagged text, why the gate could not place it, and the
+  *closest sourced claim in the profile* with its source id, so the judgement
+  can be made without re-reading the profile. Plus an optional `brief` from the
+  review agent (below).
+- **What their answer does** (`ReviewDecision` → `review.apply_decision`) —
+  approved claims stay and remain in `validation.flags` for provenance (a human
+  accepting a claim is not the gate having traced it); everything else is
+  **removed** from the CV. Removal covers the structured fields *and* the
+  `summary`/`headline` prose that may restate the claim: whole sentences naming
+  a rejected term are dropped, and a headline naming one falls back to the
+  profile's headline. Without that, rejecting a skill only moved it from the
+  skills line into the pitch above it — found in a live run, not in review.
+- **Silence is removal.** An item omitted from `approvals` is not approved. The
+  default answer to "we could not trace this" must be to drop it.
+- **Why it is two nodes.** LangGraph re-runs an interrupted node **from the
+  top** when it resumes — `interrupt()` returns the answer the second time
+  through rather than pausing again. Everything with a cost or a side effect
+  therefore lives in `prepare_review` (a node that has already *completed* when
+  the pause happens): building the request, the review agent's LLM call, and
+  the write to `review.json`. `human_review` holds nothing but the `interrupt()`
+  and the decision handling, so resuming is free. Producing a `review_request`
+  is also the signal to pause: `human_review` is a no-op without one.
+- **Where the pause lives.** A module-level `MemorySaver` shared by every
+  compiled graph, keyed by `thread_id = tailor_id`, because the pause has to
+  outlive the request that created it. It is in-process: **a restart loses
+  pending resumes** (`409`). The `ReviewRequest` itself is written to
+  `data/documents/{tailor_id}/review.json` before pausing, so the record of
+  what a person was asked survives regardless; only the ability to continue
+  that run does not. A durable checkpointer is the upgrade path.
+
+**Known gap:** the validation gate inspects bullets, skills, experiences and
+projects — never the tailored `summary`/`headline` prose. Review scrubbing
+catches literal restatements of a *rejected* claim, but a summary that
+paraphrases an unsupported claim is checked by nothing at all.
+
+### The review agent (`src/agents/review.py`, Phase 4)
+
+The one place `fund_models/agent_base.py` earns its keep, deferred here from
+Phase 1.b. Every other LLM node is a single-shot `with_structured_output` call
+whose skill is known in advance, so it resolves that skill deterministically
+(§"Agent skills"). Writing the reviewer's brief is the first genuinely
+*agentic* step — the model decides what guidance it needs — so `ReviewAgent`
+subclasses `AgentBase`: `_load_skills` loads the same `skills/` directory,
+`get_skills_context()` puts the catalog in the system prompt, and
+`register_tool` receives FUND's runtime `load_skill_from_fs` tool, which the
+agent calls mid-loop to pull a full skill body (typically `anti-fabrication`,
+so its explanation matches the standard the items were judged against).
+
+Two deliberate deviations: `get_llm()` is overridden onto this project's
+`make_llm` (keeping model tiering, the provider switch and the single
+test-mock point — `AgentBase.get_llm` would also send a `temperature` current
+Claude models reject), and the tool loop is bounded by
+`REVIEW_MAX_TOOL_ITERATIONS`. The brief is **advisory**: disabled agent, failed
+call or exhausted budget all yield `""`, because the flagged items are what
+gate rendering and a missing explanation must never block a human review.
+`skills/cv-review/SKILL.md` holds the briefing reasoning — notably the rule
+against proposing wording that would get a claim past the gate.
 
 ### From job description to targeted CV: one request, step by step
 
@@ -565,6 +716,14 @@ sequenceDiagram
     G->>G: validate_cv — source map, then similarity
     G->>LLM: cross-check (only claims below threshold)
     LLM-->>G: supported? + reason
+    opt flags raised and render requested
+        G->>G: human_review — interrupt(), state checkpointed
+        G-->>API: __interrupt__ [ReviewRequest]
+        API-->>C: review_required + items (nothing rendered)
+        C->>API: POST /tailor/{id}/resume {approvals}
+        API->>G: Command(resume=decision) — same run continues
+        G->>G: apply_decision — rejected claims removed
+    end
     opt cover_letter requested
         G->>LLM: write_cover_letter — profile + requirements + tailored CV
         LLM-->>G: CoverLetter
@@ -583,10 +742,11 @@ sequenceDiagram
 | 1 | `analyze_job` | `src/agents/job_analysis.py` | `TAILORING_MODEL` + `job-analysis` | Raw JD text (fenced by `--- JOB POST START/END ---`) → `JobRequirements`. The posting is never regex-parsed; the model splits must-haves from nice-to-haves and lifts ATS phrasing |
 | 2 | `tailor_cv` | `src/agents/tailoring.py` | `TAILORING_MODEL` + `cv-tailoring` **+** `anti-fabrication` | Full profile JSON + requirements JSON → `TailoredCV`. Selects a *subset* of experiences/projects, re-orders bullets, mirrors the posting's terminology only where a profile fact supports it |
 | 3 | `validate_cv` | `src/agents/validation.py` | `VALIDATION_MODEL` + `anti-fabrication`, **only** for step 3c | Profile + tailored CV → `ValidationResult`. Three layers, cheapest first (below) |
-| 4 | `write_cover_letter` *(optional)* | `src/agents/tailoring.py` | `COVER_LETTER_MODEL` + `cover-letter` **+** `anti-fabrication` | Profile + requirements + the tailored CV (minus `relevance_notes`) → `CoverLetter`. Reached only via the conditional edge, so the default path never pays for it |
-| 5 | `render_document` | `src/agents/tailoring_graph.py` → `src/agents/document.py` | none (no LLM) | Tailored CV (+ letter) → files in `data/documents/{tailor_id}/`, or `render_skipped` explaining why nothing was written |
-| 6 | Respond & persist | `src/api/routes.py:tailor` | — | Final state → JSON response (each document carries a ready-made `url`), and `tailor.json` is written beside the files |
-| 7 | Download | `GET /document/{tailor_id}` | — | `kind`/`format` → the file, served from the document store |
+| 4 | `prepare_review` → `human_review` *(Phase 4)* | `src/agents/tailoring_graph.py` → `src/agents/review.py` | `REVIEW_MODEL` + `cv-review` (brief only, advisory) | `ValidationResult` → a `ReviewRequest`, then `interrupt()` — when flags exist **and** `render` was asked for. The run pauses here; `ReviewDecision` comes back on `/resume`, rejected claims are pruned from the CV, and `approved` is set. Both nodes pass through otherwise. Split in two because a resumed node re-executes from the top, and the brief must not be paid for twice |
+| 5 | `write_cover_letter` *(optional)* | `src/agents/tailoring.py` | `COVER_LETTER_MODEL` + `cover-letter` **+** `anti-fabrication` | Profile + requirements + the tailored CV (minus `relevance_notes`) → `CoverLetter`. Reached only via the conditional edge, so the default path never pays for it. Runs *after* review, so it cannot quote a rejected claim |
+| 6 | `render_document` | `src/agents/tailoring_graph.py` → `src/agents/document.py` | none (no LLM) | Tailored CV (+ letter) → files in `data/documents/{tailor_id}/`, or `render_skipped` explaining why nothing was written |
+| 7 | Respond & persist | `src/api/routes.py:tailor` | — | Final state → JSON response (each document carries a ready-made `url`), and `tailor.json` is written beside the files |
+| 8 | Download | `GET /document/{tailor_id}` | — | `kind`/`format` → the file, served from the document store |
 
 **Step 3 in detail — the gate is layered so most claims cost nothing.** For every
 bullet in the tailored CV:
@@ -606,17 +766,23 @@ all".
 **Where a run stops.** Only three places, all of them explicit in the response:
 
 - **404/400 at step 0** — nothing ran, nothing was charged.
-- **Flags at step 3** — the pipeline still completes and returns the full
-  `tailored_cv` and `flags`, but step 5 writes **nothing** and sets
-  `render_skipped`. Re-running with `approve_flagged` is what unblocks it.
-- **`render: false`** (the default) — steps 1–3 run, step 5 no-ops with
+- **Flags at step 4** (Phase 4) — when `render` was requested the run **pauses**
+  and returns `review_required` with the flagged items; nothing is written
+  until `/resume` carries a decision. Before Phase 4 it instead completed with
+  an empty `documents` and a `render_skipped` reason, and the caller re-ran the
+  whole graph with `approve_flagged` — still available, and now the way to skip
+  the pause deliberately.
+- **`render: false`** (the default) — steps 1–3 run, step 4 passes through
+  (nothing can be rendered, so nothing is gated) and step 6 no-ops with
   `render_skipped: "rendering not requested"`. This is the JSON-only path Phases
   1–2 had.
 
 **Cost per request:** two LLM calls minimum (steps 1 and 2), plus one per claim
-that falls through to step 3c, plus one if a cover letter was asked for. The
-profile is read from storage, so ingestion never re-runs — the same profile can
-be tailored to any number of postings.
+that falls through to step 3c, plus one for the review brief if the run pauses,
+plus one if a cover letter was asked for. The profile is read from storage, so
+ingestion never re-runs — the same profile can be tailored to any number of
+postings. A paused run that is resumed costs **no** second tailoring call: the
+CV that renders is the one that was reviewed.
 
 **Two properties worth noting, because they are easy to assume otherwise:**
 
@@ -637,10 +803,13 @@ be tailored to any number of postings.
 | Job analysis + tailoring | `TAILORING_MODEL` | `claude-sonnet-5` |
 | Cover letter | `COVER_LETTER_MODEL` | `TAILORING_MODEL` (same task, same rules) |
 | Validation cross-check | `VALIDATION_MODEL` | `claude-sonnet-5` (override to `claude-opus-4-8` for max precision) |
+| Review brief (Phase 4) | `REVIEW_MODEL` | `VALIDATION_MODEL` (it explains that gate's findings) |
 
 Every LLM node uses `make_llm(...).with_structured_output(<PydanticModel>)`
 via the single factory `src/agents/llm.py:make_llm` — no free-form JSON
-parsing anywhere. The factory follows the same method as FUND's
+parsing anywhere. The one exception is the Phase 4 review agent, which binds
+tools instead of a structured schema (it writes prose, and chooses which skill
+to load), but still goes through `make_llm`. The factory follows the same method as FUND's
 `AgentBase.get_llm()` (provider switch + lazy imports, configured via
 `LLM_PROVIDER`, `LLM_API_KEY`, `LLM_TEMPERATURE`, `LLM_MAX_TOKENS`,
 `LLM_BASE_URL`, `LLM_STREAM_TIMEOUT_S`), defaulting to `anthropic`; `model`
@@ -664,7 +833,8 @@ skills/
 ├── job-analysis/SKILL.md        # job_analysis
 ├── cv-tailoring/SKILL.md        # tailoring (HARD RULES)
 ├── anti-fabrication/SKILL.md    # validation (also composed into tailoring + cover letter)
-└── cover-letter/SKILL.md        # cover letter (Phase 3): shape + register
+├── cover-letter/SKILL.md        # cover letter (Phase 3): shape + register
+└── cv-review/SKILL.md           # review brief (Phase 4): loaded at runtime, by a tool call
 ```
 
 Each `SKILL.md` is YAML frontmatter (`name`, `description`) + a Markdown body.
@@ -681,9 +851,12 @@ tool-calling loops), skills are resolved **deterministically by node**: each
 two skills (`cv-tailoring` + `anti-fabrication`). Resolution degrades
 gracefully: a missing/empty `SKILLS_DIR` yields an empty body, so a node falls
 back to its scaffolding and still runs — which is why the migration is
-behavior-preserving (the skill body is the prior prompt text verbatim). FUND's
-runtime `load_skill` tool and `AgentBase` are **not** used here; adopting them
-for a genuinely tool-calling node is deferred to Phase 4 (§10/§11).
+behavior-preserving (the skill body is the prior prompt text verbatim).
+
+FUND's runtime `load_skill` tool and `AgentBase` are used by exactly one node,
+added in Phase 4: the review agent, which is tool-calling and therefore picks
+its own skill instead of being handed one (see "The review agent" above). Every
+other node keeps the deterministic resolution described here.
 
 ### Storage schema
 
@@ -705,7 +878,8 @@ data/
 └── documents/{tailor_id}/        # rendered documents (Phase 3, src/utils/document_store.py)
     ├── cv.docx / cv.pdf
     ├── cover-letter.docx / cover-letter.pdf
-    └── tailor.json               # the run's tailored CV, validation result, cover letter
+    ├── tailor.json               # the run's tailored CV, validation result, cover letter
+    └── review.json               # flagged items a person was shown (Phase 4, if it paused)
 ```
 
 `profile_store.py` owns `profiles/`; `run_store.py` owns `sources/` and
@@ -770,6 +944,10 @@ client may supply its own `job_id` form field so it can subscribe before
 POSTing. `POST /tailor` is synchronous (no SSE) and, since Phase 3, returns a
 `tailor_id` whose rendered files are downloaded from
 `GET /document/{tailor_id}?kind=&format=` — served with `FileResponse` from the
-document store, 404 when that file was not rendered. Everything ships in **one
-Docker container** (python:3.11-slim + `libreoffice-writer` for PDF, uvicorn on
-0.0.0.0:8000, `data/` volume-mounted).
+document store, 404 when that file was not rendered. Since Phase 4 it may also
+return *paused*, with `GET /tailor/{tailor_id}/review` and
+`POST /tailor/{tailor_id}/resume` continuing that run (`409` when nothing is
+pending). Everything ships in **one Docker container** — now multi-stage:
+a `node:20-slim` stage builds the review UI, and the python:3.11-slim runtime
+(+ `libreoffice-writer` for PDF) serves both it and the API from uvicorn on
+0.0.0.0:8000, with `data/` volume-mounted.

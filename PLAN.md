@@ -632,7 +632,7 @@ conversion runs LibreOffice with a throwaway `-env:UserInstallation` profile
 missing/failing binary. Suite: 166 unit tests green; the PDF integration test
 passes inside the built image.
 
-## Phase 4 — Review UI + human-in-the-loop (design doc §10 frontend, §8 interrupt, §11 guardrails)
+## Phase 4 — Review UI + human-in-the-loop (design doc §10 frontend, §8 interrupt, §11 guardrails) — **implemented 2026-07-21**
 
 1. `frontend/` — React + Vite + TanStack Query. Three-panel flow per design doc §10:
    - **Sources panel:** upload CV/LinkedIn ZIP, GitHub username, free text; live SSE progress.
@@ -643,6 +643,46 @@ passes inside the built image.
 4. **Adopt `fund_models/agent_base.py` for the tool-calling review node (deferred from Phase 1.b):** the human-in-the-loop resume step is the first genuinely *agentic* (tool-calling) node, so it is implemented as an `AgentBase`/`DeepAgentMixin` subclass. This is where the rest of the FUND skill machinery finally earns its place — `AgentBase._load_skills`/`get_skills_context` load the same `skills/` directory, and `make_load_skill_tool` registers the runtime `load_skill_from_fs` tool so the node can pull a full skill body (e.g. `anti-fabrication`) on demand during the review loop, rather than the deterministic per-node resolution used by the Phase 1.b structured nodes. The Phase 1 nodes stay as functional `make_llm` nodes; only the new agentic node subclasses `AgentBase`.
 
 **Tests:** frontend unit tests with vitest (panel state, diff view, flag approval flow); backend `test_review_flow.py` — interrupt fires on flags, resume renders, no-flag runs skip straight to render; API tests for the two new endpoints; `test_review_agent.py` — the `AgentBase` review node loads skills and its `load_skill_from_fs` tool returns a known skill body.
+
+**As implemented:** the plan's four items landed as written; four things it had
+not settled:
+
+- **A decision needed a shape.** "Approvals in → graph resumes" says nothing
+  about *what* an approval does. Approving each flagged item individually is
+  the only version that respects the person: `ReviewDecision.approvals` maps a
+  stable `ReviewItem.id` to keep/remove, and **anything not approved is removed
+  from the CV** rather than the whole run being lost. An item left unanswered
+  counts as not approved — silence cannot be consent for a claim nothing could
+  trace.
+- **Prose leaks.** Removing a claim from `highlighted_skills` left it asserted
+  in the tailored `summary` ("proficient in … Docker") — caught in a live run
+  against the container, not by a test. Pruning now also drops summary
+  sentences naming a rejected term and falls back to the profile's headline
+  when the tailored one does. The underlying hole stays open and is recorded:
+  the validation gate never inspects prose at all.
+- **The cover letter had to move.** It was written before the review, so a
+  rejected bullet could reappear in the letter. Its conditional edge moved from
+  `validate_cv` to `human_review`.
+- **The review checkpoint is two nodes, not one.** LangGraph re-runs an
+  interrupted node from the top when it resumes, so a single `human_review`
+  node would re-pay for the reviewer's brief (an LLM call) on every resume.
+  `prepare_review` does everything with a cost or a side effect and completes;
+  `human_review` holds only the `interrupt()` and the decision handling.
+- **`interrupt()` needs somewhere to pause.** A module-level `MemorySaver`
+  shared by every compiled graph (`thread_id = tailor_id`), because the resume
+  arrives on a later HTTP request. In-process: a restart loses pending resumes
+  (`409`), so the `ReviewRequest` is archived to
+  `data/documents/{tailor_id}/review.json` before pausing — the record survives
+  even when the ability to continue does not.
+
+Also beyond the plan: `Conflict.resolution` (the review UI records *which*
+value the person chose, keeping the disagreement), a `.dockerignore`, and
+`REVIEW_MODEL` / `REVIEW_AGENT_ENABLED` / `REVIEW_MAX_TOOL_ITERATIONS` /
+`FRONTEND_DIR`. `ReviewAgent` overrides `AgentBase.get_llm` onto this project's
+`make_llm` — FUND's version sends a `temperature` current Claude models reject,
+and `make_llm` is the single mock point the test suite relies on. Suite: 205
+unit tests + 33 vitest tests green; the full pause → review → partial approval
+→ render path verified against the running container.
 
 ---
 

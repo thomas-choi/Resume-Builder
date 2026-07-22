@@ -8,8 +8,10 @@ from fund_models.skills import scan_skills
 from src import config
 from src.agents import skills
 
-# The five Phase 1 agent skills, one per node (tailoring composes two), plus
-# the Phase 3 cover-letter skill (which also composes anti-fabrication).
+# The five Phase 1 agent skills, one per node (tailoring composes two), the
+# Phase 3 cover-letter skill (which also composes anti-fabrication), and the
+# Phase 4 cv-review skill — the only one loaded at runtime by a tool call
+# rather than resolved deterministically by its node.
 EXPECTED_SKILLS = {
     "source-extraction",
     "profile-synthesis",
@@ -17,6 +19,7 @@ EXPECTED_SKILLS = {
     "cv-tailoring",
     "anti-fabrication",
     "cover-letter",
+    "cv-review",
 }
 
 

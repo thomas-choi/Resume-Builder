@@ -37,7 +37,7 @@ se | Implementation Detail | Related Files | Test Coverage |`
 
 ## Project status
 
-Phase 1 (core pipeline + FastAPI + Docker), Phase 2 (LinkedIn data-export ingestion) and Phase 3 (document rendering + cover letter) are implemented — see `PLAN.md` for the phase roadmap and `TECHNICAL-DESIGN.md` §13 for implementation notes. The system is an **AI/LLM-powered personalized resume builder**: two LangGraph `StateGraph`s (ingestion and tailoring) behind a FastAPI service, with an anti-fabrication validation gate, a versioned JSON profile store, and `.docx`/PDF rendering gated on that validation.
+All four planned phases are implemented — Phase 1 (core pipeline + FastAPI + Docker), Phase 2 (LinkedIn data-export ingestion), Phase 3 (document rendering + cover letter) and Phase 4 (review UI + human-in-the-loop). See `PLAN.md` for the roadmap and `TECHNICAL-DESIGN.md` §13 for implementation notes. The system is an **AI/LLM-powered personalized resume builder**: two LangGraph `StateGraph`s (ingestion and tailoring) behind a FastAPI service, with an anti-fabrication validation gate, a versioned JSON profile store, `.docx`/PDF rendering gated on that validation, and a React review UI served from the same container. A flagged tailoring run pauses at a LangGraph `interrupt()` until a person decides per claim.
 
 ## Commands
 
@@ -52,6 +52,14 @@ uvicorn src.api.main:app --reload
 
 # run in Docker (one container, data/ volume)
 docker compose up --build
+
+# review UI (frontend/, React + Vite + TanStack Query)
+cd frontend && npm install
+npm run build            # -> frontend/dist, served by the API at "/"
+npm run dev              # Vite dev server on localhost:5173, proxies API paths to :8000
+UI_HOST=0.0.0.0 UI_PORT=3000 API_URL=http://<api-host>:8000 npm run dev
+                         # UI_HOST/UI_PORT = where Vite listens; API_URL = proxy target
+npm test                 # vitest + Testing Library
 
 # tests
 pytest tests/unit/ -v    # unit tests — all LLMs mocked, no network

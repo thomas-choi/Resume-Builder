@@ -18,7 +18,7 @@ flowchart LR
         A[CV / LinkedIn / GitHub / free text] --> B[extract per source<br/>Haiku] --> C[synthesize profile<br/>Sonnet] --> D[(versioned JSON store)]
     end
     subgraph Tailoring
-        D --> E[analyze job post] --> F[tailor CV<br/>no-fabrication rules] --> G[validation gate<br/>source map + similarity + LLM check] --> H[render .docx / PDF<br/>+ optional cover letter]
+        D --> E[analyze job post] --> F[tailor CV<br/>no-fabrication rules] --> G[validation gate<br/>source map + similarity + LLM check] --> R[human review<br/>pauses on flags] --> H[render .docx / PDF<br/>+ optional cover letter]
     end
 ```
 
@@ -26,7 +26,10 @@ flowchart LR
 - **Conflict surfacing** — when sources disagree (e.g. two start dates), the
   conflict is returned to you, never silently resolved.
 - **Validation gate** — tailored claims that can't be traced to your profile
-  come back as `needs_review` flags, and block rendering until you approve them.
+  come back as `needs_review` flags.
+- **Human-in-the-loop** — a flagged run *pauses* before rendering (LangGraph
+  `interrupt()`), and anything you don't approve is removed from the CV. There
+  is a three-panel review UI, served from the same container.
 
 ## Setup
 
@@ -48,8 +51,9 @@ docker compose up --build
 ## Usage
 
 Start the server (`uvicorn src.api.main:app --reload` locally, or the Docker
-command above), then open `http://localhost:8000/docs` for the interactive
-API UI, or use curl:
+command above), then open `http://localhost:8000/` for the review UI (built
+into the Docker image; locally run `cd frontend && npm install && npm run
+build` first, otherwise `/` redirects to `/docs`). Or use curl:
 
 > To access from another machine on your network, bind to all interfaces:
 > `uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000`
@@ -76,7 +80,14 @@ curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
 curl -X POST localhost:8000/tailor -H 'content-type: application/json' \
      -d '{"profile_id": "<profile_id>", "job_post": "<paste the job posting>",
           "render": true, "cover_letter": true}'
-# -> ... + tailor_id + documents[] (nothing is rendered while flags need review)
+# -> ... + tailor_id + documents[]
+#    ...or "review_required": true + review.items — the run paused, nothing was
+#    written. Decide per item and the same run continues (no re-tailoring):
+curl -X POST "localhost:8000/tailor/<tailor_id>/resume" \
+     -H 'content-type: application/json' \
+     -d '{"approvals": {"flag-0": true, "flag-1": false}}'
+# anything you don't approve is removed from the CV
+
 curl -o cv.docx "localhost:8000/document/<tailor_id>"
 curl -o cv.pdf  "localhost:8000/document/<tailor_id>?format=pdf"
 ```
@@ -84,11 +95,28 @@ curl -o cv.pdf  "localhost:8000/document/<tailor_id>?format=pdf"
 PDF output needs LibreOffice (shipped in the Docker image); without it you get
 the `.docx` and a warning in the log.
 
+## Running the review UI in development
+
+The API serves the built UI at `/`, so this is only needed when working on the
+frontend itself:
+
+```bash
+cd frontend && npm install
+npm run dev                                     # http://localhost:5173
+UI_HOST=0.0.0.0 UI_PORT=3000 npm run dev        # reachable from another machine
+API_URL=http://192.168.0.212:8000 npm run dev   # API on a different host
+```
+
+`UI_HOST`/`UI_PORT` set where the Vite server listens; `API_URL` sets where it
+proxies the API calls. Details in
+[OPERATIONS.md](OPERATIONS.md#developing-the-ui-against-a-running-api).
+
 ## Tests
 
 ```bash
-pytest tests/unit/ -v     # unit tests — all LLM calls mocked, no network
-pytest -m integration     # end-to-end against the real Anthropic API
+pytest tests/unit/ -v        # unit tests — all LLM calls mocked, no network
+pytest -m integration        # end-to-end against the real Anthropic API
+cd frontend && npm test      # review UI — vitest, no API needed
 ```
 
 ## Documentation

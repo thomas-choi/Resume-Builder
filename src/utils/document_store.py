@@ -8,6 +8,9 @@ Third store alongside :mod:`src.utils.profile_store` (an evolving profile) and
   the rendered documents served by ``GET /document/{tailor_id}``.
 - ``tailor.json`` — the tailored CV, validation result and cover letter, so a
   downloaded document can be traced back to the claims that were checked.
+- ``review.json`` — the flagged items a human was asked about (Phase 4),
+  written when the graph pauses and kept afterwards as the record of what was
+  put in front of them.
 
 Filenames are fixed per (kind, format) rather than caller-supplied, so a
 document request can never address a path outside the tailor's directory.
@@ -24,6 +27,7 @@ from src import config
 logger = logging.getLogger(__name__)
 
 _RESULT_NAME = "tailor.json"
+_REVIEW_NAME = "review.json"
 
 # kind -> filename stem. A closed set: callers pick a kind, never a filename.
 _STEMS = {"cv": "cv", "cover_letter": "cover-letter"}
@@ -127,6 +131,34 @@ def save_result(tailor_id: str, payload: dict) -> Path:
 def load_result(tailor_id: str) -> dict | None:
     """Read a tailoring run's saved result, or ``None`` if it was never written."""
     path = document_dir(tailor_id) / _RESULT_NAME
+    if not path.exists():
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_review(tailor_id: str, payload: dict) -> Path:
+    """Save the review request a paused run put in front of a human."""
+    out_dir = document_dir(tailor_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / _REVIEW_NAME
+    path.write_text(
+        json.dumps(
+            {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                **payload,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    logger.debug("document_store: saved review for tailor %s -> %s", tailor_id, path)
+    return path
+
+
+def load_review(tailor_id: str) -> dict | None:
+    """Read a run's review request, or ``None`` if it never paused for one."""
+    path = document_dir(tailor_id) / _REVIEW_NAME
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))

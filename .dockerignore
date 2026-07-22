@@ -1,0 +1,14 @@
+# Keep the build context small and the image reproducible: the frontend stage
+# installs from package-lock.json (`npm ci`), so a host node_modules/ or dist/
+# must never be copied in, and nothing runtime-local belongs in the image.
+**/node_modules/
+frontend/dist/
+.venv/
+data/
+logs/
+.git/
+.env
+**/__pycache__/
+*.pyc
+.pytest_cache/
+tests/

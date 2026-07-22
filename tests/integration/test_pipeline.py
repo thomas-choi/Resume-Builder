@@ -39,7 +39,13 @@ def test_full_pipeline_on_sample_cv(sample_docx, data_dir):
     assert profile.raw_source_map, "raw_source_map must be populated"
 
     tailoring = build_tailoring_graph()
-    tstate = tailoring.invoke({"profile": profile, "job_post": JOB_POST})
+    # The Phase 4 graph carries a checkpointer, so every run needs a thread id
+    # (the API uses the tailor_id). Nothing is rendered here, so the human-review
+    # node passes straight through and the run cannot pause.
+    tstate = tailoring.invoke(
+        {"profile": profile, "job_post": JOB_POST},
+        {"configurable": {"thread_id": "integration-pipeline"}},
+    )
 
     cv = tstate["tailored_cv"]
     validation = tstate["validation"]

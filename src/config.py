@@ -74,6 +74,23 @@ RENDER_PDF: bool = os.getenv("RENDER_PDF", "true").strip().lower() in (
 LIBREOFFICE_BIN: str = os.getenv("LIBREOFFICE_BIN", "soffice")
 LIBREOFFICE_TIMEOUT_S: int = int(os.getenv("LIBREOFFICE_TIMEOUT_S", "120"))
 
+# Human review (Phase 4). The review agent only *explains* the validation flags
+# to the person deciding on them, so it reuses the validation tier; set
+# REVIEW_AGENT_ENABLED=false to pause for review without spending an LLM call
+# (the flags themselves, not the brief, are what gate rendering).
+REVIEW_MODEL: str = os.getenv("REVIEW_MODEL", VALIDATION_MODEL)
+REVIEW_AGENT_ENABLED: bool = os.getenv(
+    "REVIEW_AGENT_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# Bound on the review agent's tool-calling loop (it loads skill bodies on
+# demand); exceeding it yields no brief rather than looping.
+REVIEW_MAX_TOOL_ITERATIONS: int = int(os.getenv("REVIEW_MAX_TOOL_ITERATIONS", "4"))
+
+# Built frontend (Phase 4). When this directory holds an index.html the API
+# serves the review UI at `/`; otherwise `/` redirects to the API docs, so a
+# backend-only checkout (or `uvicorn` before `npm run build`) still works.
+FRONTEND_DIR: Path = Path(os.getenv("FRONTEND_DIR", "./frontend/dist"))
+
 # Directory holding the versioned agent skills (SKILL.md per agent). Skills are
 # prompt *content* (reasoning strategies/heuristics), not secrets, and ship in
 # the image. A missing dir degrades gracefully to inline-prompt behavior.

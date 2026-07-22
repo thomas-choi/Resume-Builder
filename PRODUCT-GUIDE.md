@@ -8,7 +8,12 @@ An AI-powered personalized resume builder. It ingests your career sources
 given any job posting — generates a **tailored CV** that emphasizes relevant
 experience **without fabricating anything**.
 
-## Business flows (Phases 1–3)
+## Business flows (Phases 1–4)
+
+There is now a **web UI** as well as the API: open the service in a browser and
+you get the three panels these flows describe — sources on the left, your
+profile in the middle, tailoring and review on the right. Everything below can
+still be done with plain HTTP calls; the UI is a front for the same endpoints.
 
 ### 1. Build your career profile
 
@@ -93,11 +98,21 @@ sources into a profile you already have — say you land a new role and want to
 re-ingest an updated résumé — pass that profile's id when ingesting; the result
 is stored as a new version of it rather than a separate profile.
 
+While an ingest runs you can watch it happen — each step (reading your sources,
+extracting facts, merging them into a profile, saving it) reports as it
+finishes, so a long GitHub or LinkedIn ingest is not a blank screen.
+
 ### 2. Review and edit the profile
 
-Fetch the profile, fix anything (including resolving surfaced conflicts), and
-save it back — every save creates a new version, so nothing is lost. The
-profile is durable: re-tailoring for new job posts never re-runs ingestion.
+Fetch the profile, fix anything, and save it back — every save creates a new
+version, so nothing is lost. The profile is durable: re-tailoring for new job
+posts never re-runs ingestion.
+
+**Settling a conflict is a choice you record.** Where two sources disagreed,
+you pick the value you consider right and it is stored with the disagreement,
+not instead of it: the conflict stays on the profile, now showing what each
+source said *and* what you decided. Nothing is quietly overwritten, and you can
+change your mind later — the earlier version is still there.
 
 ### 3. Tailor a CV for a job post
 
@@ -117,18 +132,51 @@ and say which profile to use. That one request runs the whole way through:
    traced back to your profile. Exact matches and obvious re-wordings pass
    quietly; anything that can't be traced gets a second, stricter check and is
    returned to you as a **flag** explaining what couldn't be supported.
-4. **Write a cover letter** (only if you asked for one) from the facts just
-   selected for the CV.
-5. **Render the documents** (only if you asked for them) — see step 4 below —
-   unless there are flags, in which case nothing is written until you approve.
+4. **Stop and ask you, if anything was flagged** — see "Reviewing what was
+   flagged" below. The run waits; it does not go on to write files.
+5. **Write a cover letter** (only if you asked for one) from the facts that
+   survived your review.
+6. **Render the documents** (only if you asked for them) — see step 4 below.
 
-You get back the tailored CV, the flags, and the documents in one response. Your
-profile is untouched by all of this, so you can tailor the same profile to as
-many postings as you like; ingestion never runs again.
+You get back the tailored CV, the flags, and the documents in one response —
+or, if something was flagged, the tailored CV and the decision waiting for you.
+Your profile is untouched by all of this, so you can tailor the same profile to
+as many postings as you like; ingestion never runs again.
+
+Side by side with the result you can see **where each line came from**: your
+original profile bullet next to the tailored version, labelled as unchanged, a
+rewording, or something with no visible origin — plus the bullets that were
+left out of this application entirely.
 
 **What it costs you in time:** two AI calls for the CV, plus one for each claim
 that needed the stricter check, plus one if you asked for a cover letter — a
-typical run is a few seconds to a minute.
+typical run is a few seconds to a minute. Answering a review costs nothing
+extra: the CV is not regenerated.
+
+### 3a. Reviewing what was flagged
+
+When a claim can't be traced back to your profile and you asked for documents,
+the run **pauses** rather than finishing. You are shown, for each flagged item:
+what the CV claimed, why it couldn't be placed, and the closest thing your
+profile actually says — with the source it came from. A short plain-language
+explanation accompanies them, written to help you tell a harmless rewording
+apart from an invented fact; it will never suggest a phrasing that would get an
+unsupported claim past the check.
+
+Then you decide, item by item: **keep it** or **remove it**. Keeping is a
+deliberate act — anything you don't explicitly keep is dropped, because the
+safe default for a claim nobody could verify is not to make it. Removing an
+item doesn't cost you the run: that claim disappears from the CV (from the
+skills list, the bullets, *and* the summary paragraph, so it can't survive by
+being mentioned somewhere else) and everything else renders as normal.
+
+The CV you approve is exactly the CV you get. Before, approving meant re-running
+the whole thing, which produced a fresh draft that nobody had read; now the run
+you reviewed is the run that continues.
+
+If you would rather not be asked — you already know the flags and accept them —
+you can say so when you submit the job post, and the run renders without
+pausing.
 
 ### 4. Get the documents (and a cover letter)
 
@@ -146,10 +194,9 @@ reasons you want the job or opinions about the company, and repeat a
 recommendation someone wrote about you as if you had said it yourself.
 
 **Nothing flagged gets rendered.** If validation raised a flag, no file is
-written and the response tells you why. You read the flags, and if you're happy
-with them you re-run and say so explicitly — approving is a decision you make,
-never a default. Documents stay downloadable afterwards by the id of that
-tailoring run, so you can come back for the PDF later.
+written until you have been through the review above — approving is a decision
+you make, never a default. Documents stay downloadable afterwards by the id of
+that tailoring run, so you can come back for the PDF later.
 
 ## Guardrails you can rely on
 
@@ -157,18 +204,25 @@ tailoring run, so you can come back for the PDF later.
 - Keyword mirroring is limited to what your profile evidences.
 - Flagged claims are surfaced, not auto-approved — you are the final gate.
 - A CV with unresolved flags is never turned into a finished document until you
-  say so.
+  say so. This is now enforced by the pipeline itself, not by the app asking
+  nicely: the run physically stops until your decision arrives.
+- A claim you reject is removed from the finished CV, everywhere it appears.
 
-## Current limitations (Phases 1–3)
+*(2026-07-21: making the UI dev server's IP and port configurable changed no
+user-facing behaviour — it is a developer setup option, documented in
+[OPERATIONS.md](OPERATIONS.md#developing-the-ui-against-a-running-api). What you
+see in the browser is identical.)*
+
+## Current limitations (Phases 1–4)
 
 | Limitation | Planned fix |
 |---|---|
 | LinkedIn comes from your own data export — there is no "connect my LinkedIn" login | By design (LinkedIn's terms forbid scraping; no personal-app read API) |
 | One fixed CV layout; styling is only customizable by supplying a base Word template | Later improvement (multiple layouts) |
 | PDF depends on LibreOffice being installed server-side; without it you get the .docx only | By design — the .docx is the guaranteed output |
-| Approving flagged claims means re-running the tailoring request (costing the AI calls again) rather than resuming where it paused | Phase 4 server-side human-in-the-loop |
-| Review of flags happens client-side (API consumer's responsibility) | Phase 4 server-side human-in-the-loop |
-| No web UI — API only | Phase 4 (React three-panel flow) |
+| A review left unanswered is lost if the server restarts — you'd have to tailor again (what you were asked is still on record) | Later improvement (durable checkpoint storage) |
+| The summary paragraph isn't itself fact-checked. A rejected claim is scrubbed from it, but a summary that *paraphrases* something unsupported without naming it isn't caught | Later improvement (validate the prose too) |
+| The cover letter is not re-checked against your profile — it is constrained by being built from the already-checked CV | Later improvement |
 | Two-column PDF CVs may extract with interleaved text | Later improvement |
 | Private repos and private org memberships are reachable only when the configured `GITHUB_TOKEN` is the ingested user's own | Multi-user ingestion needs a caller-supplied token (deferred credential decision) |
 | An organization repo you worked on only via a non-default branch, or under a different commit email, may not be recognized as yours | Later improvement (branch-aware contribution probe) |

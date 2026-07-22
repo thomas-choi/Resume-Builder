@@ -123,11 +123,18 @@ def _mock_tailoring_nodes(monkeypatch, validation_result=None):
     return calls
 
 
+def _thread(tailor_id: str) -> dict:
+    """Checkpointer config — the Phase 4 graph is compiled with a MemorySaver."""
+    return {"configurable": {"thread_id": tailor_id}}
+
+
 def test_tailoring_graph_runs_all_nodes(monkeypatch, sample_profile):
     _mock_tailoring_nodes(monkeypatch)
 
     graph = tailoring_graph.build_tailoring_graph()
-    state = graph.invoke({"profile": sample_profile, "job_post": "A job post"})
+    state = graph.invoke(
+        {"profile": sample_profile, "job_post": "A job post"}, _thread("t-all")
+    )
 
     assert state["job_requirements"].title == "Backend Engineer"
     assert state["tailored_cv"].headline == "Engineer"
@@ -140,7 +147,9 @@ def test_tailoring_graph_runs_all_nodes(monkeypatch, sample_profile):
 def test_tailoring_graph_skips_the_cover_letter_by_default(monkeypatch, sample_profile):
     calls = _mock_tailoring_nodes(monkeypatch)
     graph = tailoring_graph.build_tailoring_graph()
-    state = graph.invoke({"profile": sample_profile, "job_post": "A job post"})
+    state = graph.invoke(
+        {"profile": sample_profile, "job_post": "A job post"}, _thread("t-nocl")
+    )
     assert "cover_letter" not in calls
     assert "cover_letter" not in state
 
@@ -161,7 +170,8 @@ def test_tailoring_graph_writes_and_renders_a_cover_letter(
             "tailor_id": "tailor-graph",
             "render": True,
             "want_cover_letter": True,
-        }
+        },
+        _thread("tailor-graph"),
     )
 
     assert calls == ["analyze", "tailor", "validate", "cover_letter"]
@@ -173,6 +183,40 @@ def test_tailoring_graph_writes_and_renders_a_cover_letter(
 def test_tailoring_graph_render_is_gated_by_validation_flags(
     monkeypatch, data_dir, sample_profile
 ):
+    # Phase 4: the gate is now a pause. The run stops at human_review instead of
+    # returning a skipped render, and still writes no document.
+    flagged = ValidationResult(
+        passed=False,
+        needs_review=True,
+        flags=[ValidationFlag(item="Ran a team of 40", kind="bullet", reason="unsourced")],
+    )
+    _mock_tailoring_nodes(monkeypatch, validation_result=flagged)
+    monkeypatch.setattr(tailoring_graph.review, "write_brief", lambda *a, **k: "")
+
+    graph = tailoring_graph.build_tailoring_graph()
+    state = graph.invoke(
+        {
+            "profile": sample_profile,
+            "job_post": "A job post",
+            "tailor_id": "tailor-flagged",
+            "render": True,
+        },
+        _thread("tailor-flagged"),
+    )
+
+    assert state["__interrupt__"]
+    assert "documents" not in state
+    assert not (data_dir / "documents" / "tailor-flagged" / "cv.docx").exists()
+
+
+def test_tailoring_graph_does_not_pause_when_flags_pre_approved(
+    monkeypatch, data_dir, sample_profile
+):
+    # The Phase 3 client-side path is preserved: approve_flagged up front means
+    # the graph never interrupts and renders the flagged run directly.
+    from src import config
+
+    monkeypatch.setattr(config, "RENDER_PDF", False)
     flagged = ValidationResult(
         passed=False,
         needs_review=True,
@@ -185,11 +229,12 @@ def test_tailoring_graph_render_is_gated_by_validation_flags(
         {
             "profile": sample_profile,
             "job_post": "A job post",
-            "tailor_id": "tailor-flagged",
+            "tailor_id": "tailor-preapproved",
             "render": True,
-        }
+            "approved": True,
+        },
+        _thread("tailor-preapproved"),
     )
 
-    assert state["documents"] == []
-    assert "need review" in state["render_skipped"]
-    assert not (data_dir / "documents" / "tailor-flagged").exists()
+    assert "__interrupt__" not in state
+    assert [d["kind"] for d in state["documents"]] == ["cv"]

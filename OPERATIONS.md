@@ -4,6 +4,9 @@
 
 - Python 3.11+ (local development)
 - Docker + Docker Compose (deployment)
+- **Node 20+ / npm** — only to build or develop the review UI (`frontend/`).
+  Not needed for the API, and not needed for `docker compose` either: the image
+  builds the UI in its own stage
 - An Anthropic API key (default provider) — or a local llama.cpp server (see [Local LLM via llama.cpp](#local-llm-via-llamacpp))
 - **Optional, for PDF output:** LibreOffice (`libreoffice-writer`, providing
   `soffice`). It is installed in the Docker image; locally, without it the API
@@ -18,6 +21,14 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_TOKEN)
+```
+
+Review UI (optional locally — the API runs without it):
+
+```bash
+cd frontend
+npm install
+npm run build      # writes frontend/dist, which the API serves at "/"
 ```
 
 ## Environment variables
@@ -42,6 +53,10 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_T
 | `TAILORING_MODEL` | no | `claude-sonnet-5` | Job analysis + CV tailoring model |
 | `COVER_LETTER_MODEL` | no | `TAILORING_MODEL` | Cover-letter model — same task and same no-fabrication rules as tailoring, so it follows that tier unless set |
 | `VALIDATION_MODEL` | no | `claude-sonnet-5` | Anti-fabrication LLM cross-check (override to `claude-opus-4-8` for max precision) |
+| `REVIEW_MODEL` | no | `VALIDATION_MODEL` | Model that writes the reviewer's brief when a run pauses for human review — it explains that gate's findings, so it follows that tier unless set |
+| `REVIEW_AGENT_ENABLED` | no | `true` | Whether to write that brief at all. `false` → the run still pauses and still lists every flagged item, it just arrives without prose (one fewer LLM call per paused run) |
+| `REVIEW_MAX_TOOL_ITERATIONS` | no | `4` | Bound on the review agent's tool-calling loop (it loads skill bodies on demand). Exhausting it yields no brief rather than looping |
+| `FRONTEND_DIR` | no | `./frontend/dist` | Built review UI, served at `/`. Absent → `/` redirects to `/docs` and the API is unaffected |
 | `DATA_DIR` | no | `./data` | Root of the versioned JSON profile store |
 | `SKILLS_DIR` | no | `./skills` | Directory of per-agent `SKILL.md` reasoning skills (FUND skills mechanism). Prompt **content**, not secrets — ships in the image, safe to commit. A missing/empty dir degrades gracefully: each agent falls back to its inline prompt scaffolding and the pipeline still runs |
 | `LOG_LEVEL` | no | `INFO` | Root log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`); unknown values fall back to `INFO`. `DEBUG` traces the ingestion pipeline: GitHub repo list + full source document, extraction inputs/results, synthesis payload/profile (noisy libs — httpx/httpcore/urllib3/watchfiles/openai — stay capped at INFO) |
@@ -54,6 +69,12 @@ cp .env.example .env   # then fill in ANTHROPIC_API_KEY (and optionally GITHUB_T
 
 Secrets live in `.env` (gitignored) and are loaded via `python-dotenv`; never
 commit or hardcode them.
+
+The review UI's **dev server** has its own three variables (`UI_HOST`, `UI_PORT`,
+`API_URL`, plus `UI_ALLOWED_HOSTS`) — they are read by `frontend/vite.config.ts`
+from the shell, not from `.env`, and are irrelevant in production where the API
+serves the built bundle itself. See
+[Developing the UI against a running API](#developing-the-ui-against-a-running-api).
 
 ## GitHub coverage and rate limits
 
@@ -108,12 +129,85 @@ hitting `http://<this-machine-ip>:8000/docs`):
 uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
+Either way, `/` serves the review UI when `frontend/dist` exists and otherwise
+redirects to `/docs`.
+
 Docker (one service, `.env` file, `data/` volume):
 
 ```bash
 docker compose up --build
-# server listens on 0.0.0.0:8000
+# server listens on 0.0.0.0:8000 — API *and* review UI
 ```
+
+The image is multi-stage: a `node:20-slim` stage runs `npm ci && npm run build`
+and the Python runtime copies `dist/` in, so the shipped container has no Node
+in it and the UI is always present. `.dockerignore` keeps any host
+`node_modules/`/`dist/` out of the build context — the bundle is always built
+from `package-lock.json`.
+
+### Developing the UI against a running API
+
+Two separate things are being addressed here and it is worth keeping them
+apart: **where the dev server listens** (`UI_HOST`/`UI_PORT`) and **where it
+forwards API calls** (`API_URL`).
+
+```bash
+cd frontend
+npm install                      # once
+npm run dev                      # http://localhost:5173, API on localhost:8000
+```
+
+Custom IP and port:
+
+```bash
+# listen on every interface, port 3000 — reachable at http://<this-machine-ip>:3000
+UI_HOST=0.0.0.0 UI_PORT=3000 npm run dev
+
+# ...and talk to an API on another host
+UI_HOST=0.0.0.0 UI_PORT=3000 API_URL=http://192.168.0.212:8000 npm run dev
+
+# bind one specific interface only
+UI_HOST=192.168.0.212 UI_PORT=3000 npm run dev
+
+# equivalent Vite CLI flags (these win over the env vars)
+npm run dev -- --host 0.0.0.0 --port 3000
+```
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `UI_HOST` | `localhost` | Interface the dev/preview server binds. `0.0.0.0` = all interfaces (needed to reach it from another machine); the default stays loopback-only so nothing is exposed unintentionally |
+| `UI_PORT` | `5173` | Port it listens on. `strictPort` is set, so a taken port fails loudly instead of silently moving to `5174` — the port you hand out is the port that serves |
+| `API_URL` | `http://localhost:8000` | Where the proxy forwards `/ingest`, `/profile`, `/tailor`, `/document`, `/healthz`. Independent of `UI_HOST` — the API can be on another machine |
+| `UI_ALLOWED_HOSTS` | — | Comma-separated extra hostnames Vite will answer to. Only needed for a **DNS name** (tunnel, `/etc/hosts` alias); plain IPs work without it |
+
+These four are read by `frontend/vite.config.ts` from the shell environment —
+they are **not** part of the backend's `.env`, and they affect `npm run dev` /
+`npm run preview` only. A production deployment has no Vite server at all: the
+API serves the built bundle on its own host/port (see above).
+
+The dev server proxies the API paths to `API_URL`, so the app talks to
+same-origin paths in development exactly as it does in production — there is no
+CORS configuration anywhere. Consequently, when serving on `0.0.0.0` for a
+browser on another machine, only the **UI** port needs to be reachable from
+that browser; `API_URL` is resolved by the Vite process, not by the browser.
+
+`npm run preview` (serving the built `dist/` from `npm run build` rather than
+the dev bundle) honours all four variables the same way, proxy included — so a
+LAN smoke test of the production bundle is `UI_HOST=0.0.0.0 UI_PORT=3000 npm run
+preview`. Note it then defaults to `5173` too, not Vite's usual `4173`.
+
+### Human review is in-process state
+
+A run that pauses for review is checkpointed in a `MemorySaver` inside the API
+process. **Restarting the server loses every pending review:**
+`POST /tailor/{id}/resume` then returns `409` and the tailoring has to be
+re-run. The flagged items themselves are on disk
+(`data/documents/{tailor_id}/review.json`), so the record of what was asked
+survives — only the ability to continue that run does not. It is also
+single-process state: this service must not be scaled to multiple workers or
+replicas without swapping in a durable checkpointer, since a resume could land
+on a worker that never saw the pause. `uvicorn` defaults to one worker; do not
+add `--workers`.
 
 ## Local LLM via llama.cpp
 
@@ -189,9 +283,12 @@ VALIDATION_MODEL=qwen3.6-35b-a3b
 ```bash
 pytest tests/unit/ -v        # unit tests — no network, all LLMs mocked
 pytest -m integration        # end-to-end against real Anthropic API (needs ANTHROPIC_API_KEY)
+cd frontend && npm test      # review UI — vitest + Testing Library, jsdom, fetch mocked
 ```
 
 Unit tests are the default (`pytest.ini` excludes the `integration` marker).
+The frontend suite needs no API running: every call in `src/lib/api.ts` is
+mocked per test.
 
 The integration suite also covers PDF conversion against a real LibreOffice
 (`tests/integration/test_pdf_render.py`), which needs no API key but does need
@@ -225,15 +322,29 @@ curl -o cv.pdf  "localhost:8000/document/$TAILOR_ID?format=pdf"
 curl -o cover-letter.docx "localhost:8000/document/$TAILOR_ID?kind=cover_letter"
 ```
 
-If the response carries `"render_skipped": "... need review"`, the validation
-gate blocked the render: read `validation.flags`, then re-run the same request
-with `"approve_flagged": true` to render anyway. A missing `cv.pdf` (404) with
-a present `cv.docx` means LibreOffice was unavailable — check the log for
-`skipping PDF`.
+If the response carries `"review_required": true`, the validation gate paused
+the run for a person (this is the normal path when flags exist and `render` was
+requested). Nothing was written; answer it and the same run renders:
+
+```bash
+curl -s "localhost:8000/tailor/$TAILOR_ID/review"      # the flagged items + brief
+curl -X POST "localhost:8000/tailor/$TAILOR_ID/resume" \
+  -H 'content-type: application/json' \
+  -d '{"approvals": {"flag-0": true, "flag-1": false}}'
+```
+
+Anything not approved is removed from the CV. `409` means no review is pending
+— already resumed, or the server restarted (see "Human review is in-process
+state"). To skip the pause entirely, send `"approve_flagged": true` with the
+original `/tailor` request. A missing `cv.pdf` (404) with a present `cv.docx`
+means LibreOffice was unavailable — check the log for `skipping PDF`.
+
+In a browser, all of this is the third panel of the review UI at
+`http://<host>:8000/`.
 
 These are one-liners for checking the service is alive. For the full job
-description → downloaded CV walkthrough — with the JD in a file, the flag gate
-and the approval re-run — see
+description → downloaded CV walkthrough — with the JD in a file, the review
+pause and the resume — see
 [API-REFERENCE.md § "Worked example — end to end"](API-REFERENCE.md#worked-example--end-to-end).
 
 Profiles land in `data/profiles/{profile_id}/v{n}.json` with a `latest`

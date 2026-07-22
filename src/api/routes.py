@@ -8,12 +8,13 @@ from pathlib import Path
 import anyio
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+from langgraph.types import Command
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from src.agents.ingestion_graph import build_ingestion_graph
 from src.agents.tailoring_graph import build_tailoring_graph
-from src.models.schemas import CareerProfile, SourceDocument
+from src.models.schemas import CareerProfile, ReviewDecision, SourceDocument
 from src.tools.docx_reader import read_docx
 from src.tools.github_client import fetch_github_profile, free_text_source
 from src.tools.linkedin_export import read_linkedin_export
@@ -283,6 +284,56 @@ class TailorRequest(BaseModel):
     approve_flagged: bool = False
 
 
+def _thread(tailor_id: str) -> dict:
+    """Checkpointer config for one tailoring run (its id is the thread id)."""
+    return {"configurable": {"thread_id": tailor_id}}
+
+
+def _pending_review(state: dict) -> dict | None:
+    """The review payload a paused graph is waiting on, or ``None``.
+
+    LangGraph reports a pause by putting `Interrupt` objects on `__interrupt__`
+    in the returned state; the payload is what `human_review` passed to
+    `interrupt()` (a serialized `ReviewRequest`).
+    """
+    interrupts = state.get("__interrupt__") or []
+    if not interrupts:
+        return None
+    return interrupts[0].value
+
+
+def _tailor_response(tailor_id: str, profile_id: str, state: dict) -> dict:
+    """Build (and persist) the response shared by `/tailor` and `/resume`."""
+    cover_letter = state.get("cover_letter")
+    documents = state.get("documents") or []
+    review_request = _pending_review(state)
+    response = {
+        "profile_id": profile_id,
+        "tailor_id": tailor_id,
+        "job_requirements": state["job_requirements"].model_dump(),
+        "tailored_cv": state["tailored_cv"].model_dump(),
+        "validation": state["validation"].model_dump(),
+        "cover_letter": cover_letter.model_dump() if cover_letter else None,
+        "documents": [
+            {**doc, "url": f"/document/{tailor_id}?kind={doc['kind']}&format={doc['format']}"}
+            for doc in documents
+        ],
+        "render_skipped": state.get("render_skipped"),
+        # Phase 4: the run is paused at the human-review checkpoint. Nothing is
+        # rendered until POST /tailor/{tailor_id}/resume carries a decision.
+        "review_required": review_request is not None,
+        "review": review_request,
+        "review_url": f"/tailor/{tailor_id}/review" if review_request else None,
+    }
+    # Persist the result next to the documents so a download can be traced back
+    # to the claims the validation gate checked.
+    document_store.save_result(
+        tailor_id,
+        {k: v for k, v in response.items() if k != "documents"},
+    )
+    return response
+
+
 @router.post("/tailor")
 async def tailor(request: TailorRequest) -> dict:
     """Run the tailoring graph: job analysis -> tailoring -> validation -> render.
@@ -293,9 +344,11 @@ async def tailor(request: TailorRequest) -> dict:
     the CV; it is returned in the response either way, and rendered too when
     `render` is set.
 
-    Rendering is gated by the validation result: when `validation.needs_review`
-    is true nothing is written, and `render_skipped` explains why. Review the
-    flags, then re-run with `approve_flagged` to render regardless.
+    Rendering is gated by the validation result. When flags exist and `render`
+    was asked for, the graph **pauses** at its human-review checkpoint:
+    `review_required` is true, `review` holds the flagged items, and nothing is
+    written until `POST /tailor/{tailor_id}/resume` carries a decision.
+    Pass `approve_flagged` to accept every flag up front and skip the pause.
     """
     try:
         profile = profile_store.load_profile(request.profile_id, request.version)
@@ -316,32 +369,72 @@ async def tailor(request: TailorRequest) -> dict:
                 "render": request.render,
                 "want_cover_letter": request.cover_letter,
                 "approved": request.approve_flagged,
-            }
+            },
+            _thread(tailor_id),
         )
 
     state = await anyio.to_thread.run_sync(run_graph)
-    cover_letter = state.get("cover_letter")
-    documents = state.get("documents") or []
-    response = {
-        "profile_id": request.profile_id,
-        "tailor_id": tailor_id,
-        "job_requirements": state["job_requirements"].model_dump(),
-        "tailored_cv": state["tailored_cv"].model_dump(),
-        "validation": state["validation"].model_dump(),
-        "cover_letter": cover_letter.model_dump() if cover_letter else None,
-        "documents": [
-            {**doc, "url": f"/document/{tailor_id}?kind={doc['kind']}&format={doc['format']}"}
-            for doc in documents
-        ],
-        "render_skipped": state.get("render_skipped"),
-    }
-    # Persist the result next to the documents so a download can be traced back
-    # to the claims the validation gate checked (and Phase 4 can resume from it).
-    document_store.save_result(
-        tailor_id,
-        {k: v for k, v in response.items() if k != "documents"},
-    )
-    return response
+    return _tailor_response(tailor_id, request.profile_id, state)
+
+
+def _checked_tailor_id(tailor_id: str) -> str:
+    """Validate a path tailor_id (it addresses a directory) or raise 400."""
+    try:
+        return document_store.validate_tailor_id(tailor_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/tailor/{tailor_id}/review")
+def get_review(tailor_id: str) -> dict:
+    """Fetch the flagged items a paused tailoring run is waiting on.
+
+    `pending` distinguishes a run that is still paused — and can therefore be
+    resumed — from the archived record of a review that was already answered
+    (or whose checkpoint was lost to a restart).
+
+    Returns:
+        The `ReviewRequest` payload plus `pending`.
+
+    Raises:
+        HTTPException: 404 when that run never paused for review.
+    """
+    tailor_id = _checked_tailor_id(tailor_id)
+    snapshot = build_tailoring_graph().get_state(_thread(tailor_id))
+    interrupts = getattr(snapshot, "interrupts", ()) or ()
+    if interrupts:
+        return {"pending": True, **interrupts[0].value}
+    stored = document_store.load_review(tailor_id)
+    if stored is None:
+        raise HTTPException(404, f"no review pending for tailor {tailor_id}")
+    return {"pending": False, **stored}
+
+
+@router.post("/tailor/{tailor_id}/resume")
+async def resume_tailor(tailor_id: str, decision: ReviewDecision) -> dict:
+    """Resume a paused run with the human's per-item decision.
+
+    Items left out of `approvals` (and not covered by `approve_all`) are
+    **removed** from the CV — silence is not consent for a claim the gate could
+    not trace. The run then continues to the cover letter and rendering.
+
+    Raises:
+        HTTPException: 409 when no review is pending for that run — it was
+            already resumed, never paused, or its checkpoint was lost to a
+            restart (the checkpointer is in-process).
+    """
+    tailor_id = _checked_tailor_id(tailor_id)
+    graph = build_tailoring_graph()
+    snapshot = graph.get_state(_thread(tailor_id))
+    if not (getattr(snapshot, "interrupts", ()) or ()):
+        raise HTTPException(409, f"no review pending for tailor {tailor_id}")
+
+    def run_graph() -> dict:
+        return graph.invoke(Command(resume=decision.model_dump()), _thread(tailor_id))
+
+    state = await anyio.to_thread.run_sync(run_graph)
+    stored = document_store.load_result(tailor_id) or {}
+    return _tailor_response(tailor_id, stored.get("profile_id", ""), state)
 
 
 @router.get("/document/{tailor_id}")

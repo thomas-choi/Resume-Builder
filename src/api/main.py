@@ -1,9 +1,10 @@
-"""FastAPI app factory. Phase 4 will also serve the built frontend from here."""
+"""FastAPI app factory. Also serves the built Phase 4 review UI."""
 
 import logging
 
 from fastapi import FastAPI
 from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from src import config
 from src.api.routes import router
@@ -22,10 +23,27 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Resume Builder", version="0.1.0")
     app.include_router(router)
 
-    @app.get("/", include_in_schema=False)
-    def root() -> RedirectResponse:
-        """Browser-friendly landing: redirect to the interactive API docs."""
-        return RedirectResponse("/docs")
+    # The review UI is one container with the API (design doc §10): a built
+    # frontend is served from `/`, so the browser talks to same-origin paths and
+    # no CORS or second service is needed. Mounted last, after every API route,
+    # so `/ingest`, `/docs` etc. still win; absent (backend-only checkout, or
+    # before `npm run build`) `/` falls back to the API docs.
+    index = config.FRONTEND_DIR / "index.html"
+    if index.is_file():
+        logger.info("Serving the review UI from %s", config.FRONTEND_DIR)
+        app.mount(
+            "/", StaticFiles(directory=config.FRONTEND_DIR, html=True), name="ui"
+        )
+    else:
+        logger.info(
+            "No built frontend at %s — '/' redirects to the API docs",
+            config.FRONTEND_DIR,
+        )
+
+        @app.get("/", include_in_schema=False)
+        def root() -> RedirectResponse:
+            """Browser-friendly landing: redirect to the interactive API docs."""
+            return RedirectResponse("/docs")
 
     return app
 
