@@ -560,8 +560,8 @@ the three panels above (`frontend/src/panels/`):
 | Panel | Reads/writes | Notes |
 |---|---|---|
 | `SourcesPanel` | `POST /ingest`, `GET /ingest/{job_id}/events` | Subscribes to the SSE stream *before* POSTing, so no node event is missed. Generates its own `job_id` for that reason. File inputs **accumulate** across picks (Phase 5.b) |
-| `ProfilePanel` | `GET`/`PUT /profile/{id}` | Edits a local draft (a slow save never fights the typing); each conflict's chosen value is recorded in the new `Conflict.resolution` field |
-| `TailorPanel` | `POST /tailor`, `GET /document/{id}` | Side-by-side profile-vs-tailored bullet table; hands a paused run to `ReviewPanel` |
+| `ProfilePanel` | `GET`/`PUT /profile/{id}` | Edits a local draft (a slow save never fights the typing); each conflict's chosen value is recorded in the new `Conflict.resolution` field. Draws every stored section — contact, experience, projects, education, skills, certifications (Phase 6.d) |
+| `TailorPanel` | `POST /tailor`, `GET /document/{id}` | Side-by-side profile-vs-tailored bullet table, plus the selected projects in the order the `.docx` renders them; hands a paused run to `ReviewPanel` |
 | `ReviewPanel` | `POST /tailor/{id}/resume` | Per-item Keep/Remove, defaulting to Remove — the same default as the server |
 
 Two decisions worth recording:
@@ -592,6 +592,21 @@ Two decisions worth recording:
   unchanged/reworded/new. The authoritative judgement stays server-side
   (difflib + LLM cross-check); anything the gate flagged renders as flagged
   whatever the client scores.
+- **The screen draws everything the profile stores (Phase 6.d).** `ProfilePanel`
+  originally rendered only name, headline, summary, conflicts, experience and
+  skills, so a GitHub-only ingest — 56 repos in `projects` — looked like it had
+  produced nothing, which is the exact indistinguishability Phase 5.c set out to
+  remove. `projects`, `education`, `certifications` and `contact` now have
+  markup, and `TailorPanel` draws `selected_projects` between the bullets and
+  the skills, matching `docx_renderer.render_cv`'s section order so the review
+  screen and the approved document agree. Two constraints shaped it:
+  `education` is `list[dict]` with **no** guaranteed keys, so entries render
+  familiar keys first and list whatever else they carry rather than dropping it;
+  and a 56-item list would bury the Save button, so long lists show ten with a
+  "Show all *n*" toggle. `diff.ts` gained `diffProjects`, which matches by
+  lower-cased name — the same key `validation.py` and `review.py` use, so a
+  project the UI marks flagged is the one the gate flagged, never a near-miss
+  of the client's own invention.
 
 `Conflict.resolution` (`str | None`) is the one schema addition: conflicts are
 kept after resolution, not deleted — the record of who-said-what and what was

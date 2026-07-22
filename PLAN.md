@@ -916,6 +916,228 @@ per-stage temperature knob in this phase.
 
 ---
 
+## Phase 6 — UI state lifecycle and profile visibility (findings from the Phase 5 UI run) — **planned**
+
+Four defects reported on 2026-07-22 after driving the post-Phase-5 UI. Two are
+about **state that never gets cleared**, one is about **a transient failure
+destroying loaded data**, and one is about **data the profile holds but the
+screen never draws**. None of them are backend bugs — every one was reproduced
+or ruled out against a live API before being written down.
+
+### Evidence gathered before planning
+
+- `GET /profile/CVs-Only` → **HTTP 200, 31,829 bytes**;
+  `GET /profile/github-only` → **HTTP 200, 34,594 bytes**. The store, the route
+  and both stored profiles are healthy.
+- Headless-Chrome (CDP) replay of "type an id → click Load" against **both**
+  deployment shapes — the built bundle served by the API (`main.py` mounts
+  `dist/` at `/`) and the Vite dev server proxying to the API — issues **exactly
+  one** `GET /profile/CVs-Only`, gets 200, and the panel is still showing the
+  profile at t+0.5s, +1s, +2s and +4s. **The load path itself is not broken**;
+  the reported failure is a *second, later* request that fails only in the
+  reporter's environment (see 6.c).
+- `data/profiles/github-only/v2.json` holds **56 `projects`**, every one with
+  `source: "github:thomas-choi"`, alongside 5 experiences and 52 skills. The
+  repos are in the profile. `ProfilePanel.tsx` has no `projects` markup at all —
+  nor `education`, `certifications` or `contact` (see 6.d).
+
+### 6.a — A Reset button that clears the whole screen
+
+**Problem.** There is no way to start over short of reloading the browser. Every
+piece of session state is component-local and unreachable from the parent:
+`App.tsx` owns `profileId` / `profileIdInput`; `SourcesPanel` owns the staged CV
+and LinkedIn files, `githubUsername`, `githubToken`, `freeText`, `profileId`,
+`progress`, `liveWarnings` and its mutation result; `ProfilePanel` owns `draft`
+and its save mutation; `TailorPanel` owns `jobPost`, `render`, `coverLetter` and
+`result`. Passing a "cleared" prop down would mean threading a reset through
+four components and a dozen `useState`s.
+
+1. `frontend/src/App.tsx` — hold a `sessionKey` counter and render every panel
+   with `key={sessionKey}`. Bumping it makes React unmount and remount the
+   subtree, which discards **all** of the state above in one line and cannot
+   drift as panels gain fields. Reset `profileId` and `profileIdInput` in the
+   same handler.
+2. Clear the query cache too — `useQueryClient().clear()` — otherwise the
+   remounted `ProfilePanel` re-renders the previous profile instantly from
+   cache; a "Reset" that leaves the old data on screen is worse than none.
+3. The button is **destructive** (unsaved profile edits, a staged upload set,
+   an entered token), so guard it with a `window.confirm`. Place it in the
+   header next to the load form, `type="button"`, labelled "Clear everything".
+4. Clearing the GitHub token field is part of the point, and comes free with
+   the remount — `SourcesPanel` deliberately keeps it in state only.
+
+**Tests:** `frontend/src/__tests__/App.test.tsx` (new) — with `confirm` stubbed
+true, typing into the free-text box, loading a profile, then clicking "Clear
+everything" leaves the active-profile line gone and the inputs empty; with
+`confirm` stubbed false nothing changes.
+
+### 6.b — Clearing the screen when a new profile is built
+
+**Problem.** "Build profile" starts a new profile but the previous one's output
+stays on screen. Three distinct stale-state paths, all confirmed by reading the
+components:
+
+1. `ProfilePanel` sets `draft` only *when new data arrives*
+   ([ProfilePanel.tsx:25-27](frontend/src/panels/ProfilePanel.tsx#L25-L27)), so
+   between the id changing and the fetch landing the panel renders the **old
+   profile's** headline, summary and conflicts under the **new** id.
+2. `TailorPanel.result` is never reset on a profile change, so the tailored CV,
+   the bullet diff, a pending review and the download links from the *previous*
+   profile stay visible — and those links carry the old `tailor_id`, so they
+   download the old CV.
+3. `SourcesPanel` keeps the staged files after a successful run. Clicking
+   "Build profile" again silently re-ingests the same CVs into another profile.
+
+**Fix.** Split by what the state is *for*:
+
+- **Downstream panels are keyed by the profile they describe.** Render
+  `<ProfilePanel key={...} />` and `<TailorPanel key={...} />` with a key
+  combining `sessionKey` and `profileId`. A new profile id remounts both, which
+  fixes (1) and (2) together — no `useEffect` reset to keep in sync, and no
+  window where old data is drawn under a new id.
+- **Inputs clear on success, not on click.** In `SourcesPanel`'s `onSuccess`,
+  clear `cvFiles`, `linkedinFiles`, `freeText`, `githubToken` and the "add to
+  an existing profile" id, keeping the progress list and the outcome banner
+  (including `skipped`) — a *failed* run must keep the user's staged files, or
+  they re-pick every file after a 500.
+
+**Tests:** `SourcesPanel.test.tsx` — staged files are gone after a successful
+ingest and still staged after a failed one; the skipped/success banner survives
+the clear. `App.test.tsx` — a tailor result rendered for profile A is absent
+after the active profile becomes B.
+
+### 6.c — "Could not load X: Failed to fetch" wipes a profile that loaded fine
+
+**Problem, precisely.** The reported sequence — profile appears, then ~1s later
+the panel is replaced by `Could not load CVs-Only: Failed to fetch` — is two
+separate things, and only the second is a bug we can fix blind:
+
+- `Failed to fetch` is a `TypeError` from `fetch` — a **transport** failure
+  (connection reset, DNS, proxy hang-up, browser offline). It is never an HTTP
+  status: a 404 would render `profile … not found` from FastAPI's `detail`.
+  This did not reproduce against either deployment shape locally, so it is
+  environment-specific (dev-server proxy to a remote/Docker API, VPN, or a
+  wifi/sleep blip are the candidates).
+- **Ours regardless:**
+  [ProfilePanel.tsx:44-51](frontend/src/panels/ProfilePanel.tsx#L44-L51) checks
+  `query.isError` **before** `draft`, so *any* failure — including a background
+  refetch that React Query keeps the previous `data` through — erases a profile
+  that is already loaded and possibly edited. A one-second network blip costs
+  the user their work. The in-file comment justifies the ordering by the
+  first-load case only; that case is `isError && !draft`.
+- **Why a second request happens at all:** `main.tsx:11` sets only
+  `refetchOnWindowFocus: false` and `retry: false`. The default `staleTime: 0`
+  marks the response stale the moment it lands, so every new observer of
+  `["profile", id]` refetches — and there are two observers, `ProfilePanel` and
+  `TailorPanel`. `refetchOnReconnect` is still on by default, so any
+  online/offline flicker refires the query, which matches the "a second later"
+  timing. With `retry: false` the first blip goes straight to the error state.
+  The comment above that config ("nothing is refetched behind their back") does
+  not describe what it currently does.
+- `getProfile` ignores the `AbortSignal` React Query passes its query function,
+  so a *cancelled* request surfaces as a failure rather than being discarded.
+
+1. `frontend/src/panels/ProfilePanel.tsx` — the fatal branch becomes
+   `query.isError && !draft`. When a draft exists, render a non-destructive
+   `role="alert"` banner above the still-editable profile ("Could not refresh …
+   — showing the last loaded copy") with a **Retry** button calling
+   `query.refetch()`.
+2. `frontend/src/panels/TailorPanel.tsx` — same treatment for its
+   `profileQuery`: today a failed profile fetch silently renders an **empty
+   diff**, which reads as "nothing changed" rather than "the comparison is
+   missing".
+3. `frontend/src/main.tsx` — make the defaults match the intent: `staleTime`
+   30s (profiles change only when this user changes them, and the save path
+   already calls `invalidateQueries`), `refetchOnReconnect: false`, and
+   `retry: 1` so a single transport blip retries instead of erroring.
+4. `frontend/src/lib/api.ts` — thread React Query's `signal` into `getProfile`
+   / `getReview` and into `request`, and wrap a caught `TypeError` as
+   `Could not reach the API (<path>) — is the server running?`. The next report
+   then distinguishes transport from HTTP without a devtools session.
+5. **Still open, needs the reporter:** reproduce with the Network tab recording
+   and note the failing request's URL, initiator and status ("(failed)" vs a
+   code). Record the answer here — if it is the dev-server proxy dropping the
+   connection to a remote API, the fix is in `vite.config.ts` (proxy
+   `timeout`/`proxyTimeout` and an `error` handler that returns 502 instead of
+   destroying the socket), not in the panels.
+
+**Tests:** `ProfilePanel.test.tsx` — a query that succeeds and then fails on
+refetch still renders the profile fields plus the banner, and Retry re-issues
+the request; a query that fails on first load still renders the fatal message.
+`api.test.ts` — a `fetch` that rejects with `TypeError` produces the
+"could not reach the API" message; the abort signal is forwarded.
+
+### 6.d — GitHub projects (and education, certifications, contact) are never drawn — **implemented 2026-07-22**
+
+**Problem.** `github-only/v2.json` holds 56 GitHub repos in `projects` — the
+Phase 5.c work put them there correctly — but `ProfilePanel` renders only
+`name`, `headline`, `summary_narrative`, `conflicts`, `experiences` and
+`skills`. `projects`, `education`, `certifications` and `contact` have **no
+markup anywhere in the frontend**. A GitHub-only ingest therefore looks like it
+produced nothing, which is exactly the symptom Phase 5.c was supposed to have
+made impossible to mistake. The same blindness reaches the tailored CV:
+`TailoredCV.selected_projects` is validated (`validation.py:113`), can be
+removed at review (`review.py:201`) and **is rendered into the `.docx`**
+(`docx_renderer.py:140`) — but `TailorPanel` never displays it, so a person
+approves a document containing projects they were never shown.
+
+1. `frontend/src/panels/ProfilePanel.tsx` — add a **Projects** section after
+   Experience: count in the heading, one entry per project with the name (an
+   `<a href>` when `url` is set, `rel="noopener noreferrer"`), the description,
+   the `technologies` as a muted list, and the `source` badge already used by
+   experience entries. Muted "No projects" when empty, so an empty list is
+   visibly empty rather than absent.
+2. Same panel — small **Education**, **Certifications** and **Contact**
+   sections. `education` is `list[dict]` in the schema with no fixed shape, so
+   render its entries defensively (known keys first, then any remaining
+   key/value pairs) rather than assuming a field set the extractor does not
+   guarantee.
+3. Long lists need to stay reviewable: 56 projects at full height buries the
+   Save button. Render the first 10 with a "Show all 56" toggle; keep the
+   toggle state local to the section.
+4. `frontend/src/panels/TailorPanel.tsx` — render `selected_projects` in the
+   result, in the same order as the `.docx`, so review matches the artefact.
+5. `frontend/src/lib/diff.ts` — projects are currently outside the diff
+   entirely. Extend `diffExperiences`'s sibling coverage with a project-level
+   comparison (profile projects vs. selected ones: kept / dropped / not in
+   profile), reusing the existing validation-flag lookup so a fabricated
+   project is marked in the UI exactly as a fabricated bullet is.
+
+**Tests:** `ProfilePanel.test.tsx` — a profile with GitHub projects lists them
+with linked names and technologies, the toggle reveals the rest, and an empty
+list renders the muted placeholder. `TailorPanel.test.tsx` — selected projects
+appear in the result; `diff.test.ts` — a project present in the tailored CV but
+absent from the profile is marked as flagged.
+
+**As built.** 12 new vitest cases (55 green, from 43); the 230 Python unit tests
+are untouched and still green. One thing the real data changed: `education`
+entries from the CV extractor carry a `location`, so it joined the familiar-key
+list rather than being pushed into the leftover line. Verified in headless
+Chrome against the stored profiles rather than fixtures only — `github-only`
+renders "Projects (56)", ten at a time, "Show all 56" expanding to 56, each
+repo linked with `rel="noopener noreferrer"`; `CVs-Only` renders its 6 education
+entries, 3 certifications and 4 contact fields. Step 5 (the project diff) landed
+as `diffProjects`, keyed on the lower-cased name to match the server.
+
+### Sequencing
+
+6.d first (pure addition, no state semantics touched), then 6.b, then 6.a
+(6.a's remount key subsumes 6.b's), then 6.c — its panel changes conflict with
+6.b's remount work, so it lands on top rather than under.
+
+### Docs to update (mandatory per CLAUDE.md)
+
+- `PRODUCT-GUIDE.md` — the reset/clear behaviour, what survives a failed run,
+  and that projects/education/certifications are now visible before download.
+- `TECHNICAL-DESIGN.md` §10 — panel state lifecycle: what is keyed on the
+  active profile, what the query cache holds, and the non-destructive refetch
+  error rule.
+- `API-REFERENCE.md` — no API change (frontend-only phase); record that line.
+- `OPERATIONS.md` — only if 6.c step 5 ends in a `vite.config.ts` proxy change.
+- `HISTORY.md` — one entry per change, newest first.
+
+---
+
 ## Docs sync (every phase, mandatory per CLAUDE.md)
 
 - `TECHNICAL-DESIGN.md` — "Implementation notes" section per phase (two-graph split, JSON storage, interrupt design in Phase 4) + Mermaid diagrams of implemented graphs.
@@ -941,3 +1163,10 @@ per-stage temperature knob in this phase.
 - **Phase 3:** tailor with `render=true` → open the .docx/.pdf, verify structure matches `TailoredCV` ordering.
 - **Phase 4:** full browser flow from the Windows host (server on `0.0.0.0`): upload → edit profile → tailor → approve a flagged item → download rendered CV; verify a flagged run cannot render without approval.
 - **Phase 5:** repeat the run that found the bugs — stage `CV.docx` and `CV.pdf` in **two separate picks** plus a LinkedIn export and a GitHub username with a per-request token — and confirm: both CVs appear in `data/sources/{run_id}/cv/` under distinct names and distinct source ids; the resulting `CareerProfile` contains GitHub projects (`projects` is non-empty when the account has repos); any repo that failed extraction is listed by name in the UI, absent from `github.json`, and still present in `github.raw.json`; and the token appears in no log line and in no file under `data/`.
+- **Phase 6:** load `github-only` in the browser → its 56 GitHub projects are
+  listed with links and technologies; click "Build profile" with new sources →
+  the previous profile's fields, tailored CV and download links are gone before
+  the new ones appear; click "Clear everything" → every input, the active
+  profile line and the tailor result are empty; kill the API mid-session and
+  refetch → the loaded profile stays on screen under a retryable banner instead
+  of being replaced by the error.

@@ -588,6 +588,12 @@ that arrives in Phase 4.
 > response field changed; same-named uploads are now archived and identified
 > distinctly (`CV.docx` / `CV-2.docx`) instead of overwriting each other.
 
+> **Phase 6.d (2026-07-22) — no API change.** Drawing the profile's `projects`,
+> `education`, `certifications` and `contact` (and the tailored CV's
+> `selected_projects`) is a frontend-only change: every one of those fields was
+> already in the `GET /profile/{id}` and `POST /tailor` responses documented
+> here, and none of them changed shape.
+
 > **Configurable UI dev-server address (2026-07-21) — no API change.** The Vite
 > dev server's bind address (`UI_HOST`/`UI_PORT`) and proxy target (`API_URL`)
 > are frontend tooling only. Every endpoint, path and response here is

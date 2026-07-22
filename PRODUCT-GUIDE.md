@@ -128,6 +128,15 @@ Fetch the profile, fix anything, and save it back — every save creates a new
 version, so nothing is lost. The profile is durable: re-tailoring for new job
 posts never re-runs ingestion.
 
+**You see everything the profile holds.** The review screen lists your contact
+details, experience, projects, education, skills and certifications — not a
+selection of them. This matters most for a GitHub ingest: your repositories are
+stored as projects, each with its description, the languages it uses and a link
+back to the repository, and until now the screen simply didn't draw them, so a
+profile built from GitHub alone looked empty when it wasn't. Long lists — fifty
+repositories is normal — open showing the first ten with a "Show all" control,
+so the rest of the profile stays reachable.
+
 **Settling a conflict is a choice you record.** Where two sources disagreed,
 you pick the value you consider right and it is stored with the disagreement,
 not instead of it: the conflict stays on the profile, now showing what each
@@ -166,7 +175,10 @@ as many postings as you like; ingestion never runs again.
 Side by side with the result you can see **where each line came from**: your
 original profile bullet next to the tailored version, labelled as unchanged, a
 rewording, or something with no visible origin — plus the bullets that were
-left out of this application entirely.
+left out of this application entirely. The projects chosen for this application
+are shown too, in the order they appear in the document, with the ones left out
+named and any project that couldn't be traced back to your profile marked —
+so nothing reaches the CV you approve without having been on the screen.
 
 **What it costs you in time:** two AI calls for the CV, plus one for each claim
 that needed the stricter check, plus one if you asked for a cover letter — a

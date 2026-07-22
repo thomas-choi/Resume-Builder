@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
 import type { ReactElement } from "react";
 
-import type { CareerProfile, ReviewRequest, TailorResponse } from "../lib/types";
+import type { CareerProfile, Project, ReviewRequest, TailorResponse } from "../lib/types";
 
 /** Render inside a fresh QueryClient (no retries — a failure must surface now). */
 export function renderWithClient(ui: ReactElement) {
@@ -45,6 +45,19 @@ export function profileFixture(overrides: Partial<CareerProfile> = {}): CareerPr
         resolution: null,
       },
     ],
+    ...overrides,
+  };
+}
+
+/** A project as a GitHub ingest produces it (`source: "github:<login>"`). */
+export function projectFixture(overrides: Partial<Project> = {}): Project {
+  return {
+    name: "myFinData",
+    description: "A financial data pipeline for daily stock prices",
+    technologies: ["Python", "C++"],
+    role: null,
+    url: "https://github.com/alice/myFinData",
+    source: "github:alice",
     ...overrides,
   };
 }

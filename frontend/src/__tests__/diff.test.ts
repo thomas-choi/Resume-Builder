@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { diffExperiences, similarity } from "../lib/diff";
-import { profileFixture, tailorFixture } from "./testUtils";
+import { diffExperiences, diffProjects, similarity } from "../lib/diff";
+import { profileFixture, projectFixture, tailorFixture } from "./testUtils";
 
 describe("similarity", () => {
   it("scores identical strings 1 and unrelated strings near 0", () => {
@@ -86,5 +86,71 @@ describe("diffExperiences", () => {
     const [diff] = diffExperiences(profile, cv, result.validation);
     expect(diff.bullets[0].original).toBeNull();
     expect(diff.dropped).toEqual([]);
+  });
+});
+
+describe("diffProjects", () => {
+  const profile = profileFixture({
+    projects: [projectFixture(), projectFixture({ name: "playbook" })],
+  });
+  const cvWith = (...projects: ReturnType<typeof projectFixture>[]) => ({
+    ...tailorFixture().tailored_cv,
+    selected_projects: projects,
+  });
+  const clean = { passed: true, needs_review: false, flags: [] };
+
+  it("keeps a project the profile also has", () => {
+    const { selected } = diffProjects(profile, cvWith(projectFixture()), clean);
+    expect(selected).toHaveLength(1);
+    expect(selected[0].status).toBe("kept");
+    expect(selected[0].project.name).toBe("myFinData");
+  });
+
+  it("marks a project the validation gate flagged", () => {
+    const invented = projectFixture({ name: "Invented Project" });
+    const { selected } = diffProjects(profile, cvWith(invented), {
+      passed: false,
+      needs_review: true,
+      flags: [
+        {
+          item: "Invented Project",
+          kind: "project",
+          reason: "Project not present in the career profile",
+          similarity: null,
+        },
+      ],
+    });
+    expect(selected[0].status).toBe("flagged");
+  });
+
+  it("matches names case-insensitively, as the server does", () => {
+    const { selected, dropped } = diffProjects(
+      profile,
+      cvWith(projectFixture({ name: "MYFINDATA" })),
+      clean,
+    );
+    expect(selected[0].status).toBe("kept");
+    expect(dropped).toEqual(["playbook"]);
+  });
+
+  it("lists profile projects the tailored CV left out", () => {
+    const { dropped } = diffProjects(profile, cvWith(projectFixture()), clean);
+    expect(dropped).toEqual(["playbook"]);
+  });
+
+  it("ignores flags of other kinds", () => {
+    const { selected } = diffProjects(profile, cvWith(projectFixture()), {
+      passed: false,
+      needs_review: true,
+      flags: [
+        {
+          item: "myFinData",
+          kind: "skill",
+          reason: "Skill not present in the career profile",
+          similarity: null,
+        },
+      ],
+    });
+    expect(selected[0].status).toBe("kept");
   });
 });

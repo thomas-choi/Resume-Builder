@@ -1,10 +1,90 @@
 /** Panel 2 — review and edit the synthesized profile, resolve its conflicts. */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { getProfile, putProfile } from "../lib/api";
 import type { CareerProfile, ProfileResponse } from "../lib/types";
+
+/** Entries of a long list shown before the reader asks for the rest. */
+const PREVIEW_LIMIT = 10;
+
+/**
+ * A list that shows its first {@link PREVIEW_LIMIT} entries until asked for all
+ * of them.
+ *
+ * One GitHub source brings back dozens of projects; drawn in full they push the
+ * conflicts and the Save button off the screen, so the panel opens with a
+ * readable sample and says how many more there are.
+ */
+function ExpandableList<T>({
+  label,
+  items,
+  renderItem,
+}: {
+  label: string;
+  items: T[];
+  renderItem: (item: T, index: number) => ReactNode;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const shown = expanded ? items : items.slice(0, PREVIEW_LIMIT);
+  return (
+    <>
+      <ul className="entries" aria-label={label}>
+        {shown.map(renderItem)}
+      </ul>
+      {items.length > PREVIEW_LIMIT && (
+        <button type="button" onClick={() => setExpanded(!expanded)}>
+          {expanded ? "Show fewer" : `Show all ${items.length}`}
+        </button>
+      )}
+    </>
+  );
+}
+
+/** A value from a free-shaped dict, as display text ("" when it has none). */
+function asText(value: unknown): string {
+  return value === null || value === undefined ? "" : String(value);
+}
+
+/** Keys an education entry is *likely* to have, in the order they read best. */
+const EDUCATION_KEYS = [
+  "degree",
+  "field",
+  "field_of_study",
+  "school",
+  "institution",
+  "location",
+  "start_date",
+  "end_date",
+  "year",
+];
+
+/**
+ * One education entry, defensively.
+ *
+ * `education` is `list[dict]` in the schema with no fixed shape — the extractor
+ * guarantees no field set — so the familiar keys are drawn first and whatever
+ * else the entry happens to carry is listed as-is rather than silently dropped.
+ */
+function EducationEntry({ entry }: { entry: Record<string, unknown> }) {
+  const headline = EDUCATION_KEYS.map((key) => asText(entry[key]))
+    .filter(Boolean)
+    .join(" · ");
+  const rest = Object.entries(entry).filter(
+    ([key, value]) => !EDUCATION_KEYS.includes(key) && asText(value),
+  );
+  return (
+    <li>
+      <p>{headline || "(no details)"}</p>
+      {rest.length > 0 && (
+        <p className="muted">
+          {rest.map(([key, value]) => `${key}: ${asText(value)}`).join(" · ")}
+        </p>
+      )}
+    </li>
+  );
+}
 
 interface Props {
   profileId: string | null;
@@ -74,6 +154,13 @@ export function ProfilePanel({ profileId }: Props) {
       <p className="muted">
         {draft.name} · version {query.data?.version} of {query.data?.versions.length}
       </p>
+      {Object.keys(draft.contact).length > 0 && (
+        <p className="muted" aria-label="Contact">
+          {Object.entries(draft.contact)
+            .map(([field, value]) => `${field}: ${value}`)
+            .join(" · ")}
+        </p>
+      )}
 
       <label htmlFor="profile-headline">Headline</label>
       <input
@@ -145,8 +232,64 @@ export function ProfilePanel({ profileId }: Props) {
         ))}
       </ul>
 
+      <h3>Projects {draft.projects.length > 0 && <span className="muted">({draft.projects.length})</span>}</h3>
+      {draft.projects.length === 0 ? (
+        <p className="muted">No projects — a GitHub source contributes one per repository.</p>
+      ) : (
+        <ExpandableList
+          label="Projects"
+          items={draft.projects}
+          renderItem={(project, index) => (
+            <li key={`${project.name}-${index}`} className="project">
+              <p>
+                <strong>
+                  {project.url ? (
+                    // Repo links open away from the review screen, which must
+                    // keep its unsaved draft.
+                    <a href={project.url} target="_blank" rel="noopener noreferrer">
+                      {project.name}
+                    </a>
+                  ) : (
+                    project.name
+                  )}
+                </strong>{" "}
+                <span className="muted">{project.source}</span>
+              </p>
+              {project.description && <p>{project.description}</p>}
+              {project.technologies.length > 0 && (
+                <p className="muted">{project.technologies.join(", ")}</p>
+              )}
+            </li>
+          )}
+        />
+      )}
+
+      <h3>Education</h3>
+      {draft.education.length === 0 ? (
+        <p className="muted">No education entries.</p>
+      ) : (
+        <ExpandableList
+          label="Education"
+          items={draft.education}
+          renderItem={(entry, index) => <EducationEntry key={index} entry={entry} />}
+        />
+      )}
+
       <h3>Skills</h3>
       <p>{draft.skills.map((skill) => skill.name).join(", ") || "—"}</p>
+
+      <h3>Certifications</h3>
+      {draft.certifications.length === 0 ? (
+        <p className="muted">No certifications.</p>
+      ) : (
+        <ExpandableList
+          label="Certifications"
+          items={draft.certifications}
+          renderItem={(certification, index) => (
+            <li key={`${certification}-${index}`}>{certification}</li>
+          )}
+        />
+      )}
 
       <button type="button" disabled={save.isPending} onClick={() => save.mutate()}>
         {save.isPending ? "Saving…" : "Save as new version"}

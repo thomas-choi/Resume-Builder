@@ -118,6 +118,21 @@ button[aria-pressed="true"] {
   opacity: 0.6;
 }
 
+.project {
+  margin-bottom: 0.4rem;
+}
+
+.project p {
+  margin: 0.1rem 0;
+}
+
+/* A project the gate could not trace, marked exactly as a flagged bullet is. */
+.project.flagged {
+  background: var(--flagged);
+  border-radius: 4px;
+  padding: 0.3rem;
+}
+
 .diff table {
   width: 100%;
   border-collapse: collapse;

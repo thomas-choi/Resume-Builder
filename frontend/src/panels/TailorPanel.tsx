@@ -4,7 +4,7 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 
 import { getProfile, tailor } from "../lib/api";
-import { diffExperiences } from "../lib/diff";
+import { diffExperiences, diffProjects } from "../lib/diff";
 import type { ProfileResponse, TailorResponse } from "../lib/types";
 import { ReviewPanel } from "./ReviewPanel";
 
@@ -44,6 +44,10 @@ export function TailorPanel({ profileId }: Props) {
     result && profileQuery.data
       ? diffExperiences(profileQuery.data.profile, result.tailored_cv, result.validation)
       : [];
+  const projects =
+    result && profileQuery.data
+      ? diffProjects(profileQuery.data.profile, result.tailored_cv, result.validation)
+      : null;
 
   return (
     <section className="panel" aria-labelledby="tailor-heading">
@@ -119,6 +123,41 @@ export function TailorPanel({ profileId }: Props) {
               </table>
             </div>
           ))}
+
+          {/* Between the bullets and the skills — the order the .docx renders
+              them in, so this screen matches the document it approves. */}
+          {projects && projects.selected.length > 0 && (
+            <>
+              <h4>Projects on the tailored CV</h4>
+              <ul className="entries projects" aria-label="Selected projects">
+                {projects.selected.map(({ project, status }, index) => (
+                  <li key={`${project.name}-${index}`} className={`project ${status}`}>
+                    <p>
+                      <strong>
+                        {project.url ? (
+                          <a href={project.url} target="_blank" rel="noopener noreferrer">
+                            {project.name}
+                          </a>
+                        ) : (
+                          project.name
+                        )}
+                      </strong>{" "}
+                      {status === "flagged" && <span className="status">flagged</span>}
+                    </p>
+                    {project.description && <p>{project.description}</p>}
+                    {project.technologies.length > 0 && (
+                      <p className="muted">{project.technologies.join(", ")}</p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              {projects.dropped.length > 0 && (
+                <p className="muted">
+                  Left out: {projects.dropped.join(", ")}
+                </p>
+              )}
+            </>
+          )}
 
           <h4>Skills</h4>
           <p>{result.tailored_cv.highlighted_skills.join(", ") || "—"}</p>
