@@ -159,6 +159,14 @@ profile built from GitHub alone looked empty when it wasn't. Long lists — fift
 repositories is normal — open showing the first ten with a "Show all" control,
 so the rest of the profile stays reachable.
 
+**A network blip does not take your work with it.** If the connection drops
+while you are editing — the API restarts, the VPN reconnects, the laptop
+wakes — the profile stays on screen exactly as you left it, with a message
+above it saying it could not be refreshed and a Retry button. Only a profile
+that never loaded at all shows an error in place of the panel. When the failure
+was the connection rather than the server, the message says so ("Could not
+reach the API … — is the server running?") instead of blaming the page.
+
 **Settling a conflict is a choice you record.** Where two sources disagreed,
 you pick the value you consider right and it is stored with the disagreement,
 not instead of it: the conflict stays on the profile, now showing what each
@@ -200,7 +208,11 @@ rewording, or something with no visible origin — plus the bullets that were
 left out of this application entirely. The projects chosen for this application
 are shown too, in the order they appear in the document, with the ones left out
 named and any project that couldn't be traced back to your profile marked —
-so nothing reaches the CV you approve without having been on the screen.
+so nothing reaches the CV you approve without having been on the screen. If
+your profile can't be fetched to compare against, the screen says the
+comparison is missing rather than showing an empty table — an empty comparison
+would read as "nothing changed", which is the wrong thing to believe about a
+document you are about to approve.
 
 **What it costs you in time:** two AI calls for the CV, plus one for each claim
 that needed the stricter check, plus one if you asked for a cover letter — a

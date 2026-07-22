@@ -176,6 +176,31 @@ describe("TailorPanel", () => {
     expect(await screen.findByText(/Not rendered: rendering not requested/)).toBeInTheDocument();
   });
 
+  it("says the comparison is missing when the profile could not be loaded", async () => {
+    // An empty diff table reads as "nothing changed", which is the wrong thing
+    // to believe about a CV you are being asked to approve.
+    vi.spyOn(api, "getProfile").mockRejectedValue(
+      new Error("Could not reach the API (/profile/alice) — is the server running?"),
+    );
+    vi.spyOn(api, "tailor").mockResolvedValue(
+      tailorFixture({ review_required: false, review: null }),
+    );
+    const user = userEvent.setup();
+    renderWithClient(<TailorPanel profileId="alice" />);
+
+    await user.type(screen.getByLabelText("Job post"), "Backend engineer");
+    await user.click(screen.getByRole("button", { name: "Tailor CV" }));
+
+    const banner = await screen.findByRole("alert");
+    expect(banner).toHaveTextContent("Could not load the profile to compare against");
+    expect(banner).toHaveTextContent("is the server running?");
+    // The tailored CV itself is still shown — only the comparison is missing.
+    expect(screen.getByText("Senior Backend Engineer")).toBeInTheDocument();
+
+    await user.click(within(banner).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(api.getProfile).toHaveBeenCalledTimes(2));
+  });
+
   it("surfaces a failed tailoring call", async () => {
     vi.spyOn(api, "tailor").mockRejectedValue(new Error("profile alice not found"));
     const user = userEvent.setup();

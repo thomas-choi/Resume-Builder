@@ -2,7 +2,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ingest } from "../lib/api";
+import { getProfile, ingest } from "../lib/api";
 
 function mockFetch() {
   const fetchMock = vi.fn(
@@ -51,5 +51,45 @@ describe("ingest", () => {
       .getAll("cv")
       .map((entry) => (entry as File).name);
     expect(names).toEqual(["CV.docx", "CV.pdf"]);
+  });
+});
+
+describe("transport failures", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("names the unreachable API instead of reporting 'Failed to fetch'", async () => {
+    // `fetch` rejects with a bare TypeError on a transport failure — a message
+    // that reads as a bug in this code rather than a connection that dropped.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("Failed to fetch");
+      }),
+    );
+    await expect(getProfile("alice")).rejects.toThrow(
+      "Could not reach the API (/profile/alice) — is the server running?",
+    );
+  });
+
+  it("still reports the server's reason for an HTTP error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ detail: "profile alice not found" }), {
+            status: 404,
+          }),
+      ),
+    );
+    await expect(getProfile("alice")).rejects.toThrow("profile alice not found");
+  });
+
+  it("forwards React Query's abort signal so a cancelled request is discarded", async () => {
+    const fetchMock = mockFetch();
+    const controller = new AbortController();
+
+    await getProfile("alice", controller.signal);
+
+    expect(fetchMock.mock.calls[0][1].signal).toBe(controller.signal);
   });
 });

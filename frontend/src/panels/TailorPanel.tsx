@@ -21,7 +21,7 @@ export function TailorPanel({ profileId }: Props) {
   // The diff is against the same profile the server tailored from.
   const profileQuery = useQuery<ProfileResponse>({
     queryKey: ["profile", profileId],
-    queryFn: () => getProfile(profileId as string),
+    queryFn: ({ signal }) => getProfile(profileId as string, signal),
     enabled: Boolean(profileId),
   });
 
@@ -90,6 +90,21 @@ export function TailorPanel({ profileId }: Props) {
         <>
           <h3>{result.tailored_cv.headline}</h3>
           <p>{result.tailored_cv.summary}</p>
+
+          {/* Without the profile there is nothing to compare against, and an
+              empty table reads as "nothing changed" rather than "the
+              comparison is missing" — which is the more dangerous of the two
+              when the tailored CV below is about to be approved. */}
+          {profileQuery.isError && !profileQuery.data && (
+            <p role="alert" className="warn">
+              Could not load the profile to compare against:{" "}
+              {(profileQuery.error as Error).message}. The tailored CV below is what
+              the server produced; the side-by-side comparison is missing.{" "}
+              <button type="button" onClick={() => profileQuery.refetch()}>
+                Retry
+              </button>
+            </p>
+          )}
 
           <h4>Bullets — profile vs. tailored</h4>
           {diffs.map((diff) => (

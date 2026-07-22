@@ -96,7 +96,7 @@ export function ProfilePanel({ profileId }: Props) {
 
   const query = useQuery<ProfileResponse>({
     queryKey: ["profile", profileId],
-    queryFn: () => getProfile(profileId as string),
+    queryFn: ({ signal }) => getProfile(profileId as string, signal),
     enabled: Boolean(profileId),
   });
 
@@ -119,9 +119,12 @@ export function ProfilePanel({ profileId }: Props) {
       </section>
     );
   }
-  // Errors are checked first: a failed load leaves `draft` null forever, so
-  // testing for the draft first would render a spinner that never resolves.
-  if (query.isError) {
+  // Only a failure with *nothing loaded* is fatal. A first-load failure leaves
+  // `draft` null forever, so it must be caught before the loading branch or the
+  // panel spins for ever — but once a profile is on screen, a failed background
+  // refetch must not erase it (and with it the user's unsaved edits): that
+  // renders as the retryable banner below instead.
+  if (query.isError && !draft) {
     return (
       <section className="panel" aria-labelledby="profile-heading">
         <h2 id="profile-heading">2 · Profile</h2>
@@ -151,6 +154,15 @@ export function ProfilePanel({ profileId }: Props) {
   return (
     <section className="panel" aria-labelledby="profile-heading">
       <h2 id="profile-heading">2 · Profile</h2>
+      {query.isError && (
+        <p role="alert" className="warn">
+          Could not refresh {profileId}: {(query.error as Error).message} — showing the
+          last loaded copy.{" "}
+          <button type="button" onClick={() => query.refetch()}>
+            Retry
+          </button>
+        </p>
+      )}
       <p className="muted">
         {draft.name} · version {query.data?.version} of {query.data?.versions.length}
       </p>

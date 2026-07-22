@@ -1027,7 +1027,7 @@ after adding a CV is a normal thing to do, and the field is not a secret.
 Suite: 61 vitest green (from 55); the 230 Python unit tests are untouched and
 still green.
 
-### 6.c — "Could not load X: Failed to fetch" wipes a profile that loaded fine
+### 6.c — "Could not load X: Failed to fetch" wipes a profile that loaded fine — **implemented 2026-07-22 (step 5 still open)**
 
 **Problem, precisely.** The reported sequence — profile appears, then ~1s later
 the panel is replaced by `Could not load CVs-Only: Failed to fetch` — is two
@@ -1087,6 +1087,38 @@ refetch still renders the profile fields plus the banner, and Retry re-issues
 the request; a query that fails on first load still renders the fatal message.
 `api.test.ts` — a `fetch` that rejects with `TypeError` produces the
 "could not reach the API" message; the abort signal is forwarded.
+
+**As implemented.** Steps 1–4 landed as written; **step 5 is still open** and
+needs the reporter (see below). What the plan had not settled:
+
+- **The refetch had to be provoked by something real.** There is no "refresh"
+  control to click, so the regression test uses the path that actually produces
+  a second request: saving invalidates `["profile", id]`, and the invalidated
+  refetch is the one made to fail. That is the same shape as the background
+  refetch the bug reported, without simulating React Query's internals.
+- **`TailorPanel`'s banner is conditioned on `!profileQuery.data`, not on
+  `isError` alone.** React Query keeps the last successful data through a
+  failed refetch, so the diff still draws from the copy it has; the warning
+  belongs only to the case where there is genuinely nothing to compare
+  against — which is exactly the case that used to render as an empty table.
+- **The abort branch had to be excluded from the rewrite.** Wrapping every
+  rejection as "could not reach the API" would relabel React Query's own
+  cancellations as transport failures. Only a `TypeError` is rewritten;
+  anything else (an `AbortError` `DOMException`) is rethrown untouched.
+- `getReview` gained its `signal` parameter as specified even though nothing
+  calls it today — `ReviewPanel` receives the review as a prop.
+
+**Step 5 — still open.** The transport failure itself did not reproduce
+locally against either deployment shape, so the environment-specific cause is
+still unknown. What is needed from the reporter: reproduce with the Network tab
+recording, and note the failing request's URL, initiator and status ("(failed)"
+vs. a code). With the 6.c changes in place the message itself now
+discriminates — `Could not reach the API (/profile/<id>) — is the server
+running?` is transport, anything else is HTTP with FastAPI's `detail`. If the
+answer is the dev-server proxy dropping the connection to a remote API, the fix
+is `vite.config.ts` (proxy `timeout`/`proxyTimeout` plus an `error` handler
+returning 502 instead of destroying the socket) and `OPERATIONS.md`, not the
+panels.
 
 ### 6.d — GitHub projects (and education, certifications, contact) are never drawn — **implemented 2026-07-22**
 

@@ -157,6 +157,43 @@ describe("ProfilePanel", () => {
   it("reports a profile that could not be loaded", async () => {
     vi.spyOn(api, "getProfile").mockRejectedValue(new Error("profile nope not found"));
     renderWithClient(<ProfilePanel profileId="nope" />);
-    expect(await screen.findByRole("alert")).toHaveTextContent("profile nope not found");
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not load nope");
+    expect(alert).toHaveTextContent("profile nope not found");
+  });
+
+  it("keeps a loaded profile on screen when a later refetch fails", async () => {
+    // A one-second network blip must not cost the user their unsaved edits: the
+    // panel used to check `isError` before `draft` and replace the whole thing.
+    const loaded = {
+      profile_id: "alice",
+      version: 2,
+      versions: [1, 2],
+      profile: profileFixture(),
+    };
+    vi.spyOn(api, "getProfile")
+      .mockResolvedValueOnce(loaded)
+      .mockRejectedValueOnce(new Error("Could not reach the API (/profile/alice)"))
+      .mockResolvedValue(loaded);
+    const user = userEvent.setup();
+    renderWithClient(<ProfilePanel profileId="alice" />);
+
+    // Saving invalidates the query, so the refetch (and its failure) is the
+    // same one a background refresh would produce.
+    const headline = await screen.findByLabelText("Headline");
+    await user.clear(headline);
+    await user.type(headline, "Staff Engineer");
+    await user.click(screen.getByRole("button", { name: "Save as new version" }));
+
+    const banner = await screen.findByRole("alert");
+    expect(banner).toHaveTextContent("Could not refresh alice");
+    expect(banner).toHaveTextContent("showing the last loaded copy");
+    // The profile — and the edit — are still there and still editable.
+    expect(screen.getByLabelText("Headline")).toHaveValue("Staff Engineer");
+    expect(screen.getByText(/CV and LinkedIn disagree on start date/)).toBeInTheDocument();
+
+    await user.click(within(banner).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    expect(vi.mocked(api.getProfile)).toHaveBeenCalledTimes(3);
   });
 });

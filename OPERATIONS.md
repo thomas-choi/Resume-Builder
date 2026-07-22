@@ -443,6 +443,16 @@ Each `POST /tailor` execution is likewise tagged with a `tailor_id`:
   (`extract[<source_id>]: dropped projects[11] …`, `extraction failed for
   source …`), so a run that returns 200 with fewer entries than expected is
   diagnosable from the log: `grep 'extract\[' logs/app.log`.
+- **UI transport errors (Phase 6.c) — no setup change, no `vite.config.ts`
+  change.** When a user reports a UI error, the wording now tells you where to
+  look: `Could not reach the API (<path>) — is the server running?` means the
+  request never got a response (container down, proxy hang-up, VPN, offline) —
+  check the API is up and reachable from the browser's host, and expect *no*
+  corresponding line in the API log. Any other message is the API's own
+  `detail` from an HTTP error, so the log will have it. `Could not refresh …`
+  is non-fatal: the profile is still on screen and retryable. One expected
+  side effect: the UI cancels superseded profile requests, so a dropped
+  connection in the log is not necessarily a failure.
 - **Session clearing (Phases 6.a/6.b) — no setup change.** No env vars, no
   dependencies and no `vite.config.ts` change: "Clear everything" and the
   clear-on-new-profile behaviour are browser-side state only. Worth knowing

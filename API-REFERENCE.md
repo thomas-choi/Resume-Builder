@@ -594,6 +594,16 @@ that arrives in Phase 4.
 > already in the `GET /profile/{id}` and `POST /tailor` responses documented
 > here, and none of them changed shape.
 
+> **Phase 6.c (2026-07-22) — no API change.** Keeping a loaded profile on
+> screen when a *refresh* fails is browser-side error handling: the same
+> `GET /profile/{id}` documented here, called the same way. Two client-side
+> details worth knowing when reading a bug report: the UI now forwards an
+> `AbortSignal` on `GET /profile/{id}` and `GET /tailor/{id}/review`, so a
+> cancelled request may appear in the server log as a dropped connection; and a
+> failure that never reached the server is reported as `Could not reach the API
+> (<path>) — is the server running?`, so any *other* message in the UI came
+> from an HTTP response's `detail` field.
+
 > **Phases 6.a and 6.b (2026-07-22) — no API change.** "Clear everything" and
 > the clearing of the screen when a new profile is built are browser-side state
 > lifecycle only: no endpoint, request field, response field or status code

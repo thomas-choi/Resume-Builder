@@ -633,6 +633,38 @@ Two decisions worth recording:
     file is the wrong price for a 500. The progress list and the outcome banner
     (including the skipped repos) survive the clear: they describe the run that
     just finished, not the next one.
+- **A failed refresh is not a failed load (Phase 6.c).** `ProfilePanel` tested
+  `query.isError` *before* `draft`, so any failure — including a background
+  refetch that React Query keeps the previous `data` through — replaced a
+  profile that was already loaded and possibly edited. A one-second network
+  blip cost the user their work. The fatal branch is now `isError && !draft`
+  (a first-load failure must still be caught before the loading branch, or the
+  panel spins for ever); with a draft in hand the failure renders as a
+  `role="alert"` banner above the still-editable profile, with a Retry button
+  calling `query.refetch()`. `TailorPanel` gets the same treatment where it
+  matters more quietly: with no profile to diff against it used to draw an
+  empty comparison table, which reads as "nothing changed" rather than "the
+  comparison is missing" — a dangerous thing to believe about a CV about to be
+  approved. Its banner is conditioned on `!profileQuery.data`, since a failed
+  refetch still leaves the last copy to diff against.
+- **The query defaults now say what the comment claimed (Phase 6.c).**
+  `staleTime: 0` marked every response stale on arrival, so each new observer
+  of `["profile", id]` refetched — and there are two, `ProfilePanel` and
+  `TailorPanel` — while `refetchOnReconnect` (on by default) refired on any
+  online/offline flicker and `retry: false` turned the first blip straight into
+  an error state. `main.tsx` now sets `staleTime: 30_000`,
+  `refetchOnReconnect: false` and `retry: 1`; freshness comes from the save
+  path's explicit `invalidateQueries`, which ignores `staleTime`.
+- **Transport failure and HTTP failure are now distinguishable (Phase 6.c).**
+  `fetch` rejects with a bare `TypeError: Failed to fetch` on a connection
+  reset, DNS failure, proxy hang-up or offline browser, which reads as a bug in
+  the client; an HTTP error is a resolved response with `ok === false`, carrying
+  FastAPI's `detail`. `lib/api.ts` rewrites only the `TypeError` as
+  `Could not reach the API (<path>) — is the server running?` and rethrows
+  everything else untouched, so React Query's own cancellations are not
+  relabelled as network failures. `getProfile`/`getReview` also forward React
+  Query's `AbortSignal`, so a superseded request is cancelled rather than
+  landing later and being reported as a failure.
 
 `Conflict.resolution` (`str | None`) is the one schema addition: conflicts are
 kept after resolution, not deleted — the record of who-said-what and what was
