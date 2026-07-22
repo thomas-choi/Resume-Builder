@@ -164,6 +164,105 @@ but **each organization keeps at least one repo before recency fills the rest** 
 a straight recency sort dropped two 2021-era employers entirely, and a resume
 needs the breadth of employers more than a fifth repo from the current one.
 
+### Batched per-repo GitHub extraction (Phase 5.c, 2026-07-22)
+
+The two-tier resilience of Phase 1.e has a hole exactly where GitHub sits. One
+`github_username` renders **one** `SourceDocument` holding every repo, so the
+item-level salvage in `extract_one` only helps when the model returns a *parseable
+but invalid* tool call. When it returns a message with **no tool call at all** —
+which ~49k chars of input asking for ~50 repos of structured output made likely —
+there is nothing to salvage from, and the source-level net in `extract_source`
+can only drop the whole document. A real run lost 50 repos that way, and still
+returned 200 with a success banner.
+
+The fix is to stop asking for all of it at once:
+
+1. **Split.** `github_client.split_repo_sections` cuts a rendered document into
+   one `RepoChunk` per `### Repository:` section, and `render_repo_document`
+   reassembles any subset. The spans tile the document exactly, so
+   `render(split(text)) == text` — re-rendering an untouched document is a no-op,
+   which is what makes the pruning below safe to trust. Both live in
+   `github_client.py`, beside the rendering they invert, so the format is
+   described in exactly one file.
+2. **Every chunk carries its tier heading.** `skills/source-extraction/SKILL.md`
+   decides ownership-vs-contribution attribution from the `## Owned repositories`
+   / `## Organization repositories (…)` / `## Contributions to external
+   repositories (not owned by the user)` labelling. A chunk extracted without its
+   heading would be read as authorship — the batching would otherwise have
+   re-opened the exact fabrication risk Phase 1.f closed.
+3. **Batch, then isolate.** `_extract_github` sends
+   `GITHUB_REPOS_PER_EXTRACTION` repos per call. A failed batch is retried **one
+   repo at a time**, so the blame lands on a specific repository instead of on
+   its forty-nine neighbours. Per-batch extractions merge by concatenating the
+   list fields; `name`/`headline`/`contact` take the first non-empty value.
+   Duplicates across batches are left to synthesis, which already dedupes.
+   Raising only when *every* repo fails preserves the Phase 1.e rule that a
+   silently empty profile is worse than an error.
+
+**Synthesis is deliberately out of scope.** It still funnels every project
+through one LLM call that must re-emit them all — the same output-size fragility
+one stage later. It is left alone until extraction is demonstrably reliable,
+rather than fixed speculatively.
+
+**The archive splits in two.** `data/sources/{run_id}/github/github.json` is
+rewritten after extraction to hold only the repos that reached the profile, and
+the as-fetched document is preserved beside it as `github.raw.json` with its own
+manifest entry (`{source_id}#as-fetched`). Pruning the archive without keeping
+the original would destroy the evidence needed to investigate the drop. The
+rewrite happens in `store_profile`, the node that already owns run-store I/O, fed
+by the new `IngestionState.pruned_sources`; `extract_source` stays a pure LLM
+step. Nothing is written when nothing was dropped.
+
+**Partial success is never silent.** `IngestionState.source_errors`
+(`{"source", "repo", "reason"}`) propagates to the `/ingest` response and streams
+as `warning` SSE events, and the UI lists the skipped repos and qualifies its
+success banner. That a run could lose a whole source and still render as a clean
+success is what made this bug expensive to find, so the reporting is part of the
+fix rather than a nicety. Correspondingly, a response with no tool call now logs
+`finish_reason`, usage and a content preview — the old code logged the empty
+`parsing_error` as literally `: None`.
+
+### Per-request GitHub token (Phase 5.a, 2026-07-21)
+
+Phases 1.f/1.g read the token from the module-global `config.GITHUB_TOKEN`,
+bound once at import. One process therefore served exactly one credential, and —
+because the self-token identity check derives from that same global — exactly
+one user could ever have their private repos read. Ingesting a second username
+with *their* token meant editing `.env` and restarting.
+
+The token is now a parameter, threaded from `fetch_github_profile(username,
+client=None, token=None)` down through `_headers`, `_viewer_login`, `_graphql`
+and `_gather_evidence`, and resolved as `token or config.GITHUB_TOKEN` at the
+top of the fetch. `POST /ingest` exposes it as a `github_token` form field
+(blank → `None` → the configured fallback), so env-only deployments behave
+exactly as before.
+
+What this does **not** change is the safety property from 1.g: the
+`GET /user` identity check simply runs per request instead of per process, so
+user B's token unlocks B's private repos while a token belonging to neither
+party still never reaches a viewer endpoint. What it adds is a handling
+obligation — the token is a secret in transit, so it is deliberately absent from
+`manifest.json`, from the archived `github.json`, and from every log line (the
+existing `github[%s]: token viewer=%s` DEBUG line logs the *resolved login*,
+which is exactly the non-secret part worth having). It is held nowhere after the
+request: not in `data/`, and in the UI not in `localStorage` either.
+
+### Same-named uploads stay distinct (Phase 5.b, 2026-07-21)
+
+`run_store.save_source_file` wrote to `sources/{run_id}/{category}/{filename}`,
+so two uploads named `CV.docx` overwrote each other. The quieter half of the bug
+was in `routes._load_upload`, which derived `doc.id = f"{source_type}:{filename}"`
+from the *uploaded* name: the two sources also collided as source ids, and
+`CareerProfile.raw_source_map` — the map the anti-fabrication gate reads to trace
+a claim back to its document — lost the ability to tell them apart.
+
+`save_source_file` now suffixes a taken name (`CV.docx` → `CV-2.docx` → …) and
+returns the path it actually wrote, and both `_load_upload` and
+`_load_linkedin_export` build `doc.id` from `stored.name`. Deriving the id from
+the storage layer's answer rather than the request's is what keeps the two in
+step: the archive and the traceability map can no longer disagree about how many
+sources there were.
+
 ### LinkedIn data-export ingestion (Phase 2, 2026-07-21)
 
 `src/tools/linkedin_export.py` parses the archive the person downloads from
@@ -313,6 +412,12 @@ so resilience at the source level cannot save individual repos. Two tiers:
 With the nullable-field contract in place tier 1 should rarely fire; it is
 defense-in-depth for the next malformed field, not the primary remedy.
 
+**Superseded for GitHub by Phase 5.c** (§3, "Batched per-repo GitHub
+extraction"): both tiers assume the model returned *something* parseable, so
+neither survives a response with no tool call at all. GitHub sources are now
+split into per-repo batches before either tier applies; the two tiers above still
+govern every other source type, and still apply within each batch.
+
 ---
 
 ## 5. Stage 3 — Synthesis Agent (LLM)
@@ -454,7 +559,7 @@ the three panels above (`frontend/src/panels/`):
 
 | Panel | Reads/writes | Notes |
 |---|---|---|
-| `SourcesPanel` | `POST /ingest`, `GET /ingest/{job_id}/events` | Subscribes to the SSE stream *before* POSTing, so no node event is missed. Generates its own `job_id` for that reason |
+| `SourcesPanel` | `POST /ingest`, `GET /ingest/{job_id}/events` | Subscribes to the SSE stream *before* POSTing, so no node event is missed. Generates its own `job_id` for that reason. File inputs **accumulate** across picks (Phase 5.b) |
 | `ProfilePanel` | `GET`/`PUT /profile/{id}` | Edits a local draft (a slow save never fights the typing); each conflict's chosen value is recorded in the new `Conflict.resolution` field |
 | `TailorPanel` | `POST /tailor`, `GET /document/{id}` | Side-by-side profile-vs-tailored bullet table; hands a paused run to `ReviewPanel` |
 | `ReviewPanel` | `POST /tailor/{id}/resume` | Per-item Keep/Remove, defaulting to Remove — the same default as the server |
@@ -472,6 +577,16 @@ Two decisions worth recording:
   `API_URL` (proxy target), defaulting to loopback:5173 so nothing is exposed by
   accident, with `strictPort` on so a busy port fails instead of quietly moving.
   These live in the shell, not `.env`: the backend never reads them.
+- **A file input reports only the current pick (Phase 5.b).** `SourcesPanel`
+  originally did `setCvFiles(Array.from(event.target.files))` on every `change`,
+  which reads as "these are the files" but means "these are the files chosen in
+  *this* dialog" — a second pick dropped the first. It now merges into the
+  staged list, keyed on `name+size+lastModified`, renders the staged files with
+  per-file remove buttons, and clears `event.target.value` after reading so
+  re-picking a removed file fires `change` again. The pick must be read into a
+  local *before* that clear, since the state updater runs afterwards.
+- **The GitHub token field is component state only** — `type="password"`, never
+  `localStorage`, and appended to the `FormData` only when non-empty.
 - **The diff similarity is display-only.** `frontend/src/lib/diff.ts` scores
   bullets with a bigram Dice coefficient purely to label them
   unchanged/reworded/new. The authoritative judgement stays server-side
@@ -520,20 +635,23 @@ flowchart LR
 ```
 
 - `ingest_sources` — validates non-empty sources (deterministic).
-- `extract_source` — one Haiku call per `SourceDocument` →
-  `SourceExtraction`; the `source` field of every extracted
-  experience/project is **overwritten in code** with the document id, so
-  traceability never depends on the model. Partial failures are salvaged
-  item-by-item and a dead source is skipped rather than failing the run —
-  see §4 "Two-tier extraction resilience".
+- `extract_source` — one Haiku call per `SourceDocument` (a GitHub source is
+  batched per repo instead — §3) → `SourceExtraction`; the `source` field of
+  every extracted experience/project is **overwritten in code** with the
+  document id, so traceability never depends on the model. Partial failures are
+  salvaged item-by-item and a dead source is skipped rather than failing the run
+  — see §4 "Two-tier extraction resilience". Whatever it could not read is
+  reported in `source_errors`, and a GitHub document whose repos were dropped
+  yields `pruned_sources` for `store_profile` to apply.
 - `synthesize_profile` — one Sonnet call merges extractions into a
   `CareerProfile`; dedupe + conflict surfacing happen in the prompt, but
   `raw_source_map` is built **deterministically** from the merged entries'
   `source` fields (`synthesis.build_raw_source_map`).
 - `store_profile` — versioned JSON store (no LLM); when the run carries a
   `run_id` it also writes a copy of the profile to
-  `data/output/{run_id}/output.json` and links the run's manifest to the new
-  `profile_id`/`version` (`src/utils/run_store.py`).
+  `data/output/{run_id}/output.json`, applies any `pruned_sources` to the run
+  archive (rewriting `github.json`, preserving `github.raw.json`), and links the
+  run's manifest to the new `profile_id`/`version` (`src/utils/run_store.py`).
 
 **Run tracking / provenance.** Each `/ingest` execution is assigned a `run_id`
 (the same value as `job_id`; generated if the client omits it). Before the graph

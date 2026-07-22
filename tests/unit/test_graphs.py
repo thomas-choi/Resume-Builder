@@ -3,6 +3,7 @@
 import pytest
 
 from src.agents import extraction, ingestion_graph, synthesis, tailoring_graph
+from src.agents.extraction import ExtractionResult
 from src.agents import job_analysis, tailoring, validation
 from src.models.schemas import (
     CoverLetter,
@@ -17,7 +18,9 @@ from src.models.schemas import (
 
 def test_ingestion_graph_runs_all_nodes(monkeypatch, data_dir, sample_profile):
     monkeypatch.setattr(
-        extraction, "extract_one", lambda source: SourceExtraction(name="Alice Smith")
+        extraction,
+        "extract_one",
+        lambda source: ExtractionResult(SourceExtraction(name="Alice Smith")),
     )
     monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
 
@@ -34,7 +37,9 @@ def test_ingestion_graph_saves_output_copy_for_run(monkeypatch, data_dir, sample
     import json
 
     monkeypatch.setattr(
-        extraction, "extract_one", lambda source: SourceExtraction(name="Alice Smith")
+        extraction,
+        "extract_one",
+        lambda source: ExtractionResult(SourceExtraction(name="Alice Smith")),
     )
     monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
 
@@ -55,7 +60,7 @@ def test_ingestion_graph_skips_a_dead_source(monkeypatch, data_dir, sample_profi
     def flaky(source):
         if source.id == "dead":
             raise RuntimeError("provider exploded")
-        return SourceExtraction(name="Alice Smith")
+        return ExtractionResult(SourceExtraction(name="Alice Smith"))
 
     monkeypatch.setattr(extraction, "extract_one", flaky)
     monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
@@ -72,6 +77,131 @@ def test_ingestion_graph_skips_a_dead_source(monkeypatch, data_dir, sample_profi
 
     assert state["profile"].name == "Alice Smith"
     assert len(state["extractions"]) == 1
+
+
+def test_ingestion_graph_reports_a_dead_source_as_an_error(
+    monkeypatch, data_dir, sample_profile
+):
+    """A lost source must reach the caller, not just the log."""
+
+    def flaky(source):
+        if source.id == "dead":
+            raise RuntimeError("provider exploded")
+        return ExtractionResult(SourceExtraction(name="Alice Smith"))
+
+    monkeypatch.setattr(extraction, "extract_one", flaky)
+    monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
+
+    graph = ingestion_graph.build_ingestion_graph()
+    state = graph.invoke(
+        {
+            "sources": [
+                SourceDocument(id="dead", source_type="github", raw_text="repos"),
+                SourceDocument(id="alive", source_type="free_text", raw_text="Alice"),
+            ]
+        }
+    )
+
+    assert state["source_errors"] == [
+        {"source": "dead", "repo": None, "reason": "provider exploded"}
+    ]
+
+
+def test_ingestion_graph_propagates_per_repo_errors(monkeypatch, data_dir, sample_profile):
+    errors = [
+        {"source": "github:alice", "repo": "alice/repo-4", "reason": "no tool call"}
+    ]
+    monkeypatch.setattr(
+        extraction,
+        "extract_one",
+        lambda source: ExtractionResult(
+            SourceExtraction(name="Alice Smith"), errors=list(errors)
+        ),
+    )
+    monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
+
+    graph = ingestion_graph.build_ingestion_graph()
+    state = graph.invoke(
+        {"sources": [SourceDocument(id="github:alice", source_type="github", raw_text="r")]}
+    )
+
+    assert state["source_errors"] == errors
+
+
+def test_store_profile_prunes_the_github_archive(monkeypatch, data_dir, sample_profile):
+    """Pruned archive = what reached the profile; raw archive = what GitHub said."""
+    import json
+
+    from src.utils import run_store
+
+    original = SourceDocument(
+        id="github:alice",
+        source_type="github",
+        raw_text="## Owned repositories\n\n### Repository: alice/good\n\n"
+        "### Repository: alice/bad\n",
+    )
+    stored = run_store.save_source_file(
+        "run-prune", "github", "github.json", original.model_dump_json().encode()
+    )
+    original.stored_path = str(stored)
+    run_store.write_manifest(
+        "run-prune",
+        [run_store.source_entry("github", stored, b"x", source_id="github:alice")],
+    )
+
+    pruned_text = "## Owned repositories\n\n### Repository: alice/good\n"
+    monkeypatch.setattr(
+        extraction,
+        "extract_one",
+        lambda source: ExtractionResult(
+            SourceExtraction(name="Alice Smith"),
+            errors=[
+                {"source": "github:alice", "repo": "alice/bad", "reason": "no tool call"}
+            ],
+            pruned_text=pruned_text,
+        ),
+    )
+    monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
+
+    ingestion_graph.build_ingestion_graph().invoke(
+        {"run_id": "run-prune", "sources": [original]}
+    )
+
+    # github.json now holds only what reached the profile...
+    assert json.loads(stored.read_text())["raw_text"] == pruned_text
+    # ...and the as-fetched document survives beside it, indexed in the manifest.
+    raw_path = stored.parent / "github.raw.json"
+    assert "alice/bad" in json.loads(raw_path.read_text())["raw_text"]
+    entries = run_store.load_manifest("run-prune")["sources"]
+    assert [e["filename"] for e in entries] == ["github.json", "github.raw.json"]
+    assert entries[1]["source_id"] == "github:alice#as-fetched"
+
+
+def test_store_profile_leaves_an_unpruned_archive_alone(
+    monkeypatch, data_dir, sample_profile
+):
+    from src.utils import run_store
+
+    doc = SourceDocument(id="github:alice", source_type="github", raw_text="repos")
+    stored = run_store.save_source_file(
+        "run-clean", "github", "github.json", doc.model_dump_json().encode()
+    )
+    doc.stored_path = str(stored)
+    run_store.write_manifest("run-clean", [])
+
+    monkeypatch.setattr(
+        extraction,
+        "extract_one",
+        lambda source: ExtractionResult(SourceExtraction(name="Alice Smith")),
+    )
+    monkeypatch.setattr(synthesis, "synthesize", lambda extractions: sample_profile)
+
+    ingestion_graph.build_ingestion_graph().invoke(
+        {"run_id": "run-clean", "sources": [doc]}
+    )
+
+    # Nothing was dropped, so no second copy is written.
+    assert not (stored.parent / "github.raw.json").exists()
 
 
 def test_ingestion_graph_raises_when_every_source_fails(monkeypatch, data_dir):

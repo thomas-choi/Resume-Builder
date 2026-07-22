@@ -8,7 +8,13 @@ from pydantic import ValidationError
 
 from src import config
 from src.agents import extraction
-from src.models.schemas import Experience, Project, SourceDocument, SourceExtraction
+from src.models.schemas import (
+    Experience,
+    Project,
+    Skill,
+    SourceDocument,
+    SourceExtraction,
+)
 from src.tools.github_client import API_BASE, fetch_github_profile
 from tests.conftest import FakeLLM, RawMessage
 
@@ -34,7 +40,7 @@ def test_extract_one_overwrites_source(monkeypatch):
     doc = SourceDocument(
         id="cv_docx:resume.docx", source_type="cv_docx", raw_text="Alice Smith ..."
     )
-    result = extraction.extract_one(doc)
+    result = extraction.extract_one(doc).extraction
 
     assert result.experiences[0].source == "cv_docx:resume.docx"
     assert result.projects[0].source == "cv_docx:resume.docx"
@@ -126,7 +132,7 @@ def test_extract_one_keeps_projects_with_null_description(monkeypatch):
         SourceDocument(
             id="github:thomas-choi", source_type="github", raw_text="repos ..."
         )
-    )
+    ).extraction
 
     assert len(result.projects) == 30
     assert [p.description for p in result.projects[11:14:2]] == ["", ""]
@@ -149,7 +155,7 @@ def test_extract_one_drops_only_the_malformed_item(monkeypatch, caplog):
     monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
 
     with caplog.at_level(logging.WARNING):
-        result = extraction.extract_one(_doc())
+        result = extraction.extract_one(_doc()).extraction
 
     assert [p.name for p in result.projects] == ["good-1", "good-2"]
     assert result.name == "Alice Smith"
@@ -193,7 +199,7 @@ def test_extraction_degrades_without_skills(monkeypatch, tmp_path):
     fake = FakeLLM(SourceExtraction(name="Alice Smith"))
     monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
     # Call still works with the skill absent (graceful degradation).
-    result = extraction.extract_one(_doc())
+    result = extraction.extract_one(_doc()).extraction
     assert result.name == "Alice Smith"
     system_prompt = fake.calls[0][0][1]
     assert "Fact vs. inference" not in system_prompt
@@ -235,6 +241,178 @@ def _github_doc_with_external_section() -> SourceDocument:
 
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url=API_BASE)
     return fetch_github_profile("alice", client=client)
+
+
+def _github_doc_with_repos(count: int) -> SourceDocument:
+    """A real rendered GitHub document owning `count` repos."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/users/alice/repos":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "name": f"repo-{i}",
+                        "full_name": f"alice/repo-{i}",
+                        "owner": {"login": "alice"},
+                        "description": f"description {i}",
+                        "fork": False,
+                    }
+                    for i in range(count)
+                ],
+            )
+        return httpx.Response(404, json={"message": "not found"})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler), base_url=API_BASE)
+    return fetch_github_profile("alice", client=client)
+
+
+def _user_prompts(fake: FakeLLM) -> list[str]:
+    return [call[1][1] for call in fake.calls]
+
+
+def test_github_document_is_extracted_in_batches(monkeypatch):
+    # One document holding every repo is what asked for more structured output
+    # than the model reliably returns; repos go out a batch at a time instead.
+    monkeypatch.setattr(config, "GITHUB_TOKEN", None)
+    monkeypatch.setattr(config, "GITHUB_INCLUDE_CONTRIBUTIONS", False)
+    monkeypatch.setattr(config, "GITHUB_REPOS_PER_EXTRACTION", 4)
+    fake = FakeLLM(lambda messages: SourceExtraction(name="Alice Smith"))
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    extraction.extract_one(_github_doc_with_repos(10))
+
+    prompts = _user_prompts(fake)
+    assert len(prompts) == 3  # 4 + 4 + 2
+    assert [p.count("### Repository:") for p in prompts] == [4, 4, 2]
+    # Every batch carries the tier heading that decides attribution, and the
+    # repos are partitioned across batches rather than duplicated.
+    assert all("## Owned repositories" in p for p in prompts)
+    seen = [f"alice/repo-{i}" for i in range(10)]
+    assert sorted(name for p in prompts for name in seen if name + "\n" in p) == sorted(seen)
+
+
+def test_single_batch_github_matches_a_plain_single_call(monkeypatch):
+    """Below the batch size, batching must not change what the model is asked."""
+    monkeypatch.setattr(config, "GITHUB_TOKEN", None)
+    monkeypatch.setattr(config, "GITHUB_INCLUDE_CONTRIBUTIONS", False)
+    monkeypatch.setattr(config, "GITHUB_REPOS_PER_EXTRACTION", 10)
+    doc = _github_doc_with_repos(3)
+
+    fake = FakeLLM(lambda messages: SourceExtraction(name="Alice Smith"))
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+    result = extraction.extract_one(doc)
+
+    assert len(fake.calls) == 1
+    # The one batch re-renders the document byte-for-byte.
+    assert doc.raw_text in _user_prompts(fake)[0]
+    assert result.errors == []
+    assert result.pruned_text is None
+
+
+def test_failed_batch_isolates_to_the_offending_repo(monkeypatch, caplog):
+    """The failure this phase exists for: blame one repo, keep the rest."""
+    monkeypatch.setattr(config, "GITHUB_TOKEN", None)
+    monkeypatch.setattr(config, "GITHUB_INCLUDE_CONTRIBUTIONS", False)
+    monkeypatch.setattr(config, "GITHUB_REPOS_PER_EXTRACTION", 3)
+
+    def respond(messages):
+        prompt = messages[1][1]
+        # repo-4 poisons any call it appears in — its batch, then itself.
+        if "alice/repo-4\n" in prompt:
+            raise ValueError("no tool call returned")
+        names = [f"alice/repo-{i}" for i in range(6) if f"alice/repo-{i}\n" in prompt]
+        return SourceExtraction(
+            name="Alice Smith",
+            projects=[
+                Project(name=n, description="d", source="WRONG") for n in names
+            ],
+        )
+
+    fake = FakeLLM(respond)
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    with caplog.at_level(logging.WARNING):
+        result = extraction.extract_one(_github_doc_with_repos(6))
+
+    # Five of six repos survive; only repo-4 is lost.
+    assert [p.name for p in result.extraction.projects] == [
+        "alice/repo-0",
+        "alice/repo-1",
+        "alice/repo-2",
+        "alice/repo-3",
+        "alice/repo-5",
+    ]
+    assert result.errors == [
+        {
+            "source": "github:alice",
+            "repo": "alice/repo-4",
+            "reason": "no tool call returned",
+        }
+    ]
+    # Traceability still enforced in code across the merged batches.
+    assert {p.source for p in result.extraction.projects} == {"github:alice"}
+    # The archive is rewritten without the failed repo, and only that one.
+    assert "alice/repo-4" not in result.pruned_text
+    assert "alice/repo-5" in result.pruned_text
+    assert "## Owned repositories" in result.pruned_text
+    assert "retrying its 3 repos one at a time" in caplog.text
+
+
+def test_github_extraction_raises_only_when_every_repo_fails(monkeypatch):
+    monkeypatch.setattr(config, "GITHUB_TOKEN", None)
+    monkeypatch.setattr(config, "GITHUB_INCLUDE_CONTRIBUTIONS", False)
+    monkeypatch.setattr(config, "GITHUB_REPOS_PER_EXTRACTION", 2)
+
+    def dead(messages):
+        raise ValueError("no tool call returned")
+
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: FakeLLM(dead))
+
+    # A silently empty GitHub source is worse than a failed one.
+    with pytest.raises(ValueError, match="all 4 repositories"):
+        extraction.extract_one(_github_doc_with_repos(4))
+
+
+def test_merge_keeps_first_identity_and_concatenates_lists(monkeypatch):
+    monkeypatch.setattr(config, "GITHUB_TOKEN", None)
+    monkeypatch.setattr(config, "GITHUB_INCLUDE_CONTRIBUTIONS", False)
+    monkeypatch.setattr(config, "GITHUB_REPOS_PER_EXTRACTION", 1)
+
+    batches = [
+        SourceExtraction(name="Alice Smith", skills=[Skill(name="Python", category="language")]),
+        SourceExtraction(name="A. Smith", headline="Engineer", skills=[Skill(name="Go", category="language")]),
+    ]
+    fake = FakeLLM(list(batches))
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    result = extraction.extract_one(_github_doc_with_repos(2))
+
+    assert result.extraction.name == "Alice Smith"  # first non-empty wins
+    assert result.extraction.headline == "Engineer"  # filled in by a later batch
+    assert [s.name for s in result.extraction.skills] == ["Python", "Go"]
+
+
+def test_no_tool_call_logs_real_diagnostics(monkeypatch, caplog):
+    """The old log said literally `: None` — say what actually happened."""
+
+    class Bare:
+        tool_calls = []
+        content = "I cannot comply with this request."
+        response_metadata = {"finish_reason": "length"}
+        usage_metadata = {"output_tokens": 16384}
+
+    fake = FakeLLM({"parsed": None, "raw": Bare(), "parsing_error": None})
+    monkeypatch.setattr(extraction, "make_llm", lambda model, **kw: fake)
+
+    with caplog.at_level(logging.WARNING), pytest.raises(ValueError):
+        extraction.extract_one(_doc())
+
+    assert "finish_reason='length'" in caplog.text
+    assert "output_tokens" in caplog.text
+    assert "I cannot comply" in caplog.text
+    assert "tool_calls=0" in caplog.text
 
 
 def test_external_repo_section_carries_not_owned_framing(monkeypatch):

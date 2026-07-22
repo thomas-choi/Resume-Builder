@@ -27,6 +27,12 @@ Provide any combination of:
   contributions to other people's open-source projects
 - **Free text** — pasted bio or notes
 
+In the UI, files build up across separate picks: choose `CV.docx`, then choose
+`CV.pdf`, and both are staged and listed, each with its own remove button. (A
+second pick used to silently replace the first.) Two files that happen to share
+a name are both kept and stay separately traceable — the second is stored as
+`CV-2.docx` — so neither quietly disappears.
+
 The system extracts structured data from each source, merges duplicates
 (e.g. the same job in your CV and on GitHub), and produces a profile with:
 
@@ -54,8 +60,13 @@ Two things follow from how GitHub itself works:
 
 - **Your organizations are found even when your membership is private.** Private
   is GitHub's default, and it makes an account look like it belongs to no
-  organization at all. If the configured GitHub token is *your own*, the builder
-  reads your memberships and private repos directly, so company work counts. A
+  organization at all. If the GitHub token is *your own* — either one your
+  operator configured, or one you paste into the optional "GitHub token" field
+  when you ingest — the builder reads your memberships and private repos
+  directly, so company work counts. Pasting your own token is what lets several
+  people use one shared server and each still see their own private work; the
+  token is used for that one request and never stored, logged, or written to
+  disk. A token for a different username only raises rate limits. A
   token belonging to someone else is never used this way — nobody's private data
   is reachable by typing their username. If you'd rather keep private repos out
   of the profile entirely, your operator can set `GITHUB_INCLUDE_PRIVATE=false`;
@@ -85,13 +96,22 @@ profile disagree about the same job — a start date a year apart, a slightly
 different title — the two entries merge into one, and the disagreement is
 listed for you to settle. The system never picks a side on its own.
 
-Ingestion is **partial-failure tolerant**: if one item in a source can't be
-read cleanly — a GitHub repo with no description, a garbled résumé entry — that
-item alone is skipped and logged, and everything else still lands in your
-profile. Previously a single unreadable entry failed the whole upload. Skipped
-items are recorded in the run's logs, so nothing disappears silently; if a
-source is *entirely* unreadable it is dropped with the rest of the run
-continuing, and only a run where nothing at all could be read fails outright.
+Ingestion is **partial-failure tolerant, and tells you when it was partial**: if
+one item in a source can't be read cleanly — a GitHub repo with no description,
+a garbled résumé entry — that item alone is skipped and everything else still
+lands in your profile. Previously a single unreadable entry failed the whole
+upload. Anything skipped is now **listed by name in the UI** with a short
+reason, and the success message says how many were skipped, so a run that
+quietly lost a whole source can no longer look like a clean one. If a source is
+*entirely* unreadable it is dropped with the rest of the run continuing, and
+only a run where nothing at all could be read fails outright.
+
+Your GitHub repositories are read a handful at a time rather than all at once.
+That matters for a practical reason: asked for fifty repositories in a single
+answer, the model sometimes returned nothing usable and the whole GitHub source
+vanished from the profile. Now a problem repository costs you that repository
+and nothing else — it is named in the skipped list, and the rest of your work
+still arrives.
 
 By default each ingest creates a brand-new profile. To instead fold fresh
 sources into a profile you already have — say you land a new role and want to
@@ -224,6 +244,6 @@ see in the browser is identical.)*
 | The summary paragraph isn't itself fact-checked. A rejected claim is scrubbed from it, but a summary that *paraphrases* something unsupported without naming it isn't caught | Later improvement (validate the prose too) |
 | The cover letter is not re-checked against your profile — it is constrained by being built from the already-checked CV | Later improvement |
 | Two-column PDF CVs may extract with interleaved text | Later improvement |
-| Private repos and private org memberships are reachable only when the configured `GITHUB_TOKEN` is the ingested user's own | Multi-user ingestion needs a caller-supplied token (deferred credential decision) |
+| Private repos and private org memberships are reachable only when the GitHub token used is the ingested user's own — but you can now supply your own per ingest, so one server serves several people | Resolved (per-request token) |
 | An organization repo you worked on only via a non-default branch, or under a different commit email, may not be recognized as yours | Later improvement (branch-aware contribution probe) |
 | Single-user storage (local JSON files, no accounts) | By design for now |

@@ -1,5 +1,6 @@
 """Ingestion graph: ingest_sources -> extract_source -> synthesize_profile -> store_profile."""
 
+from pathlib import Path
 from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -16,6 +17,13 @@ class IngestionState(TypedDict, total=False):
     run_id: str
     sources: list[SourceDocument]
     extractions: list[SourceExtraction]
+    # Items that could not be extracted: {"source", "repo", "reason"}. Surfaced
+    # to the caller and the UI — a run that quietly lost a whole source is what
+    # made this class of bug expensive to find.
+    source_errors: list[dict]
+    # source id -> the document rewritten without its failed repos, applied to
+    # the run archive by store_profile.
+    pruned_sources: dict[str, str]
     profile: CareerProfile
     profile_id: str
     version: int
@@ -42,22 +50,70 @@ def extract_source(state: IngestionState) -> IngestionState:
     sources = state["sources"]
     logger.debug(f"** Extracting from {len(sources)} sources")
     extractions = []
+    errors: list[dict] = []
+    pruned: dict[str, str] = {}
     last_error: Exception | None = None
     for source in sources:
         try:
-            extractions.append(extraction.extract_one(source))
+            result = extraction.extract_one(source)
         except Exception as exc:  # noqa: BLE001 — one dead source must not be fatal
             last_error = exc
             logger.error("extraction failed for source %s: %s", source.id, exc)
+            errors.append(
+                {
+                    "source": source.id,
+                    "repo": None,
+                    "reason": extraction.short_reason(exc),
+                }
+            )
+            continue
+        extractions.append(result.extraction)
+        errors.extend(result.errors)
+        if result.pruned_text is not None:
+            pruned[source.id] = result.pruned_text
     if not extractions:
         raise last_error or ValueError("no sources could be extracted")
-    return {"extractions": extractions}
+    return {"extractions": extractions, "source_errors": errors, "pruned_sources": pruned}
 
 
 def synthesize_profile(state: IngestionState) -> IngestionState:
     """Merge extractions into one canonical CareerProfile."""
     logger.debug(f"** Synthesizing profile from {len(state['extractions'])} extractions")
     return {"profile": synthesis.synthesize(state["extractions"])}
+
+
+def _prune_archived_sources(run_id: str, state: IngestionState) -> None:
+    """Rewrite archived sources whose failed items were dropped mid-extraction.
+
+    File writes for a run live in one node on purpose, so `extract_source` can
+    stay a pure LLM step. A failure here is logged and swallowed: the profile is
+    already built, and losing the bookkeeping must not lose the run.
+    """
+    pruned = state.get("pruned_sources") or {}
+    if not pruned:
+        return
+    for source in state.get("sources") or []:
+        text = pruned.get(source.id)
+        if text is None or not source.stored_path:
+            continue
+        path = Path(source.stored_path)
+        try:
+            raw_path = run_store.prune_source_document(path, text)
+            run_store.add_source_entry(
+                run_id,
+                run_store.source_entry(
+                    source.source_type,
+                    raw_path,
+                    raw_path.read_bytes(),
+                    source_id=f"{source.id}#as-fetched",
+                ),
+            )
+        # ValueError covers a corrupt archive (JSONDecodeError); the profile is
+        # already stored, so bookkeeping must not be able to fail the run.
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "could not prune archived source %s (%s): %s", source.id, path, exc
+            )
 
 
 def store_profile(state: IngestionState) -> IngestionState:
@@ -75,6 +131,7 @@ def store_profile(state: IngestionState) -> IngestionState:
     logger.debug(f"** Storing profile {profile_id} version {version}")
     run_id = state.get("run_id")
     if run_id:
+        _prune_archived_sources(run_id, state)
         run_store.save_output(
             run_id,
             state["profile"],

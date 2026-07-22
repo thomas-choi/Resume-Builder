@@ -67,9 +67,9 @@ def data_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
-def build_sample_docx() -> bytes:
+def build_sample_docx(name: str = "Alice Smith") -> bytes:
     doc = Document()
-    doc.add_heading("Alice Smith", level=0)
+    doc.add_heading(name, level=0)
     doc.add_paragraph("alice@example.com | London")
     doc.add_heading("Experience", level=1)
     doc.add_paragraph("Senior Engineer, Acme Corp, 2020-2024")

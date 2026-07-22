@@ -33,7 +33,8 @@ tagged with a `run_id` that archives the raw inputs under
 |---|---|---|---|
 | `cv` | file(s) | no* | One or more `.docx` / `.pdf` CVs |
 | `linkedin_export` | file(s) | no* | One or more official LinkedIn data exports — the `.zip` from Settings → "Get a copy of your data", or a single `.csv` from it (e.g. `Positions.csv`). Other extensions → 400; an archive with no recognizable section → 400 |
-| `github_username` | text | no* | Public GitHub profile to ingest — owned repos, org/collaborator repos, and contributions to external repos (public data only) |
+| `github_username` | text | no* | GitHub profile to ingest — owned repos, org/collaborator repos, and contributions to external repos |
+| `github_token` | text | no | GitHub token **for this request only**, overriding the server's `GITHUB_TOKEN`. A token belonging to `github_username` also unlocks their private repos and private org memberships; a token for anyone else only raises rate limits and never reaches a viewer endpoint. Blank/omitted → the configured `GITHUB_TOKEN` is used. Never archived, never written to `manifest.json`, never logged |
 | `free_text` | text | no* | Pasted bio/notes passthrough (also the LinkedIn-summary path) |
 | `job_id` | text | no | Client-generated id for SSE progress; subscribe to `GET /ingest/{job_id}/events` before POSTing. Server generates one if omitted. Doubles as the `run_id`. |
 | `profile_id` | text | no | Target profile for the result. **Existing id** → a new version is appended; **new id** → created at v1. Must be 1–64 chars of `[A-Za-z0-9_-]` (else 400). Omitted → the server mints a fresh id. Distinct from `run_id` (which is one execution). |
@@ -51,14 +52,28 @@ invalid `profile_id` → 400. Graph failure → 500.
   "run_id": "…",
   "profile_id": "…",
   "version": 1,
+  "source_errors": [
+    {"source": "github:alice", "repo": "alice/repo-4", "reason": "no tool call returned"}
+  ],
   "profile": { CareerProfile — includes "conflicts": [Conflict, …] }
 }
 ```
+
+`source_errors` lists everything the extractor could not read; it is `[]` on a
+clean run. `repo` names a single GitHub repository, or is `null` when a whole
+source failed. A partial run still returns **200** — the profile is built from
+what survived — so this field is the only thing distinguishing it from a
+complete one. The same items stream as `warning` SSE events while the run is in
+flight.
 
 `run_id` equals `job_id`. Its archive lives at `data/sources/{run_id}/`
 (raw CV under `cv/`, `github/github.json`, `linkedin/` holding the uploaded
 export archive and/or `linkedin-summary.txt`, plus `manifest.json`) and
 `data/output/{run_id}/output.json`.
+
+Two uploads sharing a filename are both kept: the second is archived as
+`CV-2.docx` (then `CV-3.docx`, …) and its source id follows the **stored** name,
+so the two stay distinct in `manifest.json` and in `CareerProfile.raw_source_map`.
 
 **Example — CV + LinkedIn export in one call:**
 
@@ -68,13 +83,24 @@ curl -F "cv=@resume.docx" \
      localhost:8000/ingest
 ```
 
+**Example — two CVs plus GitHub with a per-request token:**
+
+```bash
+curl -F "cv=@CV.docx" -F "cv=@CV.pdf" \
+     -F "github_username=alice" -F "github_token=$ALICE_GITHUB_TOKEN" \
+     localhost:8000/ingest
+```
+
 ## GET /ingest/{job_id}/events
 
 Server-Sent Events stream of per-node ingestion progress.
 
 Events: `node` (data = node name: `ingest_sources`, `extract_source`,
-`synthesize_profile`, `store_profile`), `error` (data = message), `done`
-(terminal). The queue is discarded after `done`.
+`synthesize_profile`, `store_profile`), `warning` (data = `"<repo or source>:
+<reason>"`, one per skipped item), `error` (data = message), `done` (terminal).
+The queue is discarded after `done`. `warning` is advisory — every item it
+reports also comes back in `source_errors` on the `POST /ingest` response, so a
+client that misses the stream loses nothing.
 
 ## GET /profile/{profile_id}
 
@@ -543,6 +569,24 @@ that arrives in Phase 4.
 > `GET /document/{tailor_id}`. All new request fields default to `false`, so a
 > Phase 1/2 caller's request behaves exactly as before — the only response
 > change it sees is the four added keys.
+
+> **Phase 5.c (2026-07-22) — one new response field, one new SSE event.**
+> `POST /ingest` returns `source_errors` (always present, `[]` when nothing was
+> skipped) and streams a `warning` event per skipped item. No request field
+> changed and no status code changed: a partial extraction was already a 200,
+> it just had no way to say so. Batch size is an operator setting
+> (`GITHUB_REPOS_PER_EXTRACTION`), not a request field.
+
+> **Phase 5.a/5.b (2026-07-21) — one new request field.** `POST /ingest` accepts
+> `github_token`, which overrides the server's `GITHUB_TOKEN` for that request
+> only; omitting it leaves behavior exactly as before. This supersedes the
+> Phase 1.g note above — the endpoint now *does* accept a caller-supplied
+> credential, and the "is this the ingested user's own token?" check that gates
+> the viewer endpoints is made per request rather than once at import, so a
+> token for a third party still cannot reach their private data. The token is
+> never archived, never written to `manifest.json`, and never logged. No
+> response field changed; same-named uploads are now archived and identified
+> distinctly (`CV.docx` / `CV-2.docx`) instead of overwriting each other.
 
 > **Configurable UI dev-server address (2026-07-21) — no API change.** The Vite
 > dev server's bind address (`UI_HOST`/`UI_PORT`) and proxy target (`API_URL`)

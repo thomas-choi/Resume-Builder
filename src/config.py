@@ -34,6 +34,11 @@ GITHUB_MAX_CONTRIBUTION_PROBES: int = int(
     os.getenv("GITHUB_MAX_CONTRIBUTION_PROBES", "150")
 )
 GITHUB_MAX_ORG_REPOS: int = int(os.getenv("GITHUB_MAX_ORG_REPOS", "20"))
+# A GitHub source is one document holding every repo, which at ~50 repos asks
+# the extractor for more structured output than it reliably returns (observed:
+# a response with no tool call at all, losing the whole source). Repos are
+# extracted this many at a time; smaller = more calls, less truncation risk.
+GITHUB_REPOS_PER_EXTRACTION: int = int(os.getenv("GITHUB_REPOS_PER_EXTRACTION", "10"))
 
 # LLM provider config (same method as FUND's AgentConfig / get_llm)
 LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "anthropic")

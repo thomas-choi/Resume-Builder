@@ -686,6 +686,236 @@ unit tests + 33 vitest tests green; the full pause → review → partial approv
 
 ---
 
+## Phase 5 — Multi-source UI hardening (findings from the first end-to-end UI run) — **planned**
+
+Found by driving the Phase 4 UI end to end on 2026-07-21 with a real set of
+inputs: one `CV.docx`, one `CV.pdf`, one GitHub username, one LinkedIn data
+export. Three defects, each diagnosed below with the evidence that proves it —
+re-read this before touching code, the root causes are not what the symptoms
+suggest.
+
+### Evidence from the failing run (`run_id = ui-mrvl80oa-udexcp`)
+
+`logs/app.log` around the GitHub extraction:
+
+```
+extract[github:thomas-choi]: type=github, input 48959 chars, model=deepseek-v4-flash
+WARNING structured output failed to validate, attempting item-level salvage: None
+ERROR   extract[github:thomas-choi]: no parseable tool-call arguments to salvage from
+ERROR   extraction failed for source github:thomas-choi: ... returned no usable output
+DEBUG   ** Synthesizing profile from 2 extractions
+```
+
+Three sources went in, two extractions came out, and `/ingest` still returned
+**HTTP 200** with a success banner in the UI. `data/profiles/thomas-new-1/v1.json`
+has 6 experiences, 60 skills and **0 projects**. The same GitHub source extracts
+fine on its own (`data/profiles/github0001p/` → 28–50 projects), so this is
+output-size fragility, not a hard bug: ~49k chars in, ~50 repos of structured
+output back, and the model returned a message with **no tool call at all**
+(both `parsed` and `parsing_error` were `None`, so the item-level salvage in
+`extraction._salvage` had nothing to work with).
+
+### 5.a — Per-request GitHub token — **implemented 2026-07-21**
+
+**Problem.** `src/tools/github_client.py::_headers` builds auth from the
+module-global `config.GITHUB_TOKEN`, read once at import; `_viewer_login` uses
+the same global to decide whether the token is a "self-token" (which unlocks
+private repos and private org memberships). One process therefore serves
+exactly one token — ingesting a second username with *their* token means
+editing `.env` and restarting.
+
+1. `src/tools/github_client.py` — add an explicit `token: str | None = None`
+   parameter to `fetch_github_profile`, threaded down into `_headers(token)`,
+   `_viewer_login(client, token)`, `_graphql(...)` and `_gather_evidence(...)`.
+   Resolve as `token or config.GITHUB_TOKEN` at the top of
+   `fetch_github_profile` so env-only deployments behave exactly as today. The
+   `is_self` determination then happens per request, so user B's token unlocks
+   B's private repos without a restart, and a third-party token still never
+   reaches the viewer endpoints.
+2. `src/api/routes.py::ingest` — add `github_token: str | None = Form(default=None)`
+   and pass it to `fetch_github_profile`. The token is a **secret in transit
+   only**: it must not appear in `manifest.json`, not in the archived GitHub
+   source document, and not in any log line (the existing
+   `github[%s]: token viewer=%s` debug logs the resolved login, which is fine).
+3. `frontend/src/panels/SourcesPanel.tsx` + `lib/api.ts` — a
+   `type="password"` "GitHub token (optional)" field under the username, held
+   in component state only (**no localStorage**), appended to the `FormData` as
+   `github_token` only when non-empty. Helper text: a token for the username
+   being ingested also unlocks their private repos and org memberships; a token
+   for anyone else only raises rate limits.
+
+**Tests:** `tests/unit/test_github_client.py` — explicit token overrides
+`config.GITHUB_TOKEN`; a token whose viewer login ≠ the ingested username never
+calls `/user/repos`. `tests/unit/test_api.py` — the form field reaches
+`fetch_github_profile` and appears nowhere in the written manifest.
+`frontend/src/__tests__/SourcesPanel.test.tsx` — the field is `type="password"`
+and is omitted from the request body when blank.
+
+### 5.b — Multiple CV / export entries — **implemented 2026-07-21**
+
+Two independent defects produce the same symptom (a second file silently
+disappears):
+
+1. **UI replaces instead of accumulating.** `SourcesPanel.tsx` does
+   `setCvFiles(Array.from(event.target.files ?? []))` on every `change`, so
+   picking `CV.docx` and then `CV.pdf` in a second click drops the first. Fix:
+   append to the existing array, de-duplicate on `name+size+lastModified`,
+   render the staged files as a list with a per-file remove button, and set
+   `event.target.value = ""` after reading so re-picking the same file fires
+   `change` again. Apply the same fix to the `linkedin_export` input.
+2. **Backend filename collision.** `run_store.save_source_file` writes to
+   `data/sources/{run_id}/{category}/{filename}`, so two uploads with the same
+   name overwrite each other; worse, `routes._load_upload` derives
+   `doc.id = f"{source_type}:{filename}"`, so the two sources also collide as
+   source ids and corrupt `CareerProfile.raw_source_map` traceability. Fix:
+   `save_source_file` de-duplicates on collision (`CV.docx` → `CV-2.docx`,
+   `CV-3.docx`, …) and returns the path actually written; `_load_upload` and
+   `_load_linkedin_export` derive `doc.id` from `stored.name` rather than the
+   uploaded `filename`, so two same-named CVs stay distinct end to end.
+
+The API already accepts `list[UploadFile]` for both `cv` and `linkedin_export`
+— no signature change is needed.
+
+**Tests:** `tests/unit/test_run_store.py` — same name twice → two files, two
+paths. `tests/unit/test_api.py` — two same-named CVs → two archived files, two
+distinct source ids in the manifest. `SourcesPanel.test.tsx` — two successive
+picks accumulate; remove drops one; re-picking a removed file re-adds it.
+
+**As implemented (5.a + 5.b):** both landed as written. Three things the plan
+had not settled:
+
+- **Reading the pick and clearing the input are order-dependent.** Setting
+  `event.target.value = ""` empties `event.target.files`, and a React state
+  updater runs *after* the handler returns — so the first version, which read
+  `event.target.files` inside the updater, staged nothing on the second pick.
+  The pick is read into a local before the clear. The accumulate test caught
+  this, not review.
+- **`anyio.to_thread.run_sync` takes no keyword arguments**, so the token
+  reaches `fetch_github_profile` via `functools.partial`.
+- **"Not in the manifest" was worth testing literally.** The token test walks
+  every file written under `data/` and asserts the secret is in none of them,
+  rather than checking the one file it was expected to leak into.
+
+Also: `save_source_file`'s docstring now states that the returned path is not
+always `{category}/{filename}` — a caller deriving an id from the name it passed
+in is exactly the bug 5.b fixed. `tests/conftest.py::build_sample_docx` gained a
+`name` argument so two uploads can be told apart by content. Suite: 213 unit +
+40 vitest green.
+
+### 5.c — GitHub extraction: per-repo isolation and reporting — **implemented 2026-07-22**
+
+**Decision (2026-07-21):** handle this at the *extraction* layer only. Report
+each failed repo in the UI by name with a short reason, keep only the good repo
+content in the archived GitHub source, and synthesize the profile from the
+survivors. **`src/agents/synthesis.py` is explicitly out of scope for this
+phase** — it still funnels every project through one LLM call that must re-emit
+them all, which is the same output-size fragility one stage later; revisit only
+if it demonstrably drops data once extraction is reliable.
+
+1. **Split by repo.** New helper (e.g. `src/tools/github_client.py::split_repo_sections`
+   or a small `src/agents/github_chunks.py`) that segments the rendered GitHub
+   document on its `### Repository: owner/name` and external-contribution
+   boundaries. Each chunk must carry **its tier heading and preamble** (the
+   "Owned repositories" / "Organization repositories (… owner)" /
+   "Contributions to external repositories" blocks written by
+   `fetch_github_profile`), because `skills/source-extraction/SKILL.md` decides
+   ownership-vs-contribution attribution from exactly that labelling. A chunk
+   that loses its heading will be mis-attributed as authorship.
+2. **Batch, then isolate.** In `src/agents/extraction.py`, a `source_type ==
+   "github"` document is extracted in batches of `GITHUB_REPOS_PER_EXTRACTION`
+   repos (new env var, default 10) instead of one giant call. When a batch
+   fails, retry it **one repo at a time** so the failure is attributed to a
+   specific repo rather than losing all 50 — this is precisely the failure the
+   run above hit. Merge the per-batch `SourceExtraction`s into one (concatenate
+   the list fields; `name`/`headline`/`contact` take the first non-empty).
+3. **Prune the archive.** Repos that fail even in isolation are dropped from
+   the source document. `data/sources/{run_id}/github/github.json` is rewritten
+   after extraction to hold **only the repos that reached the profile**, and
+   the as-fetched document is preserved next to it as `github.raw.json` with
+   its own manifest entry — the audit trail of what GitHub actually returned
+   must not be lost to the pruning. Do the rewrite in the node that already
+   owns run-store I/O (`store_profile`), fed by new `IngestionState` keys, so
+   file writes stay in one place.
+4. **Report to the UI.** Add `source_errors: list[dict]` to `IngestionState`
+   (`{"source": "github:<user>", "repo": "owner/name", "reason": "<short>"}`),
+   returned from `POST /ingest` and published as a `warning` SSE event.
+   `SourcesPanel.tsx` renders a "Repos skipped" list with repo name + reason.
+   A run that silently lost a whole source must never again render as a clean
+   success — that is what made this bug expensive to find.
+5. **Real diagnostics.** `extraction._parse_response` / `_salvage` currently log
+   the failure as literally `: None`. Log `finish_reason`,
+   `response_metadata`/`usage_metadata` and a truncated content preview when
+   there is no parseable tool call, so the next occurrence is readable from the
+   log alone.
+
+**Tests:** `tests/unit/test_extraction.py` — a multi-repo GitHub document is
+split into batches with tier headings intact; a batch failure isolates to the
+offending repo and the survivors still extract; merged extraction equals the
+single-call result on a document small enough for one batch.
+`tests/unit/test_graphs.py` — `source_errors` propagates through the ingestion
+graph and the pruned/raw GitHub archives are both written.
+`tests/unit/test_api.py` — `source_errors` appears in the `/ingest` response.
+`SourcesPanel.test.tsx` — the skipped-repo list renders on a partial-success
+response.
+
+**As implemented:** all five items landed as written. What the plan had not
+settled:
+
+- **The split had to be byte-exact, not just correct.** `render_repo_document(
+  *split_repo_sections(text)) == text` is the property that makes pruning
+  trustworthy: a run that drops nothing must leave `github.json` unchanged, so
+  any diff in the archive means a repo really was dropped. The spans therefore
+  tile the document rather than being re-assembled from parsed parts.
+- **A README can forge a section boundary** — and doesn't, only because
+  `_render_repo` already quotes excerpts with `> `. That was load-bearing by
+  accident before this phase; it is now covered by a test.
+- **`extract_one` needed a return type.** Errors and the pruned document have to
+  reach two different places (the API response, and `store_profile`'s file
+  writes), so it returns an `ExtractionResult` instead of a bare
+  `SourceExtraction`. Every caller and test was updated.
+- **`MAX_REPOS = 30` still caps the owned tier**, so the 50-repo case that
+  triggered this phase actually arrives as 30. The batching is what removes the
+  fragility; the cap is a separate, unchanged decision.
+- **The success banner was part of the bug.** Listing skipped repos is not
+  enough if the headline still reads "Profile ready" — it now reads "ready, with
+  N skipped", because the indistinguishability from a clean run is what made
+  this expensive to find.
+
+Suite: 230 unit + 43 vitest green. Also verified end-to-end with only the LLM
+faked (routes → graph → extraction → splitter → run_store all real): 30 repos in,
+1 poisoned, 29 in the profile, `github.json` holding 29 and `github.raw.json`
+holding 30, both indexed in `manifest.json`.
+
+### Env vars added in Phase 5
+
+- `GITHUB_REPOS_PER_EXTRACTION` (default `10`) — repos per extraction call for
+  a GitHub source; smaller = more calls, less output-truncation risk.
+- `GITHUB_TOKEN` is **unchanged but demoted** to a fallback: the per-request
+  `github_token` form field wins when supplied.
+
+### Note recorded, not changed (operator config)
+
+The failing run used `deepseek-v4-flash` at `temperature=0.9` and
+`max_tokens=16384` for **every** stage. Structured-output stages (extraction,
+synthesis, validation) want a low temperature; sampling a tool call at 0.9 makes
+"no tool call returned" markedly more likely. Record this as guidance in
+`OPERATIONS.md`; **do not** change the user's `.env` and do not add a
+per-stage temperature knob in this phase.
+
+### Docs to update (mandatory per CLAUDE.md)
+
+- `TECHNICAL-DESIGN.md` — batched per-repo GitHub extraction, `source_errors`
+  propagation, the dual `github.json` / `github.raw.json` archive.
+- `API-REFERENCE.md` — `github_token` form field on `POST /ingest`,
+  `source_errors` in the response, the `warning` SSE event.
+- `OPERATIONS.md` — `GITHUB_REPOS_PER_EXTRACTION`, token now per-request with
+  env as fallback, the low-temperature guidance above.
+- `PRODUCT-GUIDE.md` — multi-file staging, per-username tokens, visible
+  skipped-repo reporting.
+- `HISTORY.md` — one entry per change, newest first.
+
+---
+
 ## Docs sync (every phase, mandatory per CLAUDE.md)
 
 - `TECHNICAL-DESIGN.md` — "Implementation notes" section per phase (two-graph split, JSON storage, interrupt design in Phase 4) + Mermaid diagrams of implemented graphs.
@@ -710,3 +940,4 @@ unit tests + 33 vitest tests green; the full pause → review → partial approv
 - **Phase 2:** ingest a real LinkedIn export ZIP alongside a CV → conflicting dates appear in `conflicts`, not silently merged.
 - **Phase 3:** tailor with `render=true` → open the .docx/.pdf, verify structure matches `TailoredCV` ordering.
 - **Phase 4:** full browser flow from the Windows host (server on `0.0.0.0`): upload → edit profile → tailor → approve a flagged item → download rendered CV; verify a flagged run cannot render without approval.
+- **Phase 5:** repeat the run that found the bugs — stage `CV.docx` and `CV.pdf` in **two separate picks** plus a LinkedIn export and a GitHub username with a per-request token — and confirm: both CVs appear in `data/sources/{run_id}/cv/` under distinct names and distinct source ids; the resulting `CareerProfile` contains GitHub projects (`projects` is non-empty when the account has repos); any repo that failed extraction is listed by name in the UI, absent from `github.json`, and still present in `github.raw.json`; and the token appears in no log line and in no file under `data/`.

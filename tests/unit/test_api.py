@@ -32,14 +32,16 @@ def client(data_dir, monkeypatch):
 
 
 class FakeIngestionGraph:
-    def __init__(self, final_state):
+    def __init__(self, final_state, extract_state=None):
         self.final_state = final_state
+        # What `extract_source` contributes — where `source_errors` comes from.
+        self.extract_state = extract_state or {}
         self.received_state = None
 
     def stream(self, state, stream_mode=None):
         self.received_state = state
         yield {"ingest_sources": {}}
-        yield {"extract_source": {}}
+        yield {"extract_source": self.extract_state}
         yield {"synthesize_profile": {}}
         yield {"store_profile": self.final_state}
 
@@ -145,6 +147,21 @@ def test_ingest_docx_returns_profile(client, data_dir, monkeypatch, sample_profi
     assert manifest["sources"][0]["sha256"]
 
 
+def _fake_fetch_github(calls: list | None = None):
+    """Stand-in for `fetch_github_profile`, recording the token it was given."""
+
+    def fake_fetch(username, client=None, token=None):
+        from src.models.schemas import SourceDocument
+
+        if calls is not None:
+            calls.append({"username": username, "token": token})
+        return SourceDocument(
+            id=f"github:{username}", source_type="github", raw_text="repos ..."
+        )
+
+    return fake_fetch
+
+
 def test_ingest_archives_github_and_free_text_sources(
     client, data_dir, monkeypatch, sample_profile
 ):
@@ -153,14 +170,7 @@ def test_ingest_archives_github_and_free_text_sources(
         routes, "build_ingestion_graph", lambda: FakeIngestionGraph(final_state)
     )
 
-    def fake_fetch(username):
-        from src.models.schemas import SourceDocument
-
-        return SourceDocument(
-            id=f"github:{username}", source_type="github", raw_text="repos ..."
-        )
-
-    monkeypatch.setattr(routes, "fetch_github_profile", fake_fetch)
+    monkeypatch.setattr(routes, "fetch_github_profile", _fake_fetch_github())
 
     resp = client.post(
         "/ingest",
@@ -217,6 +227,132 @@ def test_ingest_linkedin_export_zip(client, data_dir, monkeypatch, sample_profil
     entry = manifest["sources"][0]
     assert entry["category"] == "linkedin"
     assert entry["source_id"] == "linkedin:Basic_LinkedInDataExport.zip"
+
+
+def test_ingest_github_token_reaches_the_client_but_no_disk(
+    client, data_dir, monkeypatch, sample_profile
+):
+    """The per-request token is a secret in transit: used, then gone."""
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    monkeypatch.setattr(
+        routes, "build_ingestion_graph", lambda: FakeIngestionGraph(final_state)
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr(routes, "fetch_github_profile", _fake_fetch_github(calls))
+
+    resp = client.post(
+        "/ingest",
+        data={
+            "job_id": "job-tok",
+            "github_username": "alice",
+            "github_token": "ghp-secret-value",
+        },
+    )
+    assert resp.status_code == 200
+    assert calls == [{"username": "alice", "token": "ghp-secret-value"}]
+
+    assert "ghp-secret-value" not in resp.text
+    written = [p for p in data_dir.rglob("*") if p.is_file()]
+    assert written  # the run really did archive something to search through
+    assert not any("ghp-secret-value" in p.read_bytes().decode(errors="replace") for p in written)
+
+
+def test_ingest_without_github_token_falls_back_to_the_configured_one(
+    client, monkeypatch, sample_profile
+):
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    monkeypatch.setattr(
+        routes, "build_ingestion_graph", lambda: FakeIngestionGraph(final_state)
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr(routes, "fetch_github_profile", _fake_fetch_github(calls))
+
+    # Blank is no token at all — `None` lets fetch_github_profile use the env one.
+    resp = client.post(
+        "/ingest",
+        data={"job_id": "job-tok2", "github_username": "alice", "github_token": "  "},
+    )
+    assert resp.status_code == 200
+    assert calls[0]["token"] is None
+
+
+def test_ingest_keeps_two_same_named_cvs_apart(
+    client, data_dir, monkeypatch, sample_profile
+):
+    """Same filename twice: two archived files, two source ids, no overwrite."""
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    fake = FakeIngestionGraph(final_state)
+    monkeypatch.setattr(routes, "build_ingestion_graph", lambda: fake)
+
+    docx_type = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    resp = client.post(
+        "/ingest",
+        files=[
+            ("cv", ("CV.docx", build_sample_docx(), docx_type)),
+            ("cv", ("CV.docx", build_sample_docx(name="Bob Jones"), docx_type)),
+        ],
+        data={"job_id": "job-dup"},
+    )
+    assert resp.status_code == 200
+
+    cv_dir = data_dir / "sources" / "job-dup" / "cv"
+    assert sorted(p.name for p in cv_dir.iterdir()) == ["CV-2.docx", "CV.docx"]
+
+    # Distinct source ids end to end, so raw_source_map can tell them apart.
+    first, second = fake.received_state["sources"]
+    ids = [first.id, second.id]
+    assert ids == ["cv_docx:CV.docx", "cv_docx:CV-2.docx"]
+    manifest = json.loads((data_dir / "sources" / "job-dup" / "manifest.json").read_text())
+    assert [e["source_id"] for e in manifest["sources"]] == ids
+    assert [e["filename"] for e in manifest["sources"]] == ["CV.docx", "CV-2.docx"]
+    # The second CV really is the second file, not the first one parsed twice.
+    assert "Alice Smith" in first.raw_text
+    assert "Bob Jones" in second.raw_text
+
+
+def test_ingest_reports_skipped_repos_in_the_response_and_over_sse(
+    client, monkeypatch, sample_profile
+):
+    """Partial success is still success — but never a silent one."""
+    errors = [
+        {"source": "github:alice", "repo": "alice/repo-4", "reason": "no tool call"},
+        {"source": "github:alice", "repo": "alice/repo-9", "reason": "timed out"},
+    ]
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    monkeypatch.setattr(
+        routes,
+        "build_ingestion_graph",
+        lambda: FakeIngestionGraph(final_state, {"source_errors": errors}),
+    )
+    monkeypatch.setattr(routes, "fetch_github_profile", _fake_fetch_github())
+
+    resp = client.post(
+        "/ingest", data={"job_id": "job-warn", "github_username": "alice"}
+    )
+    assert resp.status_code == 200
+    assert resp.json()["source_errors"] == errors
+
+    # Each skipped repo is also announced live on the progress stream.
+    queue = routes.jobs.get("job-warn")
+    published = []
+    while not queue.empty():
+        published.append(queue.get_nowait())
+    warnings = [e for e in published if e.get("event") == "warning"]
+    assert [w["data"] for w in warnings] == [
+        "alice/repo-4: no tool call",
+        "alice/repo-9: timed out",
+    ]
+
+
+def test_ingest_reports_no_errors_on_a_clean_run(client, monkeypatch, sample_profile):
+    final_state = {"profile": sample_profile, "profile_id": "abc123", "version": 1}
+    monkeypatch.setattr(
+        routes, "build_ingestion_graph", lambda: FakeIngestionGraph(final_state)
+    )
+    resp, _ = _ingest_docx(client, {"job_id": "job-clean"}, sample_profile, monkeypatch)
+    assert resp.json()["source_errors"] == []
 
 
 def test_ingest_rejects_unknown_linkedin_file_type(client):

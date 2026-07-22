@@ -21,11 +21,17 @@ Two properties of the GitHub API shape how tiers 1-2 are collected:
 
 *Membership is private by default.* ``GET /users/{u}/orgs`` lists only **public**
 memberships, so a user whose memberships are all private looks org-less. When
-``GITHUB_TOKEN`` belongs to the very username being ingested ("self-token"), the
+the token belongs to the very username being ingested ("self-token"), the
 viewer endpoints ``GET /user/orgs`` and ``GET /user/repos?affiliation=...`` are
 used instead: they see private memberships and private repos. This never applies
 to a third party — a token for someone else falls back to the public endpoints,
 so it can never surface another account's private data.
+
+The token is resolved **per call** (PLAN.md Phase 5.a): the caller may pass one
+for the username being ingested, and ``config.GITHUB_TOKEN`` is only the
+fallback. One process can therefore serve several users' tokens without a
+restart, and the self-token determination is made per request rather than once
+at import.
 
 *Access is not contribution.* ``affiliation=collaborator`` returns every repo the
 user was ever invited to, the overwhelming majority of which they never touched.
@@ -36,7 +42,10 @@ the PR/GraphQL evidence already proves it).
 
 import base64
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Sequence
 
 import httpx
 
@@ -93,10 +102,10 @@ query($login: String!, $from: DateTime!, $to: DateTime!) {
 """
 
 
-def _headers() -> dict[str, str]:
+def _headers(token: str | None) -> dict[str, str]:
     headers = {"Accept": "application/vnd.github+json"}
-    if config.GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {config.GITHUB_TOKEN}"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     return headers
 
 
@@ -109,9 +118,9 @@ def _repo_full_name(repo: dict, username: str) -> str:
     return repo.get("full_name") or f"{_repo_owner(repo, username)}/{repo['name']}"
 
 
-def _viewer_login(client: httpx.Client) -> str | None:
-    """Login of the account owning ``GITHUB_TOKEN``; ``None`` when tokenless."""
-    if not config.GITHUB_TOKEN:
+def _viewer_login(client: httpx.Client, token: str | None) -> str | None:
+    """Login of the account owning ``token``; ``None`` when tokenless."""
+    if not token:
         return None
     try:
         resp = client.get("/user")
@@ -315,13 +324,15 @@ def _search_merged_prs(client: httpx.Client, username: str) -> dict[str, dict]:
     return per_repo
 
 
-def _graphql(client: httpx.Client, query: str, variables: dict) -> dict | None:
+def _graphql(
+    client: httpx.Client, query: str, variables: dict, token: str | None
+) -> dict | None:
     """POST a GraphQL query; ``None`` on any failure (caller degrades)."""
     try:
         resp = client.post(
             "/graphql",
             json={"query": query, "variables": variables},
-            headers={"Authorization": f"Bearer {config.GITHUB_TOKEN}"},
+            headers={"Authorization": f"Bearer {token}"},
         )
     except httpx.HTTPError as exc:  # pragma: no cover - network-only path
         logger.warning("github: GraphQL request failed (%s)", exc)
@@ -337,7 +348,7 @@ def _graphql(client: httpx.Client, query: str, variables: dict) -> dict | None:
 
 
 def _graphql_contributions(
-    client: httpx.Client, username: str
+    client: httpx.Client, username: str, token: str | None
 ) -> tuple[dict[str, dict], dict[str, int]]:
     """Contributed repos + per-repo commit counts via GraphQL (token required).
 
@@ -351,6 +362,7 @@ def _graphql_contributions(
         client,
         _CONTRIBUTED_REPOS_QUERY,
         {"login": username, "first": GRAPHQL_CONTRIBUTED_REPOS},
+        token,
     )
     user = (data or {}).get("user") or {}
     repos: dict[str, dict] = {}
@@ -383,6 +395,7 @@ def _graphql_contributions(
                 "from": start.isoformat().replace("+00:00", "Z"),
                 "to": end.isoformat().replace("+00:00", "Z"),
             },
+            token,
         )
         collection = ((year_data or {}).get("user") or {}).get(
             "contributionsCollection"
@@ -404,7 +417,7 @@ def _graphql_contributions(
 
 
 def _gather_evidence(
-    client: httpx.Client, username: str
+    client: httpx.Client, username: str, token: str | None
 ) -> tuple[dict[str, dict], dict[str, dict], dict[str, int]]:
     """Contribution evidence, gathered once and shared by both consumers.
 
@@ -414,8 +427,8 @@ def _gather_evidence(
     prs = _search_merged_prs(client, username)
     graph_repos: dict[str, dict] = {}
     commits: dict[str, int] = {}
-    if config.GITHUB_TOKEN:
-        graph_repos, commits = _graphql_contributions(client, username)
+    if token:
+        graph_repos, commits = _graphql_contributions(client, username, token)
     return prs, graph_repos, commits
 
 
@@ -577,7 +590,87 @@ def _render_external(repo: dict) -> str:
     return "\n".join(lines)
 
 
-def fetch_github_profile(username: str, client: httpx.Client | None = None) -> SourceDocument:
+@dataclass(frozen=True)
+class RepoChunk:
+    """One repository's slice of a rendered GitHub source document.
+
+    Attributes:
+        repo: ``owner/name`` of the repository this chunk describes.
+        tier: The verbatim span of the ``## …`` tier heading and its prose
+            preamble. Carried on every chunk because
+            ``skills/source-extraction/SKILL.md`` decides ownership-vs-contribution
+            attribution from exactly that labelling — a repo extracted without
+            its heading is liable to be mis-attributed as authorship.
+        body: The verbatim ``### Repository: …`` span.
+    """
+
+    repo: str
+    tier: str
+    body: str
+
+
+_TIER_RE = re.compile(r"^## .*$", re.MULTILINE)
+_REPO_RE = re.compile(r"^### Repository: (\S+)", re.MULTILINE)
+
+
+def split_repo_sections(raw_text: str) -> tuple[str, list[RepoChunk]]:
+    """Split a rendered GitHub document into per-repository chunks.
+
+    The spans tile the document exactly, so
+    ``render_repo_document(*split_repo_sections(text)) == text``: splitting and
+    re-rendering an untouched document is a no-op, and a *pruned* re-render
+    differs from the original only by the repos that were dropped.
+
+    Args:
+        raw_text: The ``raw_text`` of a ``source_type="github"`` document, as
+            assembled by :func:`fetch_github_profile`.
+
+    Returns:
+        ``(header, chunks)`` — the leading profile/membership lines, and one
+        :class:`RepoChunk` per repository in document order. A document with no
+        ``### Repository:`` sections yields ``(raw_text, [])``.
+    """
+    boundaries = sorted(
+        [(m.start(), "tier", None) for m in _TIER_RE.finditer(raw_text)]
+        + [(m.start(), "repo", m.group(1)) for m in _REPO_RE.finditer(raw_text)]
+    )
+    if not boundaries:
+        return raw_text, []
+
+    header = raw_text[: boundaries[0][0]]
+    chunks: list[RepoChunk] = []
+    tier = ""
+    for index, (start, kind, repo) in enumerate(boundaries):
+        end = boundaries[index + 1][0] if index + 1 < len(boundaries) else len(raw_text)
+        span = raw_text[start:end]
+        if kind == "tier":
+            tier = span
+        else:
+            chunks.append(RepoChunk(repo=repo, tier=tier, body=span))
+    return header, chunks
+
+
+def render_repo_document(header: str, chunks: Sequence[RepoChunk]) -> str:
+    """Reassemble a GitHub document from a subset of its repository chunks.
+
+    Each tier heading is emitted once, before the first surviving repo under it;
+    a tier whose repos were all dropped disappears with them.
+    """
+    parts = [header]
+    last_tier: str | None = None
+    for chunk in chunks:
+        if chunk.tier != last_tier:
+            parts.append(chunk.tier)
+            last_tier = chunk.tier
+        parts.append(chunk.body)
+    return "".join(parts)
+
+
+def fetch_github_profile(
+    username: str,
+    client: httpx.Client | None = None,
+    token: str | None = None,
+) -> SourceDocument:
     """Fetch a user's public GitHub footprint as one labelled SourceDocument.
 
     Covers repos the user owns, repos owned by organizations they belong to or
@@ -588,14 +681,21 @@ def fetch_github_profile(username: str, client: httpx.Client | None = None) -> S
     Args:
         username: GitHub username.
         client: Optional httpx client (injected in tests).
+        token: GitHub token for this request, falling back to
+            ``config.GITHUB_TOKEN``. A token belonging to ``username`` also
+            unlocks their private repos and private org memberships; anyone
+            else's only raises rate limits.
 
     Returns:
         A SourceDocument summarizing the user's public GitHub activity.
     """
+    token = token or config.GITHUB_TOKEN
     own_client = client is None
-    client = client or httpx.Client(base_url=API_BASE, headers=_headers(), timeout=30)
+    client = client or httpx.Client(
+        base_url=API_BASE, headers=_headers(token), timeout=30
+    )
     try:
-        viewer = _viewer_login(client)
+        viewer = _viewer_login(client, token)
         is_self = bool(viewer) and viewer.lower() == username.lower()
         logger.debug(
             "github[%s]: token viewer=%s self=%s", username, viewer or "-", is_self
@@ -617,7 +717,7 @@ def fetch_github_profile(username: str, client: httpx.Client | None = None) -> S
         graph_repos: dict[str, dict] = {}
         commits: dict[str, int] = {}
         if config.GITHUB_INCLUDE_CONTRIBUTIONS:
-            prs, graph_repos, commits = _gather_evidence(client, username)
+            prs, graph_repos, commits = _gather_evidence(client, username, token)
         else:
             logger.debug(
                 "github[%s]: GITHUB_INCLUDE_CONTRIBUTIONS off — owned + org only",

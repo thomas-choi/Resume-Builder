@@ -3,6 +3,7 @@
 import asyncio
 import re
 import uuid
+from functools import partial
 from pathlib import Path
 
 import anyio
@@ -83,8 +84,10 @@ def _load_upload(run_id: str, upload: UploadFile) -> tuple[SourceDocument, dict]
     data = upload.file.read()
     stored = run_store.save_source_file(run_id, "cv", filename, data)
     doc = read_docx(stored) if suffix == ".docx" else read_pdf(stored)
-    # Keep the original filename in the source id, not the stored path.
-    doc.id = f"{doc.source_type}:{filename}"
+    # The *stored* name, not the uploaded one: two uploads called `CV.docx` are
+    # archived as `CV.docx` / `CV-2.docx`, and their source ids must stay as
+    # distinct as their files or raw_source_map traceability collapses.
+    doc.id = f"{doc.source_type}:{stored.name}"
     doc.stored_path = str(stored)
     return doc, run_store.source_entry("cv", stored, data, source_id=doc.id)
 
@@ -110,10 +113,16 @@ def _load_linkedin_export(run_id: str, upload: UploadFile) -> tuple[SourceDocume
         doc = read_linkedin_export(stored)
     except ValueError as exc:
         raise HTTPException(400, f"unreadable LinkedIn export: {exc}") from exc
-    # Keep the original filename in the source id, not the stored path.
-    doc.id = f"linkedin:{filename}"
+    # The stored name, so two same-named exports stay distinct (see _load_upload).
+    doc.id = f"linkedin:{stored.name}"
     doc.stored_path = str(stored)
     return doc, run_store.source_entry("linkedin", stored, data, source_id=doc.id)
+
+
+def _warning_text(error: dict) -> str:
+    """One skipped item, as a single line for the SSE `warning` stream."""
+    subject = error.get("repo") or error.get("source") or "source"
+    return f"{subject}: {error.get('reason') or 'could not be extracted'}"
 
 
 @router.get("/healthz")
@@ -126,6 +135,7 @@ async def ingest(
     cv: list[UploadFile] | None = None,
     linkedin_export: list[UploadFile] | None = None,
     github_username: str | None = Form(default=None),
+    github_token: str | None = Form(default=None),
     free_text: str | None = Form(default=None),
     job_id: str | None = Form(default=None),
     profile_id: str | None = Form(default=None),
@@ -145,6 +155,19 @@ async def ingest(
     Pass `profile_id` to direct the result into a specific profile: an existing
     one gets a new version appended, a new id is created at v1. Omit it and the
     server mints a fresh profile_id (the default).
+
+    Extraction is partial-failure tolerant, and says so: anything it could not
+    read (a specific GitHub repo, or a whole source) is listed in
+    `source_errors` on the response and streamed as a `warning` SSE event. A
+    GitHub source whose repos were dropped has its archived `github.json`
+    rewritten to the repos that reached the profile, with the as-fetched
+    document kept beside it as `github.raw.json`.
+
+    `github_token` overrides the server's `GITHUB_TOKEN` for this request only.
+    A token belonging to `github_username` also unlocks their private repos and
+    private org memberships; anyone else's only raises rate limits. It is a
+    secret in transit: never archived, never written to the manifest, never
+    logged.
     """
     # Allocate the run/correlation id up front so raw inputs can be archived
     # before parsing (and before the graph runs). job_id doubles as run_id.
@@ -152,6 +175,8 @@ async def ingest(
     set_run_id(run_id)
     if profile_id is not None:
         profile_id = _validate_profile_id(profile_id)
+    # An empty form field is no token at all — fall back to config.GITHUB_TOKEN.
+    github_token = (github_token or "").strip() or None
 
     sources: list[SourceDocument] = []
     manifest_entries: list[dict] = []
@@ -164,7 +189,9 @@ async def ingest(
         sources.append(doc)
         manifest_entries.append(entry)
     if github_username:
-        gh_doc = await anyio.to_thread.run_sync(fetch_github_profile, github_username)
+        gh_doc = await anyio.to_thread.run_sync(
+            partial(fetch_github_profile, github_username, token=github_token)
+        )
         gh_bytes = gh_doc.model_dump_json(indent=2).encode("utf-8")
         gh_path = run_store.save_source_file(run_id, "github", "github.json", gh_bytes)
         gh_doc.stored_path = str(gh_path)
@@ -211,6 +238,11 @@ async def ingest(
         for update in graph.stream(stream_input, stream_mode="updates"):
             for node, node_state in update.items():
                 publish({"event": "node", "data": node})
+                # A source or repo that could not be extracted is reported as it
+                # happens: a run that silently lost a whole source must never
+                # again render as a clean success.
+                for error in (node_state or {}).get("source_errors") or []:
+                    publish({"event": "warning", "data": _warning_text(error)})
                 state.update(node_state or {})
         return state
 
@@ -228,6 +260,9 @@ async def ingest(
         "run_id": run_id,
         "profile_id": state["profile_id"],
         "version": state["version"],
+        # Partial success is still success, but it is never silent: every item
+        # the extractor could not read is named here.
+        "source_errors": state.get("source_errors") or [],
         "profile": profile.model_dump(),
     }
 

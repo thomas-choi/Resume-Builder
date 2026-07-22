@@ -36,12 +36,13 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `ANTHROPIC_API_KEY` | yes* | — | LLM calls with the default `anthropic` provider |
-| `GITHUB_TOKEN` | no | — | Raises GitHub API rate limits **and** unlocks richer contribution data for `github_username` ingestion: with a token the client uses GraphQL `repositoriesContributedTo` (all-time, with description/language/stars) plus per-repo commit counts; without one it falls back to the REST merged-PR search. If the token belongs to **the very username being ingested** it additionally unlocks private org memberships and private repos (see "GitHub coverage" below); for any other username those endpoints are never used |
+| `GITHUB_TOKEN` | no | — | **Fallback** token, used only when a request supplies no `github_token` (see API-REFERENCE.md → `POST /ingest`). Raises GitHub API rate limits **and** unlocks richer contribution data for `github_username` ingestion: with a token the client uses GraphQL `repositoriesContributedTo` (all-time, with description/language/stars) plus per-repo commit counts; without one it falls back to the REST merged-PR search. If the token belongs to **the very username being ingested** it additionally unlocks private org memberships and private repos (see "GitHub coverage" below); for any other username those endpoints are never used |
 | `GITHUB_INCLUDE_CONTRIBUTIONS` | no | `true` | Kill switch for the extra search/GraphQL calls that find contributions to repos the user doesn't own. `false` → the source document degrades to owned + organization repos only |
 | `GITHUB_MAX_EXTERNAL_REPOS` | no | `15` | How many external (contributed-to) repos to keep, ranked by contribution volume (merged PRs + commits), not recency |
 | `GITHUB_INCLUDE_PRIVATE` | no | `true` | Whether private repos are ingested on the self-token path. Their names, descriptions and README excerpts then reach the extraction LLM and are stored under `data/sources/`. `false` → public repos only, while private **org membership** is still discovered |
 | `GITHUB_MAX_CONTRIBUTION_PROBES` | no | `150` | Budget for the `GET /repos/{full}/commits?author=` probes that prove a non-owned repo was actually worked on. Repos beyond the budget are dropped, never assumed |
 | `GITHUB_MAX_ORG_REPOS` | no | `20` | How many organization/collaborator repos to render, newest contribution first. Each organization keeps at least one repo before recency fills the rest, so an old employer is not evicted by a busy current one |
+| `GITHUB_REPOS_PER_EXTRACTION` | no | `10` | How many repos go into one extraction call for a GitHub source. Lower = more calls but less risk of the model truncating (or omitting) its structured output; raise it only if extraction is reliably clean and you want fewer calls |
 | `LLM_PROVIDER` | no | `anthropic` | Provider switch (same method as FUND `get_llm`): `anthropic`, `openai`, `google`, `nvidia`, `llamacpp`, `deepseek`, `openrouter`. Non-Anthropic providers need their `langchain-*` package installed and `*_MODEL` vars set to that provider's model ids. Packages for `anthropic`, `openai`, `google`, `nvidia`, and `llamacpp` ship in `requirements.txt`; `deepseek`/`openrouter` need a manual `pip install`. For `deepseek` the factory disables thinking mode per request — DeepSeek thinking models reject the forced tool call that structured output requires. |
 | `LLM_API_KEY` | no | falls back to `ANTHROPIC_API_KEY` | Provider API key (*required if `LLM_PROVIDER` isn't `anthropic`) |
 | `LLM_TEMPERATURE` | no | unset | Sampling temperature; leave unset for current Claude models (they reject non-default sampling params). For local/OSS providers set ~`0.2` — low temperature keeps the extraction and validation stages factual, which the anti-fabrication gate depends on |
@@ -86,22 +87,48 @@ the source document (see TECHNICAL-DESIGN.md §3):
    committed to**,
 3. repos the user only **contributed** to (merged PRs / commits).
 
+**Where the token comes from.** Each `/ingest` request may carry its own
+`github_token` form field; `GITHUB_TOKEN` is only the fallback for requests that
+don't. One running server can therefore ingest several people, each with their
+own credential, without an `.env` edit or a restart. A request token is used for
+that request and nothing else: it is not archived under `data/`, not recorded in
+`manifest.json`, and not logged (the `github[%s]: token viewer=%s` DEBUG line
+logs the *resolved login*, never the secret). Operators who prefer one shared
+credential can simply keep setting `GITHUB_TOKEN` and ignore the field.
+
 **Self-token vs. third-party token.** `GET /users/{u}/orgs` lists only *public*
 organization memberships, and GitHub's default for a membership is private — so
-a user who belongs to five organizations can look org-less. When `GITHUB_TOKEN`
-belongs to the very username being ingested, the client instead uses the viewer
-endpoints `GET /user/orgs` and `GET /user/repos?affiliation=owner,organization_member,collaborator`,
+a user who belongs to five organizations can look org-less. When the resolved
+token belongs to the very username being ingested, the client instead uses the
+viewer endpoints `GET /user/orgs` and `GET /user/repos?affiliation=owner,organization_member,collaborator`,
 which see private memberships and private repos. Identity is checked with
-`GET /user` on every run: a token for anyone else falls back to the public
-endpoints, so a third party's private data can never be reached. Set
-`GITHUB_INCLUDE_PRIVATE=false` to keep private repos out of the source document
-while still discovering the memberships.
+`GET /user` **per request**, so the same process can grant user B their private
+repos and still refuse a token that belongs to neither party: a token for anyone
+else falls back to the public endpoints, and a third party's private data can
+never be reached. Set `GITHUB_INCLUDE_PRIVATE=false` to keep private repos out of
+the source document while still discovering the memberships.
 
 **Access is not contribution.** `affiliation=collaborator` returns every repo the
 user was ever invited to — in practice mostly repos they never touched. Each
 non-owned repo therefore has to prove a commit via
 `GET /repos/{full}/commits?author={u}` before it is rendered; repos already
 proven by the merged-PR search or the GraphQL commit counts skip the probe.
+
+**Extraction is batched per repo.** A GitHub source is one document holding
+every repo, which at ~50 repos asks the extractor for more structured output
+than models reliably return — observed in practice as a response with *no tool
+call at all*, losing the entire source while the run still reported success.
+Repos are therefore extracted `GITHUB_REPOS_PER_EXTRACTION` at a time, and a
+failed batch is retried one repo at a time so the loss is one repo instead of
+fifty. Repos that fail even alone are reported (see below) and dropped, and the
+run continues.
+
+**Sampling settings matter most here.** Extraction, synthesis and validation all
+use forced-tool-call structured output, and sampling that call at a high
+temperature makes "no tool call returned" markedly more likely. A run observed
+using `LLM_TEMPERATURE=0.9` with `LLM_MAX_TOKENS=16384` for every stage is what
+produced the failure above. If you set `LLM_TEMPERATURE` at all, keep it low
+(~`0.2`); there is deliberately no per-stage temperature knob.
 
 **Rate limits.** Unauthenticated: 60 core req/h and **10 search req/min**;
 with `GITHUB_TOKEN`: 5000 core req/h and 30 search req/min. Each owned/org repo
@@ -370,8 +397,9 @@ and its inputs/outputs are archived under `DATA_DIR`:
 
 | Path | Contents |
 |---|---|
-| `data/sources/{run_id}/cv/<original-name>` | Raw uploaded CV bytes, saved **before** parsing |
-| `data/sources/{run_id}/github/github.json` | Serialized GitHub `SourceDocument` |
+| `data/sources/{run_id}/cv/<original-name>` | Raw uploaded CV bytes, saved **before** parsing. A name already used in the run is suffixed (`CV.docx` → `CV-2.docx` → …) rather than overwritten, and the source id follows the stored name |
+| `data/sources/{run_id}/github/github.json` | Serialized GitHub `SourceDocument` — **the repos that reached the profile**, when any were dropped |
+| `data/sources/{run_id}/github/github.raw.json` | The GitHub document exactly as fetched, written **only** when repos were dropped. The audit trail of what GitHub really returned must survive the pruning |
 | `data/sources/{run_id}/linkedin/linkedin-summary.txt` | The `free_text` input (LinkedIn summary path) |
 | `data/sources/{run_id}/linkedin/<original-name>` | Uploaded LinkedIn data export (`.zip` / `.csv`), saved **before** parsing |
 | `data/sources/{run_id}/manifest.json` | Index of inputs (category, filename, size, sha256) linked to `profile_id`/`version` |
@@ -415,3 +443,11 @@ Each `POST /tailor` execution is likewise tagged with a `tailor_id`:
   (`extract[<source_id>]: dropped projects[11] …`, `extraction failed for
   source …`), so a run that returns 200 with fewer entries than expected is
   diagnosable from the log: `grep 'extract\[' logs/app.log`.
+- **Skipped repos are reported, not just logged (Phase 5.c).** Anything the
+  extractor could not read comes back in `source_errors` on the `/ingest`
+  response and as `warning` events on the SSE stream, and the UI lists it. A
+  partial run is no longer indistinguishable from a clean one. When a response
+  with no tool call is what failed, the log now carries the provider's
+  `finish_reason`, token usage and a content preview instead of the bare `: None`
+  it used to print — check those first, since a `length` finish reason means the
+  batch was too big and `GITHUB_REPOS_PER_EXTRACTION` should come down.

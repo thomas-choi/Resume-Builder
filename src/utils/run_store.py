@@ -47,8 +47,25 @@ def output_dir(run_id: str) -> Path:
     return _output_root() / run_id
 
 
+def _free_path(dest_dir: Path, safe_name: str) -> Path:
+    """First unused path for ``safe_name`` in ``dest_dir`` (``x.pdf``, ``x-2.pdf``…)."""
+    dest = dest_dir / safe_name
+    if not dest.exists():
+        return dest
+    stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+    counter = 2
+    while (dest := dest_dir / f"{stem}-{counter}{suffix}").exists():
+        counter += 1
+    return dest
+
+
 def save_source_file(run_id: str, category: str, filename: str, data: bytes) -> Path:
     """Archive one raw input under ``sources/{run_id}/{category}/{filename}``.
+
+    A name already taken within the run is suffixed (``CV.docx`` → ``CV-2.docx``
+    → ``CV-3.docx``) rather than overwritten: uploading two files that happen to
+    share a name is ordinary, and the second silently replacing the first loses
+    a source the profile was meant to be built from.
 
     Args:
         run_id: The run correlation id.
@@ -60,17 +77,19 @@ def save_source_file(run_id: str, category: str, filename: str, data: bytes) -> 
         data: Raw bytes to write verbatim.
 
     Returns:
-        The path the bytes were written to.
+        The path the bytes were actually written to — which is *not* always
+        ``{category}/{filename}``, so callers deriving a source id from the name
+        must use this rather than the name they passed in.
     """
     safe_name = Path(filename).name or "unnamed"
     dest_dir = sources_dir(run_id) / category
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / safe_name
+    dest = _free_path(dest_dir, safe_name)
     dest.write_bytes(data)
     logger.debug(
         "run_store: archived %s/%s (%d bytes) for run %s",
         category,
-        safe_name,
+        dest.name,
         len(data),
         run_id,
     )
@@ -89,6 +108,57 @@ def source_entry(category: str, path: Path, data: bytes, source_id: str | None =
     if source_id is not None:
         entry["source_id"] = source_id
     return entry
+
+
+def prune_source_document(path: Path, pruned_text: str) -> Path:
+    """Rewrite an archived ``SourceDocument`` JSON to carry ``pruned_text``.
+
+    The as-fetched copy is preserved alongside it as ``<stem>.raw.json`` before
+    the rewrite: the pruned file records what actually reached the profile,
+    and the raw one remains the audit trail of what the provider really
+    returned. Losing the latter to the pruning would make a dropped item
+    impossible to investigate.
+
+    Args:
+        path: The archived document, e.g. ``sources/{run_id}/github/github.json``.
+        pruned_text: The document text with the failed items removed.
+
+    Returns:
+        The path the as-fetched copy was written to.
+    """
+    original = path.read_bytes()
+    raw_path = path.with_suffix(".raw.json")
+    raw_path.write_bytes(original)
+
+    document = json.loads(original)
+    document["raw_text"] = pruned_text
+    path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    logger.debug(
+        "run_store: pruned %s (%d -> %d chars), as-fetched copy at %s",
+        path.name,
+        len(original),
+        len(pruned_text),
+        raw_path.name,
+    )
+    return raw_path
+
+
+def add_source_entry(run_id: str, entry: dict) -> None:
+    """Append one entry to an existing manifest, preserving its profile link.
+
+    No-op (logs a warning) when the manifest is missing, for the same reason as
+    :func:`link_profile`: provenance bookkeeping must never fail a run.
+    """
+    manifest = load_manifest(run_id)
+    if manifest is None:
+        logger.warning("run_store: no manifest to extend for run %s", run_id)
+        return
+    write_manifest(
+        run_id,
+        [*manifest.get("sources", []), entry],
+        profile_id=manifest.get("profile_id"),
+        version=manifest.get("version"),
+    )
 
 
 def write_manifest(

@@ -14,6 +14,20 @@ def test_save_source_file_writes_bytes_and_returns_path(data_dir):
     assert path.read_bytes() == data
 
 
+def test_save_source_file_keeps_both_files_when_names_collide(data_dir):
+    """Two uploads called CV.docx are two sources — neither may overwrite the other."""
+    first = run_store.save_source_file("run-1", "cv", "CV.docx", b"one")
+    second = run_store.save_source_file("run-1", "cv", "CV.docx", b"two")
+    third = run_store.save_source_file("run-1", "cv", "CV.docx", b"three")
+
+    assert [p.name for p in (first, second, third)] == ["CV.docx", "CV-2.docx", "CV-3.docx"]
+    assert (first.read_bytes(), second.read_bytes(), third.read_bytes()) == (
+        b"one",
+        b"two",
+        b"three",
+    )
+
+
 def test_save_source_file_sanitizes_filename(data_dir):
     """A traversal-style upload name must not escape the run directory."""
     path = run_store.save_source_file("run-1", "cv", "../../etc/passwd", b"x")
