@@ -231,6 +231,11 @@ with `"approve_flagged": true` to render anyway. A missing `cv.pdf` (404) with
 a present `cv.docx` means LibreOffice was unavailable — check the log for
 `skipping PDF`.
 
+These are one-liners for checking the service is alive. For the full job
+description → downloaded CV walkthrough — with the JD in a file, the flag gate
+and the approval re-run — see
+[API-REFERENCE.md § "Worked example — end to end"](API-REFERENCE.md#worked-example--end-to-end).
+
 Profiles land in `data/profiles/{profile_id}/v{n}.json` with a `latest`
 pointer file. Each `/ingest` call also returns a `run_id` and archives its
 inputs + output copy (see [Run tracking & retention](#run-tracking--retention)):

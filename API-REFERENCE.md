@@ -201,6 +201,20 @@ with a resumable server-side review.)
 
 ### Worked example — end to end
 
+The whole path in `curl`, from a job description on your clipboard to a `.docx`
+on disk. Each shell step below maps to the pipeline steps in
+[TECHNICAL-DESIGN.md § "From job description to targeted
+CV"](TECHNICAL-DESIGN.md#from-job-description-to-targeted-cv-one-request-step-by-step):
+
+| Shell step | Pipeline steps it triggers |
+|---|---|
+| 1 — ingest | the *ingestion* graph (once; not part of tailoring) |
+| 2 — save the JD | none — local file handling |
+| 3 — tailor | 0 accept → 1 `analyze_job` → 2 `tailor_cv` → 3 `validate_cv` → 4 `write_cover_letter` → 5 `render_document` → 6 respond |
+| 4 — read the result | none — reads the response you already have |
+| 5 — approve, if flagged | re-runs 1–5 with the gate open |
+| 6 — download | 7 `GET /document` |
+
 **Step 1 — get a `profile_id`.** Tailoring reads a stored profile, so you need
 one ingest first. Keep the id; every later job post reuses it.
 
@@ -213,7 +227,7 @@ PROFILE_ID=$(curl -s -X POST localhost:8000/ingest \
 echo "$PROFILE_ID"        # e.g. 9f2c1e04-… — reuse this for every job post
 ```
 
-**Step 2 — put the job post in a file.** Job posts are multi-line text with
+**Step 2 — save the job description to a file.** Job posts are multi-line text with
 quotes, `$`, and bullet characters; pasting that straight into a shell string
 breaks the JSON. Save it verbatim instead:
 
@@ -229,20 +243,19 @@ EOF
 The `<<'EOF'` quoting matters — it stops the shell expanding `$` or backticks
 inside the posting.
 
-**Step 3 — tailor.**
+**Step 3 — send the JD and ask for the documents.** This one call is the entire
+tailoring pipeline: it reads the posting, writes the CV, validates every claim,
+writes the cover letter, and renders the files.
 
 ```bash
 curl -s -X POST localhost:8000/tailor \
   -H 'Content-Type: application/json' \
   -d "$(jq -n --arg pid "$PROFILE_ID" --rawfile job job.txt \
-          '{profile_id: $pid, job_post: $job}')" \
+          '{profile_id: $pid, job_post: $job, render: true, cover_letter: true}')" \
   -o tailored.json
 
-jq '{headline: .tailored_cv.headline,
-     experiences: [.tailored_cv.selected_experiences[] | .company + " — " + .title],
-     skills: .tailored_cv.highlighted_skills,
-     needs_review: .validation.needs_review,
-     flags: [.validation.flags[] | {kind, item, reason}]}' tailored.json
+TAILOR_ID=$(jq -r '.tailor_id' tailored.json)
+echo "$TAILOR_ID"         # e.g. 1994c6fe7642 — the id you download documents by
 ```
 
 What each piece does:
@@ -253,12 +266,27 @@ What each piece does:
 | `-X POST` | the endpoint is POST-only; a GET returns 405 |
 | `-H 'Content-Type: application/json'` | **required.** The body is a Pydantic model, not a form. Omit this and FastAPI rejects the request with 422 |
 | `jq -n --arg pid … --rawfile job job.txt '{…}'` | builds the request body. `--rawfile` reads `job.txt` as one string and **JSON-escapes the newlines and quotes for you** — this is the part that makes a real job post work |
-| `-o tailored.json` | writes the response to disk. Worth doing: the response holds the full CV, and re-running costs another LLM call |
-| trailing `jq '{…}'` | pulls out the parts you actually read — headline, chosen roles, skills, and any validation flags |
+| `render: true` | also write `.docx`/`.pdf` files. Omit for the JSON-only path |
+| `cover_letter: true` | also write a cover letter (one extra LLM call). Omit to skip it |
+| `-o tailored.json` | writes the response to disk. Worth doing: the response holds the full CV, and re-running costs the LLM calls again |
 
-**Step 4 — check the flags before using the CV.** Anything in
-`validation.flags` is a claim the validator could not trace back to your
-profile. Gate on it:
+The call is synchronous and takes seconds to a minute — it is doing two LLM
+calls plus one per claim that needs the strict check, plus one for the letter.
+
+**Step 4 — read what came back.** The parts you actually act on: the CV, whether
+anything was flagged, and what got rendered.
+
+```bash
+jq '{headline: .tailored_cv.headline,
+     experiences: [.tailored_cv.selected_experiences[] | .company + " — " + .title],
+     skills: .tailored_cv.highlighted_skills,
+     needs_review: .validation.needs_review,
+     rendered: [.documents[] | "\(.kind).\(.format)"],
+     render_skipped}' tailored.json
+```
+
+Anything in `validation.flags` is a claim the validator could not trace back to
+your profile. Gate on it before using the CV:
 
 ```bash
 jq -e '.validation.needs_review | not' tailored.json >/dev/null \
@@ -266,7 +294,79 @@ jq -e '.validation.needs_review | not' tailored.json >/dev/null \
   || jq -r '.validation.flags[] | "[\(.kind)] \(.item)\n    → \(.reason) (similarity \(.similarity // "n/a"))"' tailored.json
 ```
 
+**Step 5 — approve, only if it was flagged.** When flags exist, `documents` is
+empty and `render_skipped` says so — the files were deliberately not written.
+Read the flags from step 4 first; if you accept them, re-run the *same* request
+with the gate open (a fresh `tailor_id`, and the LLM calls happen again):
+
+```bash
+jq -e '.validation.needs_review' tailored.json >/dev/null && {
+  curl -s -X POST localhost:8000/tailor \
+    -H 'Content-Type: application/json' \
+    -d "$(jq -n --arg pid "$PROFILE_ID" --rawfile job job.txt \
+            '{profile_id: $pid, job_post: $job, render: true, cover_letter: true,
+              approve_flagged: true}')" \
+    -o tailored.json
+  TAILOR_ID=$(jq -r '.tailor_id' tailored.json)
+}
+```
+
+**Step 6 — download the documents.**
+
+```bash
+jq -r '.documents[] | "\(.kind)/\(.format)\t\(.url)"' tailored.json
+
+curl -s -o cv.docx          "localhost:8000/document/$TAILOR_ID"
+curl -s -o cv.pdf           "localhost:8000/document/$TAILOR_ID?format=pdf"
+curl -s -o cover-letter.docx "localhost:8000/document/$TAILOR_ID?kind=cover_letter"
+curl -s -o cover-letter.pdf  "localhost:8000/document/$TAILOR_ID?kind=cover_letter&format=pdf"
+```
+
+A `404` here means that document was not rendered — check `render_skipped` in
+the response, and for `?format=pdf` specifically, that LibreOffice is installed
+server-side (see OPERATIONS.md). The `.docx` is always written when a render
+happened; the files stay downloadable by `tailor_id` afterwards.
+
+**All six steps in one block**
+
+```bash
+BASE=localhost:8000
+
+PROFILE_ID=$(curl -s -X POST $BASE/ingest \
+  -F cv=@resume.docx -F github_username=your-gh-user | jq -r '.profile_id')
+
+cat > job.txt <<'EOF'
+Senior Backend Engineer — Acme
+We're looking for someone to own our ingestion pipeline.
+Requirements: 5+ years Python, PostgreSQL, async APIs.
+EOF
+
+curl -s -X POST $BASE/tailor -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg pid "$PROFILE_ID" --rawfile job job.txt \
+          '{profile_id: $pid, job_post: $job, render: true, cover_letter: true}')" \
+  -o tailored.json
+
+jq -r '.validation.flags[]? | "FLAG [\(.kind)] \(.item) → \(.reason)"' tailored.json
+jq -r '.render_skipped // "rendered"' tailored.json
+
+TAILOR_ID=$(jq -r '.tailor_id' tailored.json)
+curl -s -o cv.docx "$BASE/document/$TAILOR_ID"
+curl -s -o cv.pdf  "$BASE/document/$TAILOR_ID?format=pdf"
+```
+
 **Variants**
+
+JSON only — no files, no cover letter, no LibreOffice involved. This is the
+Phase 1/2 path and stays the default; steps 1–4 above still apply, `documents`
+comes back empty with `render_skipped: "rendering not requested"`:
+
+```bash
+curl -s -X POST localhost:8000/tailor \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -n --arg pid "$PROFILE_ID" --rawfile job job.txt \
+          '{profile_id: $pid, job_post: $job}')" \
+  -o tailored.json
+```
 
 Pin a specific profile version instead of the latest (e.g. to reproduce an
 earlier run after editing the profile):
@@ -298,26 +398,6 @@ curl -s -X POST localhost:8000/tailor \
   -d '{"profile_id":"'"$PROFILE_ID"'","job_post":"Senior Python engineer, FastAPI and PostgreSQL"}' \
   | jq '.tailored_cv.headline'
 ```
-
-Ask for documents and a cover letter, then download them:
-
-```bash
-TAILOR_ID=$(curl -s -X POST localhost:8000/tailor \
-  -H 'Content-Type: application/json' \
-  -d "$(jq -n --arg pid "$PROFILE_ID" --rawfile job job.txt \
-          '{profile_id: $pid, job_post: $job, render: true, cover_letter: true}')" \
-  -o tailored.json -w '' ; jq -r '.tailor_id' tailored.json)
-
-jq -r '.render_skipped // "rendered"' tailored.json
-jq -r '.documents[] | "\(.kind)/\(.format)\t\(.url)"' tailored.json
-
-curl -s -o cv.docx          "localhost:8000/document/$TAILOR_ID"
-curl -s -o cv.pdf           "localhost:8000/document/$TAILOR_ID?format=pdf"
-curl -s -o cover-letter.pdf "localhost:8000/document/$TAILOR_ID?kind=cover_letter&format=pdf"
-```
-
-If `render_skipped` mentions review, inspect the flags as in Step 4 and re-run
-the same command with `render: true, approve_flagged: true`.
 
 If you'd rather not build JSON by hand at all, `GET /` redirects to `/docs`
 (Swagger UI), where `POST /tailor` has a form with the same fields.
