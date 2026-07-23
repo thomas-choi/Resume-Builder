@@ -292,4 +292,30 @@ see in the browser is identical.)*
 | Two-column PDF CVs may extract with interleaved text | Later improvement |
 | Private repos and private org memberships are reachable only when the GitHub token used is the ingested user's own — but you can now supply your own per ingest, so one server serves several people | Resolved (per-request token) |
 | An organization repo you worked on only via a non-default branch, or under a different commit email, may not be recognized as yours | Later improvement (branch-aware contribution probe) |
-| Single-user storage (local JSON files, no accounts) | By design for now |
+| Accounts exist (passwordless sign-up/sign-in by email — see below), but data is **not yet partitioned per account**: everyone still shares one profile/document namespace | In progress — per-user data roots and route enforcement land in Phase 7.c–7.d |
+
+## Accounts (Phase 7.b — passwordless sign-up / sign-in)
+
+You can now create an account and sign in **without a password**. The email
+address *is* your identity — there is no separate username to choose.
+
+- **Sign up** with your first name, last name and email. We email you a proof of
+  receipt: by default a **6-digit code** you type back into the screen, or (if
+  the deployment prefers it) a **magic link** you click. Completing it confirms
+  the address and signs you in.
+- **Sign in** with just your email; the same code-or-link confirms it's you.
+- **No login before you confirm.** An address that started sign-up but never
+  finished it can't be used to sign in — the only way forward is to complete the
+  sign-up it began.
+- To keep the endpoints from revealing who has an account, every sign-up and
+  sign-in reply looks the same; if there's nothing to act on (no account, or one
+  you already finished), the *email* explains what to do next.
+
+**Important caveat for this release:** signing in does **not** yet give you a
+private workspace. The account system is in place, but profiles and documents
+are still shared across everyone using the server — per-account isolation is the
+next step (7.c–7.d). Until then, treat this as a single-user deployment.
+
+*Running locally with no mail server?* The default setup writes each email to a
+file instead of sending it — open the newest file in `data/auth/outbox/` to read
+your code or link (see OPERATIONS.md).

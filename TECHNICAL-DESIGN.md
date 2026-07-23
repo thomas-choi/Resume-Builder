@@ -1142,3 +1142,576 @@ pending). Everything ships in **one Docker container** — now multi-stage:
 a `node:20-slim` stage builds the review UI, and the python:3.11-slim runtime
 (+ `libreoffice-writer` for PDF) serves both it and the API from uvicorn on
 0.0.0.0:8000, with `data/` volume-mounted.
+
+
+## 14. Accounts, passwordless auth and per-user isolation (Phase 7)
+
+> **Status: 7.a + 7.b implemented (2026-07-22); 7.c–7.e still design.** The
+> mailer (§14.9), the account/challenge/session store (§14.3–14.7) and the
+> `/auth/*` routes (§14.5, §14.13) are built and tested — the sign-up/sign-in
+> flow works end to end via the `file` mail backend, with R6 enforced. **Not yet
+> built:** per-user data roots (§14.3 `data/users/{uid}/`), business-route
+> enforcement (§14.8), the migration script (§14.11) and the frontend (§14.12).
+> Until 7.c–7.d land, `/ingest`, `/profile` and `/tailor` are unauthenticated and
+> share one namespace. The rest of §14 is recorded as originally designed so the
+> later steps stay settled ahead of code.
+>
+> **Two deviations from a literal §14, both because their dependency does not
+> exist until 7.c:** (1) `POST /auth/verify` does **not** `mkdir
+> data/users/{uid}/` — creating the per-user root belongs to 7.c, so 7.b's verify
+> creates only the account record + session; (2) `AUTH_ENABLED` /
+> `SINGLE_USER_EMAIL` (§14.10, §14.11) are **not** added in 7.b — they only
+> matter once the stores take a `user_id`, so they arrive with 7.c.
+>
+> **As-implemented notes worth recording:** code-method challenges keep a
+> companion index `challenges/idx-{sha256(email)}.json` mapping the email to its
+> live code lookup, so a *wrong* guess (which hashes to a different,
+> non-existent key) can still find the live challenge to increment `attempts` and
+> burn it — the "`attempts` on that address's live challenge" of §14.4 needs a
+> handle findable without the correct code. A consumed code's index is left in
+> place so a replay resolves to the consumed record and returns `410` rather than
+> `400`. The per-IP send ceiling is a looser multiple of the per-address
+> `AUTH_MAX_SENDS_PER_HOUR`. Tests must set `SESSION_COOKIE_SECURE=false` for the
+> cookie to round-trip over `TestClient`'s `http://`.
+
+Everything up to Phase 6 is **single-user by construction**: `data/profiles/`,
+`data/sources/`, `data/output/` and `data/documents/` are one flat namespace,
+and any caller who knows (or guesses) a `profile_id` or a `tailor_id` gets that
+file. Phase 7 adds identity — sign-up, sign-in, and a data root per account —
+without adding a database, a password store, or a second service.
+
+### 14.1 Requirements and non-goals
+
+| # | Requirement |
+|---|---|
+| R1 | **Sign-up screen** — first name, last name, email address. A verification email is sent; the account becomes usable only after the recipient proves they received it (see R5) |
+| R2 | **Sign-in screen** — email address only (the email *is* the user-id, R4). A one-time verification is emailed; completing it establishes the session |
+| R3 | **Per-user storage** — everything a run generates lives under a per-user root, and no request from user A can read or write user B's files. Neither the root nor any filesystem path is ever exposed over the network |
+| R4 | **The email address is the user-id.** There is no separate handle to choose or remember; a person is their (normalized) email everywhere the system needs identity |
+| R5 | **Two interchangeable proofs of receipt**, chosen by `AUTH_VERIFY_METHOD`: a **6-digit one-time code** typed back into the screen (**default**), or a **magic link** clicked in the mail. Both confirm the address at sign-up *and* authenticate at sign-in |
+| R6 | **No login before confirmation.** An address that signed up but never completed R5 cannot be used to sign in — the only way out of the unverified state is to finish the sign-up it started |
+
+Deliberately **not** in scope, and why:
+
+- **Passwords.** R1/R2/R5 describe an email-ownership proof end to end; adding a
+  password would mean a hashing scheme, a reset flow (which is the same code/link
+  again) and a credential-stuffing surface, for no capability this product
+  needs. Passwordless is the *whole* auth story, not a convenience path over one.
+- **OAuth / SSO providers.** Additive later — the user record gains an
+  `identities` list — and nothing in this design blocks it.
+- **Roles, teams, sharing.** One account owns its own data; there is no grant
+  mechanism and no admin view.
+- **Postgres.** The storage schema (§13) is versioned JSON files and stays that
+  way; §14.3 shows why the two writes that actually race can be made safe with
+  `O_EXCL` and `os.replace` instead of transactions.
+- **Account deletion / export.** Worth doing (`DELETE /auth/me` would be one
+  `shutil.rmtree` of the user root, which is precisely the payoff of rooting
+  storage per user) but out of this phase.
+
+### 14.2 What "cannot access other users' files" means here
+
+The guarantee is **in-process path rooting**, enforced at one place:
+
+> A request's `user_id` comes *only* from its session. It is never read from a
+> path parameter, a query string, a form field or a header. Every filesystem
+> path is built by joining a validated, separator-free id onto that session's
+> root.
+
+The consequence is that there is **no parameter an attacker can vary to reach
+another user's root** — the traversal-style defenses (`_PROFILE_ID_RE`,
+`validate_tailor_id`) stop being the thing standing between two users and become
+defense in depth against a malformed id inside one user's own tree.
+
+**The path is never web-reachable (R3).** No endpoint returns a filesystem path:
+`GET /document/{tailor_id}` streams bytes through `FileResponse`, never the
+location, and the static mount serves only `frontend/dist`, never `data/`. The
+account's on-disk directory is `sha256(email)` (§14.3), so the address itself
+appears in no directory name, no log line and no backup filename — the path a
+person's files live at is neither guessable from the outside nor derivable from
+anything the network sees.
+
+What this does *not* claim, stated plainly so nobody assumes otherwise:
+
+- **No OS-level isolation.** One container, one UID, one `data/` volume. Anyone
+  with a shell in the container or access to the host volume reads every
+  account. Per-user encryption is a different project.
+- **The mailbox is the credential.** Whoever controls the inbox controls the
+  account — the standard passwordless trade-off. Short TTLs and single-use
+  codes/links bound the window; they do not change that fact.
+- **Not multi-tenant hardening.** No per-user quotas, no noisy-neighbour limits
+  on LLM spend beyond the existing global caps.
+
+### 14.3 Storage layout
+
+The email is the identity, but it is **never** the directory name. Define the
+storage handle once — `uid = sha256(normalize(email))` — and everything on disk
+uses `uid`, a 64-char hex string:
+
+```
+data/
+├── auth/                              # NEW — the account system's own store
+│   ├── users/{uid}.json               # User record (see 14.4); uid = sha256(email)
+│   ├── challenges/{lookup}.json       # code/link record; filename IS the lookup key
+│   ├── sessions/{sha256(cookie)}.json
+│   └── outbox/                        # dev EMAIL_BACKEND=file drops .eml here
+└── users/{uid}/                       # NEW — one root per account
+    ├── profiles/{profile_id}/v1.json, latest
+    ├── sources/{run_id}/...
+    ├── output/{run_id}/output.json
+    └── documents/{tailor_id}/...
+```
+
+Inside `users/{uid}/`, the tree is **byte-for-byte the §13 schema**. That is
+the point: `profile_store`, `run_store` and `document_store` change only in how
+they compute their root, not in what they write, so the ingestion, tailoring,
+rendering and review code is untouched by Phase 7.
+
+Three layout decisions worth recording:
+
+- **The email is the user-id (R4), but `sha256(email)` is the folder.** The
+  requirement is "the email is the user-id" and "files under `/data/{user_id}`";
+  taken literally that is `data/users/twmchoi2010@gmail.com/`, which is *legal*
+  on Linux but wrong in three ways: it stamps the person's address into every
+  path, log line and backup filename (violating R3's "path never exposed" and
+  leaking PII); it makes case a silent footgun (`A@x.com` vs `a@x.com`); and an
+  address can contain characters (`+`, `.`, and in the local part almost
+  anything) that are awkward-to-dangerous as a path. So the *logical* id — what
+  the user types, what sign-in matches on, what a session carries — is the
+  normalized email, and the *physical* handle is its SHA-256. The email is still
+  the user-id in every sense that matters to a user; it simply never touches the
+  filesystem. `uid` is `^[0-9a-f]{64}$` by construction, so it is structurally
+  incapable of being a reserved name or holding a separator — a stronger
+  guarantee than validating a free-form id.
+- **`data/users/{uid}/…`, not `data/{uid}/…`.** A bare `data/{uid}/` would share
+  a namespace with the existing `profiles/`, `sources/`, `output/`, `documents/`
+  and the new `auth/`; the `users/` prefix costs one path segment and makes
+  "list all accounts" and "delete this account" unambiguous.
+- **The user record file is itself the uniqueness claim** — no separate email
+  index. Because `uid` is a pure function of the email, `open(auth/users/{uid}
+  .json, "x")` (`O_CREAT|O_EXCL`, atomic at the filesystem) *is* the account
+  claim: two concurrent sign-ups for one address race on that create and exactly
+  one wins with `FileExistsError`; the loser is handled as "account exists". No
+  lock, no read-modify-write, and no second file to keep consistent.
+  Normalization is `strip().lower()` only: gmail-style dot/plus folding is
+  deliberately **not** applied — treating `a.b@gmail.com` and `ab@gmail.com` as
+  one account surprises users and is wrong for every non-Gmail domain.
+
+Every write is atomic: temp file in the same directory + `os.replace()`. Every
+read of a token/session tolerates a missing file (expired-and-swept) as "not
+found" rather than an error.
+
+### 14.4 Data model (`src/models/schemas.py`)
+
+```python
+class User(BaseModel):
+    email: EmailStr                 # normalized (strip().lower()) — this IS the user-id (R4)
+    display_email: str              # as typed, for showing back
+    first_name: str
+    last_name: str
+    email_verified: bool = False    # False until R5 is completed; gates login (R6)
+    created_at: datetime
+    verified_at: datetime | None = None
+    last_login_at: datetime | None = None
+
+class Challenge(BaseModel):         # stored at auth/challenges/{lookup}.json
+    email: str                      # the user-id it proves
+    purpose: Literal["signup", "signin"]
+    method: Literal["code", "link"]
+    attempts: int = 0               # code only; link is single-shot by construction
+    created_at: datetime
+    expires_at: datetime
+    consumed_at: datetime | None = None
+
+class Session(BaseModel):           # stored at auth/sessions/{sha256(raw_cookie)}.json
+    email: str                      # the user-id
+    created_at: datetime
+    expires_at: datetime
+    last_seen_at: datetime
+```
+
+Request/response models: `SignUpRequest(first_name, last_name, email)`,
+`SignInRequest(email)`, `VerifyRequest(email, code=None, token=None)`, and
+`UserPublic(email, first_name, last_name)` for `GET /auth/me`. `EmailStr` adds
+`email-validator` to `requirements.txt` — worth one dependency to stop malformed
+addresses at the schema boundary rather than at the SMTP server.
+
+**Neither the raw code nor the raw link-token is ever stored** — only a hash is,
+and the hash *is* the filename, so verification is an O(1) lookup with nothing to
+time-attack and a leaked `data/` directory yields no usable credentials. The two
+methods differ only in what gets hashed into `{lookup}`:
+
+- **link** — `token = secrets.token_urlsafe(32)`; `lookup = sha256(token)`. High
+  entropy, so the token alone identifies the record.
+- **code** — `code = f"{secrets.randbelow(1_000_000):06d}"`; `lookup =
+  sha256(email + ":" + code)`. Six digits is only 10⁶ possibilities, so the code
+  is **scoped to the email**: a guesser must target one known address, and
+  `attempts` on that address's live challenge is capped at
+  `AUTH_MAX_CODE_ATTEMPTS` (default 5) before the challenge is burned and a new
+  one required. 5 / 10⁶ per issued code, plus the per-address send limit
+  (§14.9), keeps a brute force far below one success.
+
+`purpose` binds a challenge to its flow: a sign-up proof presented to the
+sign-in path (or vice versa) is rejected even while unexpired — without it, one
+flow's credential is a bearer token for the other. `method` is likewise checked,
+so a code cannot be replayed through the link path. Session cookies are the same
+opaque-random-stored-as-hash construction as the link token.
+
+### 14.5 The two flows
+
+Both flows are the same machinery — mint a challenge, mail it, verify it, open a
+session — differing in what verifying it *means*: sign-up also flips
+`email_verified` and is the moment the account root is created. The diagram shows
+the **code** method (the default); the **link** method is identical except the
+mail carries a URL instead of a number and §14.6 covers what changes.
+
+```mermaid
+sequenceDiagram
+    participant B as Browser (SignUpPanel)
+    participant A as FastAPI /auth
+    participant S as data/auth/*
+    participant M as Mailer
+    B->>A: POST /auth/signup {first_name, last_name, email}
+    A->>S: create users/{uid}.json via open(...,"x")
+    alt address is free
+        S-->>A: claimed (email_verified=false)
+        A->>S: write challenge purpose=signup, method=code
+        A->>M: "Your code is 481920" (expires in SIGNUP_TTL)
+    else exists but NOT verified
+        A->>S: replace with a fresh signup challenge
+        A->>M: "Finish signing up — your code is …"
+    else exists AND verified
+        A->>M: "You already have an account — sign in here"
+    end
+    A-->>B: 202 status=sent (identical in all three branches)
+    B->>B: user reads the code from their inbox, types it in
+    B->>A: POST /auth/verify {email, code}
+    A->>S: lookup challenges/{sha256(email:code)}; check purpose/method/expiry/attempts
+    A->>S: mark consumed; set email_verified=true, verified_at
+    A->>S: mkdir data/users/{uid}/
+    A->>S: write sessions/{sha256(c)}
+    A-->>B: 200 {user} + Set-Cookie: rb_session=c; HttpOnly; SameSite=Lax
+```
+
+Sign-in is the same machinery with `purpose=signin`, a short TTL, no account
+creation, and **three** branches — the middle one is what enforces R6:
+
+- **No account for this address** → still `202`, and mail "there is no account
+  here, sign up". Uniform responses keep the endpoint from being an account
+  oracle; the explanatory mail keeps that uniformity from stranding someone who
+  mistyped their address.
+- **Account exists but is unverified** → still `202`, but the challenge minted is
+  a **`purpose=signup`** one ("finish signing up first"), *never* a `signin`
+  credential. This is R6 made concrete: an unverified address can obtain no proof
+  that logs it in — the only proof it can get completes the sign-up it abandoned,
+  and completing that is what flips `email_verified`. There is no dead-end and no
+  way to log in around the unfinished sign-up.
+- **Account exists and is verified** → the normal `signin` challenge.
+
+All three return an identical `202`. Belt to that: `POST /auth/verify` re-checks
+`email_verified` before honouring a `signin` challenge, so even a mis-minted one
+cannot bypass R6.
+
+### 14.6 The magic-link method, and three details easy to get wrong
+
+`AUTH_VERIFY_METHOD=link` swaps the six-digit code for a clicked URL. Everything
+above is unchanged except the mail body and the verify request (`{token}` instead
+of `{email, code}`). It exists because a link is one tap on the phone that holds
+the inbox, where a code makes the user copy digits between apps; the code is the
+default because it works when the mail is read on a *different* device from the
+browser session (the code is typed into whichever tab is waiting) and needs no
+deep-link handling at all. Three things the link must get right — none of which
+the code method has to worry about:
+
+- **The link is consumed by a `POST`, not by the `GET` that opens it.** A
+  `GET /auth/verify?token=…` is the obvious design and it breaks in the real
+  world: Outlook Safe Links, corporate mail gateways, antivirus proxies and
+  chat-app preview fetchers all retrieve URLs found in mail, and any of them
+  burns a single-use token before the human clicks. So the link opens a *page*,
+  and that page issues `POST /auth/verify`. A scanner that fetches HTML and does
+  not execute the app's JS cannot consume the token. (A typed code is immune —
+  no scanner types it.)
+- **The token travels in the URL fragment: `{PUBLIC_BASE_URL}/#/verify?token=…`.**
+  Everything after `#` is never sent to the server, so the token cannot land in
+  an access log, a proxy log, or a `Referer` header. It also solves deep-linking
+  for free: the built UI is served by `StaticFiles(html=True)`, which has no SPA
+  fallback, so a real path like `/verify` would 404 — hash routing needs no
+  server change at all. The verify screen calls
+  `history.replaceState` to clear the fragment once it has the token in memory,
+  so a shared screenshot or a back-button leaves nothing behind.
+- **`PUBLIC_BASE_URL` is configuration, never derived from the request.** Building
+  the link from the `Host` header lets an attacker with a forged `Host` receive a
+  link that points at their own server. It is set explicitly (defaulting to
+  `http://localhost:8000`), and a deployment that forgets it sends broken links
+  rather than poisoned ones. (`PUBLIC_BASE_URL` is still used by the code method
+  for the "you already have an account — sign in here" mail, just not on the hot
+  path.)
+
+### 14.7 Sessions
+
+An opaque `secrets.token_urlsafe(32)` in an **HttpOnly cookie**, with the record
+server-side under its hash.
+
+| Attribute | Value | Why |
+|---|---|---|
+| `HttpOnly` | on | XSS in the review UI cannot read the session |
+| `SameSite` | `Lax` | Blocks cross-site `POST`s outright — which matters because `POST /ingest` is `multipart/form-data`, a "simple request" a cross-origin form can send without a preflight |
+| `Secure` | `SESSION_COOKIE_SECURE`, default on | Off only for local `http://localhost` development |
+| `Path` | `/` | The UI and API share one origin (§10) |
+| `Max-Age` | `SESSION_TTL_S`, default 14 days | Sliding: `last_seen_at` refreshes on use, and the cookie is re-issued once past half-life |
+
+Server-side records (rather than a signed/JWT cookie) buy **revocation**:
+`POST /auth/signout` deletes the file and the cookie is instantly worthless, and
+a compromised account can be cut off by clearing `auth/sessions/`.
+
+A cookie is also the only option that works for the existing SSE endpoint:
+`EventSource` cannot set an `Authorization` header, but it does send same-origin
+cookies — so `GET /ingest/{job_id}/events` authenticates exactly like every
+other route, with no token-in-query-string workaround.
+
+Belt to `SameSite`'s braces: unsafe methods assert that `Origin` (when present)
+matches `PUBLIC_BASE_URL`. Rejected as the *primary* defense because reverse
+proxies and native clients make `Origin` unreliable; kept as a cheap second gate.
+
+### 14.8 Enforcement — one dependency, fail-closed
+
+```mermaid
+flowchart TD
+    R[Request] --> C{rb_session cookie?}
+    C -- no --> U[401 unauthenticated]
+    C -- yes --> L[load auth/sessions/sha256]
+    L -- missing/expired --> U
+    L -- valid --> USR["session -> email (the user-id)"]
+    USR --> ROOT["root = DATA_DIR/users/sha256(email)"]
+    ROOT --> ID{"path id matches [A-Za-z0-9_-]{1,64}?"}
+    ID -- no --> B4[400]
+    ID -- yes --> J["p = root / kind / id  (resolve + is_relative_to root)"]
+    J --> E{exists under this root?}
+    E -- no --> NF[404 — same answer whether it never existed<br/>or belongs to someone else]
+    E -- yes --> OK[handler runs]
+```
+
+Shape of the change:
+
+- **`src/api/deps.py`** — `current_user(request) -> User`, raising `401`. The
+  stores take the user's `email` (the user-id) and derive the handle themselves.
+- **Two routers.** The existing business routes move onto
+  `APIRouter(dependencies=[Depends(current_user)])`, so **a route added later is
+  protected unless someone opts it out** — the opposite of decorating each
+  handler, where the failure mode of forgetting is an open endpoint. A second,
+  unauthenticated router carries `/healthz` and `/auth/*` only.
+- **Store signatures gain the user (email) first**: `profile_store.save_profile(
+  email, profile, profile_id=None)`, `run_store.sources_dir(email, run_id)`,
+  `document_store.document_dir(email, tailor_id)`, and so on. A required
+  positional argument means every existing call site is a **type error until
+  updated** — a store that defaulted to a global root would let a missed call
+  site silently write into the shared tree.
+- **`config.user_root(email)`** is the single place `DATA_DIR/"users"/uid` is
+  spelled: it normalizes the email, computes `uid = sha256(...)`, asserts it
+  against `^[0-9a-f]{64}$` (belt-and-braces — a hash always matches), and returns
+  the path. A `_within(root, path)` helper (`Path.resolve()` + `is_relative_to`)
+  is asserted by each store before it opens anything.
+- **`404`, never `403`**, for an id that exists under another root. A `403`
+  confirms the id is real and turns the endpoint into an enumeration oracle.
+
+Three places where isolation is *not* a filesystem path, and would be missed by
+a purely storage-focused change:
+
+1. **The SSE job registry** (`jobs`, an in-process `dict[job_id, Queue]`) is
+   keyed by a client-supplied `job_id`. Unchanged, any signed-in user can
+   subscribe to another user's ingest and watch its node-by-node progress. The
+   registry entry gains an owner and `/ingest/{job_id}/events` 404s for anyone
+   else.
+2. **The tailoring checkpointer's `thread_id`** is the `tailor_id`, so a guessed
+   id could resume someone else's paused, human-review run. Namespaced to
+   `f"{uid}:{tailor_id}"`.
+3. **Logs.** `set_run_id` gains a companion `set_user`, which records the
+   **`uid`** (the `sha256(email)` handle), *not* the address — because the
+   user-id is now the email (PII), the pseudonymous handle used for attribution
+   has to be the hash. Codes, link tokens, session cookies and raw email
+   addresses are never logged; `uid` is the safe handle for support work, and it
+   ties a log line back to an account without a single line of the file holding
+   the person's email.
+
+### 14.9 Email delivery (`src/utils/mailer.py`)
+
+One protocol, `send(to, subject, text, html) -> None`, and three backends chosen
+by `EMAIL_BACKEND`:
+
+| Backend | Behaviour | Intended for |
+|---|---|---|
+| `file` (**default**) | Writes a complete `.eml` into `data/auth/outbox/` | Local dev and tests — the entire sign-up/sign-in flow is exercisable with no mail server; OPERATIONS.md will document "open the newest file in the outbox and read the code (or click the link)" |
+| `console` | Logs subject + code/link at INFO | Container demos |
+| `smtp` | stdlib `smtplib` over STARTTLS, run in a worker thread via `anyio.to_thread.run_sync` | Production |
+
+Stdlib `smtplib` in a thread rather than adding `aiosmtplib`: this is one small
+message per human action, never a batch, so the async client's benefit is
+theoretical while the dependency is real. The existing code already uses
+`anyio`/threads for the blocking graph runs, so the pattern is not new here.
+
+Send failures are **reported, not swallowed**: `502` with "could not send the
+email, try again". A `202` on a failed send leaves the user waiting for mail
+that will never arrive, which is the worst outcome in a flow whose only feedback
+channel is that mail. The minted challenge stays valid; a retry mints another.
+
+**Rate limiting** — at most `AUTH_MAX_SENDS_PER_HOUR` (default 5) challenges
+sent per address, and a per-IP ceiling, so the endpoint cannot be used to
+mailbomb a third party or to farm codes/links. This bound is what makes the
+six-digit code safe alongside the per-challenge `AUTH_MAX_CODE_ATTEMPTS` cap: an
+attacker gets at most `5 × 5 = 25` guesses an hour against a chosen address's
+10⁶ space. In-process counters are adequate for the single-container deployment
+(§10); a multi-replica deployment needs shared state, and that limitation is
+noted rather than pre-solved.
+
+### 14.10 Configuration (`src/config.py`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTH_ENABLED` | `true` | `false` runs the legacy single-user mode (§14.11) |
+| `SINGLE_USER_EMAIL` | `local@localhost` | The account used when auth is off; its `uid` roots the legacy data |
+| `AUTH_VERIFY_METHOD` | `code` | `code` (6-digit OTP) \| `link` (magic link) — R5 |
+| `VERIFY_CODE_LENGTH` | `6` | Digits in the OTP |
+| `AUTH_MAX_CODE_ATTEMPTS` | `5` | Wrong-code tries before a challenge is burned |
+| `PUBLIC_BASE_URL` | `http://localhost:8000` | Base for magic links + the "sign in here" mail — never derived from `Host` |
+| `SESSION_COOKIE_NAME` | `rb_session` | |
+| `SESSION_TTL_S` | `1209600` (14 d) | Sliding |
+| `SESSION_COOKIE_SECURE` | `true` | Set `false` for local http |
+| `SIGNUP_TTL_S` | `1800` (30 min) | Sign-up code/link lifetime |
+| `SIGNIN_TTL_S` | `900` (15 min) | Sign-in code/link lifetime |
+| `AUTH_MAX_SENDS_PER_HOUR` | `5` | Challenges emailed per address |
+| `EMAIL_BACKEND` | `file` | `file` \| `console` \| `smtp` |
+| `EMAIL_FROM` | `no-reply@localhost` | |
+| `EMAIL_OUTBOX_DIR` | `./data/auth/outbox` | `file` backend |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_STARTTLS` / `SMTP_TIMEOUT_S` | — / `587` / — / — / `true` / `10` | `smtp` backend; credentials via `.env`, never committed |
+
+The two TTLs are both short because either proof — a typed code or a clicked
+link — is an at-the-keyboard action used within minutes; sign-up gets the more
+generous 30 minutes only to survive a slow mail hop, not because it is confirmed
+"later" (with a code there is no reading it hours afterwards). A challenge older
+than its TTL verifies to `410`, and the screen offers to send a fresh one.
+
+### 14.11 Backward compatibility and migration
+
+`AUTH_ENABLED=false` keeps every existing workflow (and the integration tests)
+running: `current_user` returns a synthetic verified account for
+`SINGLE_USER_EMAIL` instead of reading a cookie, and the frontend's `AuthGate`
+sees `GET /auth/me` succeed and renders the three panels directly. Crucially the
+**storage path is identical** — that account still reads and writes
+`data/users/{sha256(SINGLE_USER_EMAIL)}/…`, so there is exactly one code path
+through the stores and the auth-off mode cannot drift into being the untested
+one.
+
+Existing data is moved by `scripts/migrate_to_users.py --email you@example.com`:
+create the account (verified), compute `uid = sha256(normalize(email))`, then
+`os.replace` `data/{profiles,sources,output,documents}` into
+`data/users/{uid}/`. Idempotent, refuses to run if the target root is non-empty,
+and prints the email→uid mapping. A rename within one filesystem means it is
+instant and reversible; nothing is copied or rewritten, because the per-user
+tree is deliberately the same schema.
+
+### 14.12 Frontend (`frontend/src/`)
+
+| Component | Responsibility |
+|---|---|
+| `AuthGate` (wraps `App`) | `GET /auth/me` via TanStack Query. `401` → renders the auth screens; success → the existing panels, with the user's name and a Sign out button in the header |
+| `SignUpPanel` | First name, last name, email → `POST /auth/signup` → advances to `VerifyPanel` in **code** mode (the email is remembered so the code can be posted with it), or "check your inbox" in **link** mode |
+| `SignInPanel` | Email → `POST /auth/signin` → same as sign-up: on to the code entry, or "check your inbox". Identical confirmation copy in every branch, so the screen leaks no more than the API does |
+| `VerifyPanel` | **Code mode:** a 6-digit input; `POST /auth/verify {email, code}`; on `410`/attempts-exhausted, offers "send me a new code"; the remembered email means no re-typing. **Link mode:** rendered when the hash route is `#/verify`; reads `token`, clears the fragment, `POST /auth/verify {token}`, offers "send me a new link" on `410`. Either way, success hands off to the app |
+
+`lib/api.ts` sends `credentials: "same-origin"` and grows one rule: a `401` from
+any call clears the query cache and drops to `AuthGate`'s signed-out state, so a
+session expiring mid-session surfaces as the sign-in screen rather than as a
+row of failed panels. This composes with the Phase 6.c rule that a *failed
+refresh* must not erase loaded data — a `401` is precisely the case where
+erasing it is correct, and the two are distinguished by status, not by
+guesswork.
+
+Sign out is destructive to on-screen state, so it reuses Phase 6.a's mechanism:
+`POST /auth/signout`, then bump `sessionKey` and `queryClient.clear()` — the
+same remount that "Clear everything" performs, for the same reason (no stale
+panel may outlive the identity it was rendered for).
+
+The existing vitest suites all render panels that will now sit behind the gate;
+`testUtils.tsx` gains a default `GET /auth/me` stub so they keep testing what
+they were written to test.
+
+### 14.13 API surface (detail lands in API-REFERENCE.md when built)
+
+| Method | Path | Auth | Returns |
+|---|---|---|---|
+| `POST` | `/auth/signup` | — | `202 {"status":"sent","method":"code"\|"link"}` — identical for a free, unverified-existing or verified-existing address |
+| `POST` | `/auth/signin` | — | `202 {"status":"sent","method":…}` — identical across no-account / unverified / verified |
+| `POST` | `/auth/verify` | — | body `{email, code}` (code mode) or `{token}` (link mode) → `200 {user}` + `Set-Cookie`; `400` unknown/wrong-purpose/wrong-method, `410` expired, consumed, or attempts exhausted |
+| `GET` | `/auth/me` | session | `200 {user}` / `401` |
+| `POST` | `/auth/signout` | session | `204`, session record deleted, cookie cleared |
+| *all existing routes* | | session | `401` without one; ids resolve under the session's root only |
+
+`method` is echoed so the frontend knows whether to show a code box or an
+"inbox" message without re-reading config. `410 Gone` distinguishes "this
+proof was real but is spent/expired/exhausted" from `400` "this is not a
+challenge we issued" — the first deserves a "send me a new one" button, the
+second deserves suspicion, and collapsing them makes the common case (a code
+typed twice, a link clicked twice) look like an attack.
+
+### 14.14 Test plan
+
+*Python unit (all mail and LLM calls mocked, no network):*
+
+- **Challenges** — expired rejected (`410`); consumed rejected on the second use;
+  a `signup` proof rejected on the sign-in path and vice versa; a `code`
+  presented through the link path (and vice versa) rejected; an unknown or
+  tampered code/token rejected (`400`); neither the raw code nor the raw token
+  ever appears in `data/auth/`.
+- **Code method** — the wrong code increments `attempts` and after
+  `AUTH_MAX_CODE_ATTEMPTS` the challenge is burned (`410`) so the right code no
+  longer works until a new one is sent; the `sha256(email:code)` lookup means one
+  address's code cannot verify another's; the send limit caps codes per hour.
+- **Sign-up** — a second sign-up for a *verified* address creates no second
+  account, returns the same `202`, and mails "you already have an account"; a
+  second sign-up for an *unverified* address re-sends a fresh signup challenge;
+  the `O_EXCL` record claim is exercised concurrently; verifying flips
+  `email_verified` and creates the user root.
+- **Sign-in / R6** — unknown address returns `202` and emits the "no account"
+  mail; an **unverified** account returns the same `202` but is minted a
+  *signup* challenge, and no sequence of sign-in + verify produces a session for
+  it until the sign-up is completed; a verified account signs in normally; and
+  `POST /auth/verify` refuses a hand-crafted `signin` challenge whose account is
+  unverified.
+- **Isolation (the R3 suite)** — with two accounts and a fixture profile in
+  each: A's `GET /profile/{B_id}` → `404`; likewise `PUT /profile`,
+  `GET /document/{B_tailor}`, `GET /tailor/{B}/review`,
+  `POST /tailor/{B}/resume`, and `GET /ingest/{B_job}/events`; ids containing
+  `../`, absolute paths and URL-encoded separators are rejected; after a full
+  ingest+tailor as A, nothing exists outside `data/users/{A}/`.
+- **Sessions** — cookie flags; expired session → `401`; sign-out revokes;
+  an unauthenticated call to every business route → `401` (parametrized over
+  the router's route table, so a newly added unprotected route fails the suite).
+- **Mailer** — the `file` backend writes an `.eml` containing the code (or link); the
+  `smtp` backend is driven against a mocked `smtplib.SMTP`; a send failure
+  surfaces as `502`.
+- **Migration** — the script moves a populated legacy tree, is idempotent, and
+  refuses a non-empty target.
+
+*Vitest:* signed-out renders the auth screen and no panels; sign-up validates
+its three fields; in **code** mode the verify screen posts `{email, code}` with
+the remembered email and shows "send me a new code" on `410`; in **link** mode
+it posts the token from the hash and clears the fragment; a mid-session `401`
+drops to sign-in while a *network* failure still keeps the loaded profile (the
+Phase 6.c behaviour must survive).
+
+### 14.15 Build order
+
+1. **7.a** — `mailer.py` + config + the `file` backend, with tests. Nothing else
+   works without a testable way to send mail.
+2. **7.b** — the auth store (`src/utils/auth_store.py`): the `uid = sha256(email)`
+   identity, the challenge (code + link) and session lifecycles, and the
+   `/auth/*` routes with R6 enforced; still no enforcement on business routes.
+3. **7.c** — per-user roots: store signatures take `email`, `config.user_root`,
+   the migration script, `AUTH_ENABLED=false` path. Business routes still open.
+4. **7.d** — flip enforcement on (router-level dependency), the SSE-owner and
+   `thread_id` fixes, the R3 isolation suite.
+5. **7.e** — `AuthGate`, `SignUpPanel`/`SignInPanel`/`VerifyPanel` (code + link
+   modes), `api.ts` `401` handling, vitest.
+
+7.c before 7.d is the ordering that matters: moving the data while every route
+is still reachable makes the migration verifiable on its own, and the flip in
+7.d then has exactly one thing to prove.

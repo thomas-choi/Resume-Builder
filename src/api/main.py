@@ -7,6 +7,7 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from src import config
+from src.api.auth_routes import auth_router
 from src.api.routes import router
 from src.utils.logging_setup import setup_logging
 
@@ -22,6 +23,9 @@ def create_app() -> FastAPI:
     )
     app = FastAPI(title="Resume Builder", version="0.1.0")
     app.include_router(router)
+    # Passwordless account routes (Phase 7.b), unauthenticated. Included before
+    # the "/" static mount so /auth/* wins over the SPA fallback.
+    app.include_router(auth_router)
 
     # The review UI is one container with the API (design doc §10): a built
     # frontend is served from `/`, so the browser talks to same-origin paths and

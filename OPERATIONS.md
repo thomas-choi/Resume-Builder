@@ -67,6 +67,60 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `RENDER_PDF` | no | `true` | Whether to convert each rendered `.docx` to PDF with headless LibreOffice. `false` → `.docx` only, no subprocess call |
 | `LIBREOFFICE_BIN` | no | `soffice` | The headless converter binary. Installed in the Docker image (`libreoffice-writer`); if it is missing or fails locally the PDF is skipped with a WARNING and the `.docx` is still returned |
 | `LIBREOFFICE_TIMEOUT_S` | no | `120` | Per-conversion timeout; on timeout the PDF is skipped, never the run |
+| `EMAIL_BACKEND` | no | `file` | Mail delivery (Phase 7). `file` drops a complete `.eml` in the outbox (see below); `console` logs the code/link; `smtp` sends for real |
+| `EMAIL_FROM` | no | `no-reply@localhost` | `From:` address on auth mail |
+| `EMAIL_OUTBOX_DIR` | no | `./data/auth/outbox` | Where the `file` backend writes `.eml` files |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_STARTTLS` / `SMTP_TIMEOUT_S` | no | — / `587` / — / — / `true` / `10` | `smtp` backend only; a login is sent only when `SMTP_USER` is set. Credentials via `.env`, never committed |
+| `AUTH_VERIFY_METHOD` | no | `code` | `code` (6-digit OTP typed back) or `link` (magic link) |
+| `VERIFY_CODE_LENGTH` | no | `6` | Digits in the OTP |
+| `AUTH_MAX_CODE_ATTEMPTS` | no | `5` | Wrong-code tries before a challenge is burned |
+| `PUBLIC_BASE_URL` | no | `http://localhost:8000` | Base for magic links + the "sign in here" mail — **never** derived from the `Host` header (a forged `Host` would poison the link) |
+| `SESSION_COOKIE_NAME` | no | `rb_session` | Session cookie name |
+| `SESSION_COOKIE_SECURE` | no | `true` | `Secure` flag on the cookie; set `false` only for local `http://` |
+| `SESSION_TTL_S` | no | `1209600` | Session lifetime (14 days), sliding on use |
+| `SIGNUP_TTL_S` / `SIGNIN_TTL_S` | no | `1800` / `900` | Sign-up / sign-in challenge lifetimes |
+| `AUTH_MAX_SENDS_PER_HOUR` | no | `5` | Challenges emailed per address per hour (mailbomb / code-farming bound) |
+
+> Phase 7.b ships the auth **flow** only; the business routes are not yet behind
+> it (that is 7.d). `AUTH_ENABLED` / `SINGLE_USER_EMAIL` arrive with per-user
+> roots in 7.c.
+
+**Reading a verification code/link with no mail server.** With the default
+`EMAIL_BACKEND=file`, every auth mail is written as a complete `.eml` under
+`EMAIL_OUTBOX_DIR` (default `./data/auth/outbox/`), timestamped so the **newest
+sorts last**. To complete a sign-up/sign-in locally, open the newest file there
+and read the 6-digit code (or click the link):
+
+```bash
+ls -t data/auth/outbox/*.eml | head -1 | xargs cat
+```
+
+**Sending real mail via Gmail SMTP.** Set `EMAIL_BACKEND=smtp` and point it at
+Gmail's submission endpoint. Gmail does **not** accept your normal account
+password over SMTP — you must enable 2-Step Verification on the Google account
+and generate a 16-character **App Password**
+([myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)),
+then use that as `SMTP_PASSWORD`:
+
+```dotenv
+EMAIL_BACKEND=smtp
+EMAIL_FROM=you@gmail.com          # Gmail rewrites From to the authenticated user
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587                     # submission port; our mailer upgrades with STARTTLS
+SMTP_STARTTLS=true
+SMTP_USER=you@gmail.com
+SMTP_PASSWORD=abcd efgh ijkl mnop # the App Password (spaces optional), NOT your login password
+SMTP_TIMEOUT_S=10
+```
+
+Notes:
+- Port `587` + STARTTLS is the path this mailer implements; the SSL-on-connect
+  port `465` is **not** supported (it needs `SMTP_SSL`, which the mailer does not
+  use).
+- Keep `SMTP_PASSWORD` in `.env` only — it is a credential; never commit it. If
+  the App Password leaks, revoke it from the same Google page and mint a new one.
+- Gmail free accounts cap at ~500 recipients/day, which is ample for one code per
+  sign-in but not for bulk mail.
 
 Secrets live in `.env` (gitignored) and are loaded via `python-dotenv`; never
 commit or hardcode them.

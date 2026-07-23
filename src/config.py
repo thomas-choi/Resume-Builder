@@ -101,6 +101,44 @@ FRONTEND_DIR: Path = Path(os.getenv("FRONTEND_DIR", "./frontend/dist"))
 # the image. A missing dir degrades gracefully to inline-prompt behavior.
 SKILLS_DIR: Path = Path(os.getenv("SKILLS_DIR", "./skills"))
 
+# Accounts / passwordless auth (Phase 7). 7.a adds only the mail rows; the
+# auth-flow rows (verify method, TTLs, session cookie, rate limit) arrive with
+# 7.b. `AUTH_ENABLED` / `SINGLE_USER_EMAIL` are deliberately deferred to 7.c —
+# they only matter once the stores take a per-user root.
+
+
+def _flag(name: str, default: str = "true") -> bool:
+    """Parse a boolean env var the same way as RENDER_PDF."""
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Mail delivery (§14.9). `file` (default) drops a complete .eml into the outbox
+# so the whole sign-up/sign-in flow is exercisable with no SMTP server;
+# `console` logs the code/link; `smtp` sends for real via stdlib smtplib.
+EMAIL_BACKEND: str = os.getenv("EMAIL_BACKEND", "file")
+EMAIL_FROM: str = os.getenv("EMAIL_FROM", "no-reply@localhost")
+EMAIL_OUTBOX_DIR: Path = Path(os.getenv("EMAIL_OUTBOX_DIR", "./data/auth/outbox"))
+SMTP_HOST: str | None = os.getenv("SMTP_HOST")
+SMTP_PORT: int = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER: str | None = os.getenv("SMTP_USER")
+SMTP_PASSWORD: str | None = os.getenv("SMTP_PASSWORD")
+SMTP_STARTTLS: bool = _flag("SMTP_STARTTLS", "true")
+SMTP_TIMEOUT_S: int = int(os.getenv("SMTP_TIMEOUT_S", "10"))
+
+# Auth flow (§14.10). Added in 7.b; NOT AUTH_ENABLED/SINGLE_USER_EMAIL (7.c).
+AUTH_VERIFY_METHOD: str = os.getenv("AUTH_VERIFY_METHOD", "code")  # code | link
+VERIFY_CODE_LENGTH: int = int(os.getenv("VERIFY_CODE_LENGTH", "6"))
+AUTH_MAX_CODE_ATTEMPTS: int = int(os.getenv("AUTH_MAX_CODE_ATTEMPTS", "5"))
+# Base for magic links + the "you already have an account" mail. Never derived
+# from the request Host header (a forged Host would point the link elsewhere).
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
+SESSION_COOKIE_NAME: str = os.getenv("SESSION_COOKIE_NAME", "rb_session")
+SESSION_COOKIE_SECURE: bool = _flag("SESSION_COOKIE_SECURE", "true")
+SESSION_TTL_S: int = int(os.getenv("SESSION_TTL_S", "1209600"))  # 14 days, sliding
+SIGNUP_TTL_S: int = int(os.getenv("SIGNUP_TTL_S", "1800"))  # 30 min
+SIGNIN_TTL_S: int = int(os.getenv("SIGNIN_TTL_S", "900"))  # 15 min
+AUTH_MAX_SENDS_PER_HOUR: int = int(os.getenv("AUTH_MAX_SENDS_PER_HOUR", "5"))
+
 # Logging: level name (DEBUG/INFO/WARNING/ERROR); unset LOG_FILE = console only
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE: Path | None = Path(os.environ["LOG_FILE"]) if os.getenv("LOG_FILE") else None

@@ -655,10 +655,62 @@ paused — a `review.json` copy of the items the person was shown. The same URL
 keeps working after a restart. There is no listing or deletion endpoint yet —
 the `documents` array in the tailor response is the index.
 
+## Accounts & passwordless auth (`/auth/*`, Phase 7.b)
+
+Email-only, passwordless sign-up/sign-in (design doc §14). The email address is
+the user-id; a proof of receipt — a **6-digit code** typed back (default) or a
+**magic link** clicked, chosen by `AUTH_VERIFY_METHOD` — confirms the address at
+sign-up and authenticates at sign-in. A successful `verify` sets an HttpOnly
+session cookie (`SESSION_COOKIE_NAME`, default `rb_session`).
+
+> **Scope (7.b):** the `/auth/*` flow works end to end (via the `file` mail
+> backend by default — read the newest `.eml` in `data/auth/outbox/`), but the
+> business routes (`/ingest`, `/profile`, `/tailor`, …) are **not yet
+> authenticated and still share one namespace** — that enforcement lands in 7.d.
+
+| Method | Path | Auth | Returns |
+|---|---|---|---|
+| `POST` | `/auth/signup` | — | `202 {"status":"sent","method":"code"\|"link"}` — **identical** for a free, unverified-existing or verified-existing address (no account oracle) |
+| `POST` | `/auth/signin` | — | `202 {"status":"sent","method":…}` — identical across no-account / unverified / verified |
+| `POST` | `/auth/verify` | — | `200 {email, first_name, last_name}` + `Set-Cookie` |
+| `GET` | `/auth/me` | session | `200 {email, first_name, last_name}` / `401` |
+| `POST` | `/auth/signout` | session | `204`, session revoked, cookie cleared |
+
+### POST /auth/signup
+
+**Body:** `{"first_name": …, "last_name": …, "email": …}`. Claims the account
+(atomic `O_EXCL`) and emails a sign-up challenge. A second sign-up for an
+already-**verified** address makes no new account and mails "you already have an
+account"; for an **unverified** address it re-sends a fresh sign-up challenge.
+
+### POST /auth/signin
+
+**Body:** `{"email": …}`. Unknown address → a "no account, sign up" mail;
+**unverified** account → a *sign-up* challenge (never a sign-in one — R6: no
+login before confirmation); verified account → a sign-in challenge. All three
+return the identical `202`.
+
+### POST /auth/verify
+
+**Body:** `{"email", "code"}` (code mode) or `{"token"}` (link mode). Consumes
+the challenge and opens a session.
+
+- `400` — unknown / wrong code / wrong method / wrong purpose (including a
+  sign-in proof for an account that is not yet verified).
+- `410` — the proof was real but is **expired, already consumed, or
+  attempts-exhausted** (offer "send me a new one").
+
+### Errors common to the send endpoints
+
+- `429` — the per-address / per-IP hourly send cap (`AUTH_MAX_SENDS_PER_HOUR`)
+  was reached.
+- `502` — the mail could not be sent; the minted challenge stays valid, a retry
+  mints another.
+
 ## Planned (later phases)
 
-Every endpoint in the design doc is now implemented. Known gaps, none of which
-have an endpoint yet:
+Every endpoint in the design doc through Phase 7.b is implemented. Known gaps,
+none of which have an endpoint yet:
 
 - **Pending reviews do not survive a restart.** The checkpointer is an
   in-process `MemorySaver`, so a paused run's `resume` returns `409` after the
@@ -666,5 +718,8 @@ have an endpoint yet:
   A durable checkpointer (SQLite/Postgres) would remove the caveat.
 - **No listing endpoints** for profiles, runs or documents — ids come from the
   response that created them.
-- **Single-user.** There is no authentication and no per-user partitioning; any
-  caller can read any `profile_id` or `tailor_id` they can name.
+- **Business routes not yet authenticated.** The `/auth/*` flow exists (7.b),
+  but `/ingest`, `/profile`, `/tailor` and `/document` carry no session
+  requirement and share one namespace — any caller can still read any
+  `profile_id` or `tailor_id` they can name. Router-level enforcement and
+  per-user data roots land in 7.c–7.d.

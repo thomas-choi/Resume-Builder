@@ -11,9 +11,10 @@ skill — is what yields. Models that are not LLM-extraction targets
 strict, because a `null` there is a real bug.
 """
 
-from typing import Annotated, Any
+from datetime import datetime
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, BeforeValidator, Field
+from pydantic import BaseModel, BeforeValidator, EmailStr, Field
 
 
 def _blank_if_none(v: Any) -> Any:
@@ -186,3 +187,76 @@ class ReviewDecision(BaseModel):
     approvals: dict[str, bool] = Field(default_factory=dict)
     approve_all: bool = False
     notes: str = ""
+
+
+# --- Accounts & passwordless auth (Phase 7, design doc §14.4) ---------------
+#
+# The normalized email is the user-id (R4); the on-disk handle is sha256(email)
+# (§14.3), computed in auth_store — never stored in these records as a path.
+# Neither the raw code nor the raw link-token is ever stored: only a hash is,
+# and that hash IS the challenge/session filename.
+
+
+class User(BaseModel):
+    """A registered account. ``email`` (normalized) is the user-id (R4)."""
+
+    email: EmailStr  # normalized (strip().lower()) — this IS the user-id
+    display_email: str  # as typed, for showing back
+    first_name: str
+    last_name: str
+    email_verified: bool = False  # False until R5 done; gates login (R6)
+    created_at: datetime
+    verified_at: datetime | None = None
+    last_login_at: datetime | None = None
+
+
+class Challenge(BaseModel):
+    """A proof-of-receipt record, stored at ``auth/challenges/{lookup}.json``.
+
+    ``purpose`` binds the challenge to its flow (a signup proof presented to the
+    sign-in path is rejected even while unexpired) and ``method`` to how it is
+    presented (a code cannot be replayed through the link path).
+    """
+
+    email: str  # the user-id it proves
+    purpose: Literal["signup", "signin"]
+    method: Literal["code", "link"]
+    attempts: int = 0  # code only; link is single-shot by construction
+    created_at: datetime
+    expires_at: datetime
+    consumed_at: datetime | None = None
+
+
+class Session(BaseModel):
+    """A server-side session, stored at ``auth/sessions/{sha256(cookie)}.json``."""
+
+    email: str  # the user-id
+    created_at: datetime
+    expires_at: datetime
+    last_seen_at: datetime
+
+
+class SignUpRequest(BaseModel):
+    first_name: str
+    last_name: str
+    email: EmailStr
+
+
+class SignInRequest(BaseModel):
+    email: EmailStr
+
+
+class VerifyRequest(BaseModel):
+    """Verify body: ``{email, code}`` in code mode or ``{token}`` in link mode."""
+
+    email: EmailStr | None = None
+    code: str | None = None
+    token: str | None = None
+
+
+class UserPublic(BaseModel):
+    """The account fields returned by ``GET /auth/me`` and ``/auth/verify``."""
+
+    email: EmailStr
+    first_name: str
+    last_name: str

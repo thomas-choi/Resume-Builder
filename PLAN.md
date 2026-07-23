@@ -1191,6 +1191,229 @@ as `diffProjects`, keyed on the lower-cased name to match the server.
 
 ---
 
+## Phase 7 — Accounts, passwordless auth and per-user isolation — **planned**
+
+Full design in `TECHNICAL-DESIGN.md` §14 (§14.1–14.15). The build order is
+7.a–7.e (§14.15); **this section details only 7.a and 7.b** — enough for a new
+session to implement them without re-deriving the design. The later steps
+(per-user roots, enforcement flip, migration, frontend) are designed in §14 but
+not yet expanded here.
+
+**Scope boundary for 7.a + 7.b.** *In:* a testable email sender, the on-disk
+account/challenge/session store, the `/auth/*` endpoints, and R6 (no login
+before confirmation). *Out (7.c–7.e):* per-user data roots, business-route
+enforcement, the migration script, and the frontend. After 7.b the `/auth/*`
+flow works end to end via the `file` mail backend, but `/ingest`, `/profile`
+and `/tailor` are still unauthenticated and share one namespace.
+
+**Two intentional deviations from a literal reading of §14**, both because the
+thing they depend on does not exist until 7.c:
+
+- §14.5's sequence diagram shows `POST /auth/verify` doing
+  `mkdir data/users/{uid}/`. That belongs to **7.c** (per-user roots). In 7.b,
+  verify creates the account record + session only; the data root is added when
+  7.c introduces `config.user_root`.
+- `AUTH_ENABLED` / `SINGLE_USER_EMAIL` (§14.10, §14.11) are **7.c** config —
+  they only matter once the stores take a `user_id`. Do not add them in 7.b.
+
+### 7.a — `src/utils/mailer.py` + mail config + `file` backend — **planned**
+
+Nothing else in Phase 7 is testable without a way to send mail that needs no
+SMTP server, so this lands first (§14.9).
+
+**New file `src/utils/mailer.py`.** One entry point
+`async def send(to: str, subject: str, text: str, html: str | None = None) -> None`,
+dispatching on `config.EMAIL_BACKEND`:
+
+1. `file` (**default**) — build a MIME message (`email.message.EmailMessage`,
+   set `From`/`To`/`Subject`, `.set_content(text)`, and `.add_alternative(html,
+   subtype="html")` when `html` is given) and write a complete `.eml` into
+   `config.EMAIL_OUTBOX_DIR`. Filename
+   `f"{utcnow:%Y%m%dT%H%M%S%f}-{secrets.token_hex(4)}.eml"` so the newest sorts
+   **last** (OPERATIONS.md tells the operator to open the newest file and read
+   the code/link). Create the outbox dir on demand.
+2. `console` — log subject + body at INFO via the existing logger
+   (`logging.getLogger` per the module convention in `logging_setup.py`).
+3. `smtp` — stdlib `smtplib` over STARTTLS (honour `SMTP_STARTTLS`), `login`
+   only when `SMTP_USER` is set, `send_message`, `SMTP_TIMEOUT_S` on the
+   connection. Run the blocking call in a worker thread via
+   `anyio.to_thread.run_sync` — the same pattern the graph runs already use, so
+   `aiosmtplib` is deliberately **not** added.
+
+`send` is `async def` because it is called from async route handlers; the
+`file`/`console` branches do trivial sync work inline, only `smtp` offloads to a
+thread. **Send failures propagate** — never swallowed; the auth route turns them
+into `502` (§14.9). No retry/queue in this phase.
+
+**Config additions to `src/config.py`** (the mail rows of §14.10), following the
+existing bool-parsing idiom used by `RENDER_PDF`:
+
+| Variable | Default |
+|---|---|
+| `EMAIL_BACKEND` | `file` |
+| `EMAIL_FROM` | `no-reply@localhost` |
+| `EMAIL_OUTBOX_DIR` | `./data/auth/outbox` (a `Path`) |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` | — / `587` / — / — |
+| `SMTP_STARTTLS` / `SMTP_TIMEOUT_S` | `true` / `10` |
+
+**Tests — `tests/unit/test_mailer.py`** (use the `data_dir`/`tmp_path` fixtures;
+run the async `send` with `pytest-asyncio`, already a dependency):
+
+- `file` backend writes a parseable `.eml` (round-trip with
+  `email.parser.BytesParser`) whose body contains the given text; two sends
+  produce two files and the newest sorts last.
+- `smtp` backend drives a **mocked** `smtplib.SMTP` — assert `starttls`,
+  conditional `login`, and `send_message` are called; no real socket.
+- a backend that raises propagates the exception (the route-level `502` is
+  covered in 7.b, not here).
+
+**Docs to update:** `OPERATIONS.md` (mail env-var rows + the "read the newest
+file in `data/auth/outbox`" note); `HISTORY.md` (one entry); one line in
+`API-REFERENCE.md` noting "no API change — mailer utility only".
+
+### 7.b — `src/utils/auth_store.py` + `src/api/auth_routes.py` + `deps.py` — **planned**
+
+The identity model, the challenge (code + link) and session lifecycles, and the
+`/auth/*` routes with **R6 enforced**. **No enforcement on the business routes
+yet** — that is 7.d.
+
+**Schema additions to `src/models/schemas.py`** (§14.4). Add `User`,
+`Challenge`, `Session`, and the request/response models `SignUpRequest(first_name,
+last_name, email)`, `SignInRequest(email)`, `VerifyRequest(email=None, code=None,
+token=None)`, `UserPublic(email, first_name, last_name)`. `User.email` /
+`SignUpRequest.email` use `EmailStr`, which requires adding **`email-validator`**
+to `requirements.txt`. Field set per §14.4:
+
+- `User`: `email` (normalized — the user-id, R4), `display_email`, `first_name`,
+  `last_name`, `email_verified=False`, `created_at`, `verified_at=None`,
+  `last_login_at=None`.
+- `Challenge` (stored at `auth/challenges/{lookup}.json`): `email`, `purpose`
+  (`Literal["signup","signin"]`), `method` (`Literal["code","link"]`),
+  `attempts=0`, `created_at`, `expires_at`, `consumed_at=None`.
+- `Session` (stored at `auth/sessions/{sha256(cookie)}.json`): `email`,
+  `created_at`, `expires_at`, `last_seen_at`.
+
+**New file `src/utils/auth_store.py`** — pure filesystem layer, **no FastAPI
+imports**. Roots under `config.DATA_DIR / "auth"`: `users/`, `challenges/`,
+`sessions/`. (The per-user `data/users/{uid}/` tree is 7.c — do not create it
+here.) Helpers and their §14 anchors:
+
+- `normalize(email) -> email.strip().lower()`; `uid(email) ->
+  sha256(normalize(email)).hexdigest()` (§14.3). Never write the raw address
+  into a path.
+- **Users.** `create_user(first_name, last_name, email) -> User` via
+  `open(users/{uid}.json, "x")` — the `O_CREAT|O_EXCL` atomic account claim
+  (§14.3); `FileExistsError` is the "account exists" signal, no separate email
+  index. `load_user(email)`, `mark_verified(email)`.
+- **Challenges.** `mint(email, purpose, method) -> raw` returns the raw
+  code/token **to the caller** (for the mail) and persists **only** the
+  hash-keyed record (§14.4):
+  - `code`: `f"{secrets.randbelow(1_000_000):06d}"`, lookup =
+    `sha256(f"{email}:{code}")` — scoped to the email.
+  - `link`: `token = secrets.token_urlsafe(32)`, lookup = `sha256(token)`.
+  `verify_challenge(...)` checks `purpose`, `method`, expiry and `consumed_at`;
+  for `code` it increments `attempts` and **burns** the challenge once past
+  `AUTH_MAX_CODE_ATTEMPTS`; on success marks `consumed_at` atomically. TTL comes
+  from `SIGNUP_TTL_S` / `SIGNIN_TTL_S` by purpose.
+- **Sessions.** `create_session(email) -> raw_cookie` (record under
+  `sha256(cookie)`), `load_session(cookie)`, `delete_session(cookie)`; sliding
+  `last_seen_at` refresh and re-issue past half-life (§14.7).
+- Every write atomic (tempfile in the same dir + `os.replace`); every read
+  tolerates a missing file as "not found" (§14.3).
+- **In-process rate limiter** — at most `AUTH_MAX_SENDS_PER_HOUR` challenges per
+  address plus a per-IP ceiling (§14.9). A module-level dict of timestamps is
+  adequate for the single-container deployment; note the multi-replica caveat in
+  a comment rather than solving it.
+
+**Config additions to `src/config.py`** (the auth rows of §14.10 — **not**
+`AUTH_ENABLED`/`SINGLE_USER_EMAIL`, those are 7.c):
+
+| Variable | Default |
+|---|---|
+| `AUTH_VERIFY_METHOD` | `code` (`code` \| `link`) |
+| `VERIFY_CODE_LENGTH` | `6` |
+| `AUTH_MAX_CODE_ATTEMPTS` | `5` |
+| `PUBLIC_BASE_URL` | `http://localhost:8000` (never derived from `Host`) |
+| `SESSION_COOKIE_NAME` | `rb_session` |
+| `SESSION_COOKIE_SECURE` | `true` |
+| `SESSION_TTL_S` | `1209600` (14 d, sliding) |
+| `SIGNUP_TTL_S` | `1800` (30 min) |
+| `SIGNIN_TTL_S` | `900` (15 min) |
+| `AUTH_MAX_SENDS_PER_HOUR` | `5` |
+
+**New file `src/api/deps.py`** — minimal for 7.b: `current_user(request) -> User`
+reads the `SESSION_COOKIE_NAME` cookie, loads the session and its user, refreshes
+`last_seen_at`, and raises `401` on a missing/expired session. Only `/auth/me`
+and `/auth/signout` depend on it now; the **business-route** wiring is 7.d.
+
+**New file `src/api/auth_routes.py`** — a second `APIRouter` (unauthenticated by
+default) wired into `create_app()` in `src/api/main.py` next to the existing
+`router`. Routes per §14.5 / §14.13:
+
+- `POST /auth/signup` `{first_name, last_name, email}` — `O_EXCL` claim →
+  three branches (free / exists-unverified / exists-verified), each mints + mails
+  the right challenge and returns an **identical** `202
+  {"status":"sent","method":<code|link>}`. Method chosen by `AUTH_VERIFY_METHOD`;
+  for `link`, build `{PUBLIC_BASE_URL}/#/verify?token=…` (fragment — §14.6).
+- `POST /auth/signin` `{email}` — three branches; the **unverified branch mints
+  a `purpose=signup` challenge, never `signin`** (R6, §14.5). All three return
+  the identical `202`. Unknown-address branch mails "no account here, sign up".
+- `POST /auth/verify` — body `{email, code}` (code mode) or `{token}` (link
+  mode). Look up, check purpose/method/expiry/attempts; **re-check
+  `email_verified` before honouring a `signin` challenge** (belt for R6, §14.5).
+  On a `signup` proof: flip `email_verified`/`verified_at`. Create the session,
+  `Set-Cookie` `rb_session` with `HttpOnly`, `SameSite=Lax`,
+  `Secure=SESSION_COOKIE_SECURE`, `Path=/`, `Max-Age=SESSION_TTL_S` (§14.7).
+  Return `200 {user}`. Errors: `400` unknown/wrong-purpose/wrong-method; `410`
+  expired / consumed / attempts-exhausted (§14.13).
+- `GET /auth/me` — `Depends(current_user)` → `200 UserPublic` / `401`.
+- `POST /auth/signout` — `Depends(current_user)`, delete the session record,
+  clear the cookie, `204`.
+- **Mail-send failure → `502`** ("could not send the email, try again"); the
+  minted challenge stays valid, a retry mints another (§14.9). Unsafe-method
+  `Origin` check against `PUBLIC_BASE_URL` as a cheap second gate (§14.7).
+
+**Tests** (mailer mocked via `monkeypatch.setattr(auth_routes, "send", …)`; the
+`data_dir` fixture roots `DATA_DIR`; `TestClient(create_app())` as in
+`test_api.py`). The §14.14 rows in scope for 7.b:
+
+- `tests/unit/test_auth_store.py` — challenge lifecycle: expired → not honoured;
+  consumed rejected on second use; `signup` proof rejected on the sign-in path
+  and vice versa; `code` presented through the link path (and vice versa)
+  rejected; unknown/tampered code/token rejected; **neither the raw code nor the
+  raw token ever appears anywhere under `data/auth/`**. Code method: wrong code
+  increments `attempts`, burns after `AUTH_MAX_CODE_ATTEMPTS` so the right code
+  no longer works; one address's `sha256(email:code)` cannot verify another's;
+  the per-address send cap holds. Sessions: create/load/delete, expiry, sliding
+  refresh.
+- `tests/unit/test_auth_routes.py` — sign-up: a second sign-up for a **verified**
+  address makes no second account, same `202`, mails "you already have an
+  account"; a second for an **unverified** address re-sends a fresh signup
+  challenge; verifying flips `email_verified` and returns `200` + cookie.
+  Sign-in / **R6**: unknown address → `202` + "no account" mail; an
+  **unverified** account → same `202` but is minted a *signup* challenge, and
+  **no sequence of sign-in + verify yields a session** until sign-up completes;
+  a verified account signs in normally; `verify` refuses a hand-crafted `signin`
+  challenge whose account is unverified. Cookie flags (`HttpOnly`, `SameSite`,
+  `Secure`, `Max-Age`); `410` on expired/consumed; sign-out revokes; a
+  mail-send failure surfaces as `502`.
+
+**Docs to update:** `API-REFERENCE.md` — the `/auth/*` table (§14.13);
+`TECHNICAL-DESIGN.md` §14 — mark 7.a/7.b implemented and record the two
+deviations above; `OPERATIONS.md` — the auth env-var rows and the outbox note;
+`PRODUCT-GUIDE.md` — the sign-up/sign-in flow now exists (single-user data
+sharing still applies until 7.c–7.d); `HISTORY.md` — one entry per change,
+newest first.
+
+### Sequencing within 7.a + 7.b
+
+7.a first (mailer is the dependency of every auth test), then 7.b. Suggested
+commit split: (1) 7.a — mailer + mail config + `test_mailer.py` + docs; (2) 7.b
+— schemas + `email-validator` + `auth_store.py` + `deps.py` + `auth_routes.py` +
+auth config + both test files + docs.
+
+---
+
 ## Docs sync (every phase, mandatory per CLAUDE.md)
 
 - `TECHNICAL-DESIGN.md` — "Implementation notes" section per phase (two-graph split, JSON storage, interrupt design in Phase 4) + Mermaid diagrams of implemented graphs.
