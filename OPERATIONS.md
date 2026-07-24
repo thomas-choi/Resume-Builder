@@ -43,7 +43,7 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `GITHUB_MAX_CONTRIBUTION_PROBES` | no | `150` | Budget for the `GET /repos/{full}/commits?author=` probes that prove a non-owned repo was actually worked on. Repos beyond the budget are dropped, never assumed |
 | `GITHUB_MAX_ORG_REPOS` | no | `20` | How many organization/collaborator repos to render, newest contribution first. Each organization keeps at least one repo before recency fills the rest, so an old employer is not evicted by a busy current one |
 | `GITHUB_REPOS_PER_EXTRACTION` | no | `10` | How many repos go into one extraction call for a GitHub source. Lower = more calls but less risk of the model truncating (or omitting) its structured output; raise it only if extraction is reliably clean and you want fewer calls |
-| `LLM_PROVIDER` | no | `anthropic` | Provider switch (same method as FUND `get_llm`): `anthropic`, `openai`, `google`, `nvidia`, `llamacpp`, `deepseek`, `openrouter`. Non-Anthropic providers need their `langchain-*` package installed and `*_MODEL` vars set to that provider's model ids. Packages for `anthropic`, `openai`, `google`, `nvidia`, and `llamacpp` ship in `requirements.txt`; `deepseek`/`openrouter` need a manual `pip install`. For `deepseek` the factory disables thinking mode per request — DeepSeek thinking models reject the forced tool call that structured output requires. |
+| `LLM_PROVIDER` | no | `anthropic` | Provider switch (same method as FUND `get_llm`): `anthropic`, `openai`, `google`, `nvidia`, `llamacpp`, `deepseek`, `openrouter`. Non-Anthropic providers need their `langchain-*` package installed and `*_MODEL` vars set to that provider's model ids. Packages for `anthropic`, `openai`, `google`, `nvidia`, `llamacpp` and `deepseek` (`langchain-deepseek`) ship in `requirements.txt` — and therefore in the Docker image; only `openrouter` (`langchain_openrouter`, imported by `src/agents/llm.py`) needs a manual `pip install` and a rebuild. For `deepseek` the factory disables thinking mode per request — DeepSeek thinking models reject the forced tool call that structured output requires. |
 | `LLM_API_KEY` | no | falls back to `ANTHROPIC_API_KEY` | Provider API key (*required if `LLM_PROVIDER` isn't `anthropic`) |
 | `LLM_TEMPERATURE` | no | unset | Sampling temperature; leave unset for current Claude models (they reject non-default sampling params). For local/OSS providers set ~`0.2` — low temperature keeps the extraction and validation stages factual, which the anti-fabrication gate depends on |
 | `LLM_MAX_TOKENS` | no | `8000` | Default output token cap per LLM call |
@@ -58,6 +58,8 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `REVIEW_AGENT_ENABLED` | no | `true` | Whether to write that brief at all. `false` → the run still pauses and still lists every flagged item, it just arrives without prose (one fewer LLM call per paused run) |
 | `REVIEW_MAX_TOOL_ITERATIONS` | no | `4` | Bound on the review agent's tool-calling loop (it loads skill bodies on demand). Exhausting it yields no brief rather than looping |
 | `API_PORT` | no | `8000` | Port uvicorn binds **and** `docker compose` publishes. Honored via the Docker `CMD`/Compose port mapping (not read by Python), with precedence `API_PORT` > `$PORT` (cloud convention — Cloud Run/Heroku/Railway inject it) > `8000`. Running uvicorn directly? pass `--port` yourself |
+| `IMAGE_REPO` | no | `thomaschoi/resume-builder` | **Cloud deploy only.** Docker Hub repository `docker-compose.prod.yml` pulls from. Not read by Python — Compose interpolates it from the VM's `.env` (see [Cloud deployment](#cloud-deployment-docker-hub--vm)) |
+| `IMAGE_TAG` | no | `latest` | **Cloud deploy only.** Image tag to run. Pin it to a git short SHA (what `scripts/build_and_push.sh` tags) to roll back a bad release |
 | `UI_PORT` | no | `5173` | **Dev-only** port the Vite dev server (`npm run dev`) listens on — a frontend shell var read by `vite.config.ts`, not part of the backend `.env`. No effect in production (the API serves the built UI on `API_PORT`). Change it and you must add its origin to `AUTH_ALLOWED_ORIGINS` |
 | `FRONTEND_DIR` | no | `./frontend/dist` | Built review UI, served at `/`. Absent → `/` redirects to `/docs` and the API is unaffected |
 | `DATA_DIR` | no | `./data` | Root of the versioned JSON profile store |
@@ -367,6 +369,262 @@ single-process state: this service must not be scaled to multiple workers or
 replicas without swapping in a durable checkpointer, since a resume could land
 on a worker that never saw the pause. `uvicorn` defaults to one worker; do not
 add `--workers`.
+
+## Cloud deployment (Docker Hub → VM)
+
+The shipping model is **build here, run there**: the image is built and pushed
+from the workstation, and the VM only ever pulls it. The VM therefore never
+holds a source checkout, a `node_modules`, or a Python venv — the two files it
+needs are a Compose file and a `.env`.
+
+| Where | What lives there |
+|---|---|
+| Workstation | Source tree, `docker build`, `docker push` to `docker.io/thomaschoi/resume-builder` |
+| Docker Hub | Versioned images, tagged with the short git SHA plus a moving `latest` |
+| VM `~/projects/ResumeBuilder` | `docker-compose.yml`, `.env`, `data/`, `logs/` — nothing else |
+
+Reference deployment: DigitalOcean droplet, public IP `143.198.153.31`, login
+user `ops` (password auth), app served over plain HTTP on port 8000. Substitute
+your own where they differ.
+
+Two scripts wrap steps 1 and 2; steps 3–5 are typed on the VM on purpose, since
+that is where an unattended mistake costs the most.
+
+### Step 0 — one-time setup
+
+**Docker on the workstation.** Skip if `docker --version` and
+`docker compose version` both answer. Otherwise, on Ubuntu/Debian:
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"   # then log out and back in
+docker run --rm hello-world       # verify
+```
+
+**A Docker Hub account and repository.** The image name is
+`thomaschoi/resume-builder`. Docker Hub creates the repository on first push, so
+nothing needs pre-creating for a **public** repo — which is what this runbook
+assumes, because a public image needs no credentials on the VM to pull. The
+image contains the application source and the built UI (no `.env`, no keys, no
+`data/`); if that is not acceptable, make the repo private on Docker Hub and add
+a `docker login` on the VM before every pull.
+
+Log in on the workstation once, using an access token rather than the account
+password (hub.docker.com → Account Settings → Personal access tokens →
+Generate, scope *Read & Write*):
+
+```bash
+docker login -u thomaschoi        # paste the access token as the password
+```
+
+**Docker on the VM.** As `ops`:
+
+```bash
+ssh ops@143.198.153.31
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker ops       # so `docker` needs no sudo
+exit                              # group membership applies on next login
+```
+
+Log back in and confirm `docker compose version` works (the Compose **plugin**,
+v2, is included by `get.docker.com`; the old `docker-compose` binary is not
+used here). If `ops` cannot use `sudo`, have an admin run the two `sudo` lines.
+
+**The production env file**, on the workstation:
+
+```bash
+cp .env.prod.example .env.prod
+$EDITOR .env.prod    # ANTHROPIC_API_KEY, SMTP_*, and verify PUBLIC_HOST
+```
+
+`.env.prod` is gitignored — it holds the API key and the SMTP password. Read the
+comments in it: `PUBLIC_HOST` and `SESSION_COOKIE_SECURE` are the two settings
+that break sign-in silently when wrong (see Troubleshooting below).
+
+### Step 1 — build the image and push it to Docker Hub
+
+On the workstation:
+
+```bash
+scripts/build_and_push.sh              # tags <short-sha> and latest
+scripts/build_and_push.sh v1.0.0       # or an explicit tag
+```
+
+It builds for `linux/amd64` (what the droplet runs) and refuses to tag a dirty
+working tree — a tag that does not correspond to a commit cannot be rolled back
+to. Override with `ALLOW_DIRTY=1` for a throwaway test build.
+
+The build takes several minutes on a cold cache: the UI stage runs `npm ci &&
+npm run build`, and the runtime stage installs `libreoffice-writer` for PDF
+conversion. The push moves roughly 1–1.5 GB the first time and only changed
+layers after that.
+
+### Step 2 — copy the two files to the VM
+
+On the workstation:
+
+```bash
+scripts/deploy_to_vm.sh
+# VM_HOST=… VM_USER=… ENV_FILE=… scripts/deploy_to_vm.sh   to override
+```
+
+It creates `~/projects/ResumeBuilder/{data,logs}` on the VM, copies
+`docker-compose.prod.yml` there **as `docker-compose.yml`** (so the operator
+runs a plain `docker compose up -d` with no `-f` flag) and `.env.prod` as
+`.env`, then `chmod 600`s it. Because the VM uses password auth, ssh prompts —
+the script multiplexes one connection, so the password is typed once.
+
+It deliberately does **not** copy `src/`, `frontend/` or the local `data/`: the
+first two are already inside the image, and `data/` is résumé PII that belongs
+only where it was created. It also refuses `ENV_FILE=.env`, since the local
+`.env` points at `localhost` and would 403 every browser sign-in.
+
+The equivalent by hand, if you would rather not use the script:
+
+```bash
+ssh ops@143.198.153.31 'mkdir -p ~/projects/ResumeBuilder/{data,logs}'
+scp docker-compose.prod.yml ops@143.198.153.31:projects/ResumeBuilder/docker-compose.yml
+scp .env.prod               ops@143.198.153.31:projects/ResumeBuilder/.env
+ssh ops@143.198.153.31 'chmod 600 ~/projects/ResumeBuilder/.env'
+```
+
+### Step 3 — log in to the VM and pull the image
+
+```bash
+ssh ops@143.198.153.31
+cd ~/projects/ResumeBuilder
+docker compose pull
+```
+
+`pull` resolves `IMAGE_REPO:IMAGE_TAG` from `.env` (default
+`thomaschoi/resume-builder:latest`). For a **private** repo, run
+`docker login -u thomaschoi` here first. Confirm what arrived:
+
+```bash
+docker image ls thomaschoi/resume-builder
+```
+
+### Step 4 — check the firewall
+
+Two independent layers can block port 8000, and both must allow it. Check the
+host first:
+
+```bash
+sudo ufw status verbose
+```
+
+If ufw is `active`, open the port (and make sure SSH stays open — locking
+yourself out of a password-auth VM is unrecoverable without console access):
+
+```bash
+sudo ufw allow OpenSSH
+sudo ufw allow 8000/tcp
+sudo ufw status
+```
+
+If ufw is `inactive`, leave it that way or enable it *after* adding both rules
+above — never before.
+
+Then the **provider** firewall, which ufw knows nothing about: in the
+DigitalOcean control panel → Networking → Firewalls, the droplet's firewall
+needs an inbound TCP rule for port `8000`. Restrict the source to your own IP
+while testing; opening it to `0.0.0.0/0` publishes the app, and anyone who
+reaches it can sign up (`AUTH_ENABLED=true` gates the data per account, but not
+who may create one).
+
+Verify from *outside* the VM, since a local `curl` passes even when both
+firewalls are shut:
+
+```bash
+curl -fsS http://143.198.153.31:8000/healthz     # from your workstation
+```
+
+A hang (rather than "connection refused") is the signature of a firewall drop;
+"connection refused" means nothing is listening, so go back to step 5.
+
+### Step 5 — start the container
+
+On the VM, in `~/projects/ResumeBuilder`:
+
+```bash
+docker compose up -d
+docker compose ps                 # STATUS should reach "Up … (healthy)"
+docker compose logs -f            # CTRL+C to stop following
+```
+
+Verify in three widening circles:
+
+```bash
+curl -fsS http://localhost:8000/healthz            # on the VM
+curl -fsS http://143.198.153.31:8000/healthz       # from the workstation
+```
+
+then open `http://143.198.153.31:8000/` in a browser — the review UI — and
+`http://143.198.153.31:8000/docs` for the API. Sign in with a real address and
+confirm the verification code arrives, which is the one thing only a browser
+test proves.
+
+`restart: unless-stopped` in the Compose file means the container comes back by
+itself after a crash or a droplet reboot. It does **not** come back after an
+explicit `docker compose stop` — that is the point of the flag.
+
+> The API must stay a **single** process: a paused human-review run lives in an
+> in-memory checkpointer (see "Human review is in-process state" above). Do not
+> add `--workers`, and do not scale this service to replicas.
+
+### Updating a running deployment
+
+```bash
+# workstation
+scripts/build_and_push.sh
+scripts/deploy_to_vm.sh          # only when compose/.env actually changed
+
+# VM
+cd ~/projects/ResumeBuilder
+docker compose pull && docker compose up -d
+```
+
+`up -d` recreates the container only if the image or config changed. `data/` and
+`logs/` are bind mounts, so profiles, documents and accounts survive every
+update untouched.
+
+To roll back, pin the tag instead of `latest` — this is why the build script
+tags each image with its git SHA:
+
+```bash
+sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=a1b2c3d/' .env
+docker compose pull && docker compose up -d
+```
+
+Housekeeping, occasionally: `docker image prune -f` reclaims the superseded
+image layers, which accumulate at ~1 GB per kept version on a small droplet.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `403` on every sign-in POST | `PUBLIC_HOST` still `localhost`, so the derived `AUTH_ALLOWED_ORIGINS` does not contain `http://143.198.153.31:8000` | Set `PUBLIC_HOST` to the public IP/hostname in `.env`, `docker compose up -d` |
+| Login succeeds, then every request `401`s back to the verify screen | `SESSION_COOKIE_SECURE=true` while serving plain `http://` — the browser discards the cookie | `SESSION_COOKIE_SECURE=false` over HTTP; set it back to `true` the day TLS goes in front |
+| No verification email arrives | `EMAIL_BACKEND` left at `file`, so the message sits in `data/auth/outbox/` inside the VM | Configure `SMTP_*` (Gmail needs an App Password), or read the newest `.eml` under `data/auth/outbox/` for a solo test |
+| `exec format error` on start | An ARM-built image on an amd64 droplet | Rebuild with `scripts/build_and_push.sh` (it pins `--platform linux/amd64`) |
+| `curl` from outside hangs, from the VM works | Provider firewall or ufw blocking 8000 | Step 4 — both layers |
+| `connection refused` from outside | Container not running, or `API_PORT` in `.env` disagrees with the published port | `docker compose ps`, `docker compose logs` |
+| `pull access denied` / `not found` | Repo is private and the VM has no credentials, or the tag does not exist | `docker login -u thomaschoi` on the VM, or fix `IMAGE_TAG` |
+| PDFs missing, `.docx` fine | LibreOffice failed inside the container | `docker compose logs \| grep -i libreoffice`; `RENDER_PDF=false` to stop trying |
+
+### Backups
+
+Everything that matters is under `~/projects/ResumeBuilder/data` — versioned
+profile JSON, ingested sources, rendered documents and the account store. It is
+also PII (see "Data management" below). From the workstation:
+
+```bash
+ssh ops@143.198.153.31 'tar -czf - -C ~/projects/ResumeBuilder data' \
+  > "resume-builder-data-$(date +%F).tar.gz"
+```
+
+Restoring is the same tar unpacked into the same path while the container is
+stopped. The image itself needs no backup — it is on Docker Hub, tagged.
 
 ## Local LLM via llama.cpp
 

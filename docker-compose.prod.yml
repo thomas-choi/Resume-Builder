@@ -1,0 +1,49 @@
+# Production compose file — the VM PULLS a pre-built image from Docker Hub and
+# never builds. This is the whole reason it is a separate file from
+# docker-compose.yml: that one carries `build: .` and therefore needs the source
+# tree, which the VM does not have (and should not have — see OPERATIONS.md
+# "Cloud deployment").
+#
+# scripts/deploy_to_vm.sh copies THIS file to the VM as `docker-compose.yml`, so
+# the operator there runs a plain `docker compose up -d` with no `-f` flag.
+#
+# Every ${VAR} below is interpolated by Compose from the `.env` sitting next to
+# it (see .env.prod.example).
+services:
+  api:
+    image: ${IMAGE_REPO:-thomaschoi/resume-builder}:${IMAGE_TAG:-latest}
+    container_name: resume-builder
+    # Always re-resolve the tag against the registry, so redeploying a moving
+    # tag like `latest` actually picks up the new digest instead of silently
+    # reusing the locally cached layer.
+    pull_policy: always
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
+    env_file:
+      - .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      # Both are host-side state that must outlive the container: data/ is the
+      # profile store (and PII — back it up, see OPERATIONS.md "Data
+      # management"), logs/ makes app.log readable without `docker exec`.
+      - ./data:/app/data
+      - ./logs:/app/logs
+    healthcheck:
+      # urllib, not curl: the python:3.11-slim runtime has no curl installed.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:${API_PORT:-8000}/healthz').status==200 else 1)
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    logging:
+      # An unbounded json-file log will eventually fill a small VM disk.
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

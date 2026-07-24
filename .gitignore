@@ -151,6 +151,9 @@ activemq-data/
 
 # Environments
 .env
+# The filled-in production env for the cloud VM (API key + SMTP password).
+# .env.prod.example, the template, IS tracked.
+.env.prod
 .envrc
 .venv
 env/

@@ -602,6 +602,15 @@ that arrives in Phase 4.
 > response field changed; same-named uploads are now archived and identified
 > distinctly (`CV.docx` / `CV-2.docx`) instead of overwriting each other.
 
+> **Cloud deployment (2026-07-23) — no API change.** Shipping the container to a
+> cloud VM via Docker Hub adds packaging and runbook artifacts only
+> (`docker-compose.prod.yml`, `scripts/build_and_push.sh`,
+> `scripts/deploy_to_vm.sh`, `.env.prod.example`). No endpoint, parameter,
+> response field or SSE event was added, removed or changed; the deployed image
+> serves exactly the surface documented here. The only operator-visible endpoint
+> involved is the existing `GET /healthz`, now also used as the container's
+> Docker health check.
+
 > **Phase 6.d (2026-07-22) — no API change.** Drawing the profile's `projects`,
 > `education`, `certifications` and `contact` (and the tailored CV's
 > `selected_projects`) is a frontend-only change: every one of those fields was

@@ -331,3 +331,14 @@ shared account — handy for a personal install or CI. See OPERATIONS.md.
 *Running locally with no mail server?* The default setup writes each email to a
 file instead of sending it — open the newest file in `data/auth/outbox/` to read
 your code or link (see OPERATIONS.md).
+
+---
+
+*Cloud deployment (2026-07-23) — no product change.* Running the app on a cloud
+VM instead of a laptop changes where it lives, not what it does: the same
+capabilities, flows and limitations described above apply verbatim. Two things
+users notice indirectly — sign-in emails must go through a real mail server once
+the app is shared (the file-based fallback above is a solo-install convenience),
+and everything anyone uploads now lives on that VM, so the PII handling in
+OPERATIONS.md → "Data management" applies to other people's résumés too. Setup
+is OPERATIONS.md → "Cloud deployment (Docker Hub → VM)".

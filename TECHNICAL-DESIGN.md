@@ -670,6 +670,62 @@ Two decisions worth recording:
 kept after resolution, not deleted — the record of who-said-what and what was
 chosen is the point.
 
+### Deployment topology (2026-07-23)
+
+The container built in §10 is shipped **build here, run there**: the image is
+produced on the workstation and pushed to Docker Hub, and the cloud VM only
+pulls it. The runbook is OPERATIONS.md → "Cloud deployment (Docker Hub → VM)".
+
+```mermaid
+flowchart LR
+    subgraph WS["Workstation (source of truth)"]
+        SRC["src/ · frontend/ · skills/"]
+        BUILD["scripts/build_and_push.sh<br/>docker build --platform linux/amd64"]
+        ENVP[".env.prod<br/>(gitignored secrets)"]
+        COMP["docker-compose.prod.yml"]
+        SRC --> BUILD
+    end
+
+    HUB[("Docker Hub<br/>thomaschoi/resume-builder<br/>:&lt;git-sha&gt; · :latest")]
+
+    subgraph VM["Cloud VM — ops@143.198.153.31"]
+        DIR["~/projects/ResumeBuilder<br/>docker-compose.yml · .env"]
+        CTR["container resume-builder<br/>uvicorn :8000 — API + UI"]
+        VOL[("./data — profiles, PII<br/>./logs — app.log")]
+        DIR --> CTR
+        CTR <--> VOL
+    end
+
+    FW{{"provider firewall + ufw<br/>inbound tcp/8000"}}
+
+    BUILD -- "docker push" --> HUB
+    HUB -- "docker compose pull" --> CTR
+    ENVP -- "scp (scripts/deploy_to_vm.sh)" --> DIR
+    COMP -- "scp -> docker-compose.yml" --> DIR
+    BROWSER(["Browser"]) --> FW --> CTR
+```
+
+Three decisions this encodes:
+
+- **The VM holds no source.** Application code, the built UI bundle and the
+  `SKILL.md` bodies are all inside the image; the VM gets exactly two files
+  (Compose + `.env`) plus the two bind-mounted state directories. A deploy is
+  therefore an image tag change, not a file sync, and the VM cannot drift from
+  the built artifact.
+- **`docker-compose.prod.yml` exists separately from `docker-compose.yml`
+  precisely because it has no `build:` key.** The dev file builds from context;
+  a registry-only file is what makes "the VM holds no source" enforceable rather
+  than aspirational.
+- **The image tag is the rollback unit.** Every push is tagged with the short
+  git SHA alongside the moving `latest`, so reverting is `IMAGE_TAG=<sha>` +
+  `up -d` — no rebuild, and no dependence on the workstation's current tree.
+  The build script refuses to tag a dirty worktree for that reason.
+
+One constraint carries over from Phase 4 and limits this topology: a paused
+human-review run lives in an in-process `MemorySaver`, so the service must stay
+a single container with a single worker. Horizontal scaling requires a durable
+checkpointer first.
+
 ---
 
 ## 11. Guardrails worth building in from day one

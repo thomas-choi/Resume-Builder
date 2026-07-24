@@ -8,6 +8,7 @@ data/
 logs/
 .git/
 .env
+.env.prod
 **/__pycache__/
 *.pyc
 .pytest_cache/
