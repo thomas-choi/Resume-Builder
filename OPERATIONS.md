@@ -73,7 +73,7 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `LIBREOFFICE_TIMEOUT_S` | no | `120` | Per-conversion timeout; on timeout the PDF is skipped, never the run |
 | `AUTH_ENABLED` | no | `true` | `true` (shipped default) makes every business route require a session, with data rooted per account. `false` runs **legacy single-user mode**: no login, and all data lands under one synthetic account (`SINGLE_USER_EMAIL`) |
 | `SINGLE_USER_EMAIL` | no | `local@example.com` | The account used when `AUTH_ENABLED=false`; its `sha256` roots the legacy data. Must be a valid email (it is a real account record) — hence `example.com`, not `localhost` |
-| `EMAIL_BACKEND` | no | `file` | Mail delivery (Phase 7). `file` drops a complete `.eml` in the outbox (see below); `console` logs the code/link; `smtp` sends for real |
+| `EMAIL_BACKEND` | no | `file` | Mail delivery (Phase 7). **Currently dormant** — see the password-auth note below; retained for when verification returns. `file` drops a complete `.eml` in the outbox (see below); `console` logs the code/link; `smtp` sends for real |
 | `EMAIL_FROM` | no | `no-reply@localhost` | `From:` address on auth mail |
 | `EMAIL_OUTBOX_DIR` | no | `./data/auth/outbox` | Where the `file` backend writes `.eml` files |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_STARTTLS` / `SMTP_TIMEOUT_S` | no | — / `587` / — / — / `true` / `10` | `smtp` backend only; a login is sent only when `SMTP_USER` is set. Credentials via `.env`, never committed |
@@ -98,6 +98,18 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 > single-user or CI deployment: no login is needed and everything is rooted at
 > `data/users/{sha256(SINGLE_USER_EMAIL)}/` — the **same** storage path as a real
 > signed-in account, so the two modes never diverge.
+
+> **Password auth, email verification off (Phase 7.f, 2026-07-23).** Auth is now
+> **email + password**: sign-up sets a password (bcrypt-hashed via the `bcrypt`
+> dependency — run `pip install -r requirements.txt` after pulling) and opens a
+> session immediately; sign-in is email + password; a signed-in account changes
+> its own password at `POST /auth/change-password`. **No email is sent** — the
+> `EMAIL_BACKEND` / `SMTP_*` / `AUTH_VERIFY_METHOD` / `*_TTL_S` /
+> `AUTH_MAX_SENDS_PER_HOUR` / `PUBLIC_BASE_URL`-for-links rows above are dormant
+> (the mailer and challenge store are retained but unwired). The password rule —
+> **more than 8 chars and at least one of `_ $ , -`** — is enforced server-side
+> and needs no configuration. `AUTH_ALLOWED_ORIGINS`, `SESSION_COOKIE_*` and
+> `SESSION_TTL_S` are still live. There is no forgot-password reset yet.
 
 ### Migrating an existing (pre-Phase-7) install to per-user storage
 

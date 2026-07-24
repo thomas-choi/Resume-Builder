@@ -134,17 +134,11 @@ export interface ProfileResponse {
   profile: CareerProfile;
 }
 
-/** The account fields returned by GET /auth/me and POST /auth/verify. */
+/** The account fields returned by GET /auth/me, POST /auth/signup and /auth/signin. */
 export interface UserPublic {
   email: string;
   first_name: string;
   last_name: string;
-}
-
-/** The uniform 202 from /auth/signup and /auth/signin. */
-export interface AuthChallengeResponse {
-  status: string;
-  method: "code" | "link";
 }
 
 export interface TailorResponse {

@@ -29,21 +29,28 @@ def test_normalize_and_uid_are_case_insensitive(data_dir):
 
 
 def test_create_user_is_exclusive(data_dir):
-    auth_store.create_user("Alice", "Smith", "Alice@Example.com")
+    auth_store.create_user("Alice", "Smith", "Alice@Example.com", "hash123")
     user = auth_store.load_user("alice@example.com")
     assert user is not None
     assert user.email == "alice@example.com"
     assert user.display_email == "Alice@Example.com"
-    assert user.email_verified is False
-    with pytest.raises(FileExistsError):
-        auth_store.create_user("Alice", "Again", "alice@example.com")
-
-
-def test_mark_verified_flips_flag(data_dir):
-    auth_store.create_user("A", "B", "a@example.com")
-    user = auth_store.mark_verified("a@example.com")
+    assert user.password_hash == "hash123"
+    # Verification is off (Phase 7.f): accounts are created already-verified.
     assert user.email_verified is True
-    assert user.verified_at is not None
+    assert user.password_updated_at is not None
+    with pytest.raises(FileExistsError):
+        auth_store.create_user("Alice", "Again", "alice@example.com", "hash456")
+
+
+def test_set_password_replaces_hash(data_dir):
+    auth_store.create_user("A", "B", "a@example.com", "old-hash")
+    user = auth_store.set_password("a@example.com", "new-hash")
+    assert user.password_hash == "new-hash"
+    assert auth_store.load_user("a@example.com").password_hash == "new-hash"
+
+
+def test_set_password_unknown_account_is_none(data_dir):
+    assert auth_store.set_password("nobody@example.com", "x") is None
 
 
 # --- code challenges --------------------------------------------------------

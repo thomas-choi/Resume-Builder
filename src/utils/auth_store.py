@@ -115,22 +115,31 @@ def _user_path(email: str) -> Path:
     return _users_dir() / f"{uid(email)}.json"
 
 
-def create_user(first_name: str, last_name: str, email: str) -> User:
+def create_user(
+    first_name: str,
+    last_name: str,
+    email: str,
+    password_hash: str | None = None,
+) -> User:
     """Atomically claim an account for ``email`` (R4, §14.3).
 
     Uses ``open(..., "x")`` (``O_CREAT|O_EXCL``): two concurrent sign-ups for one
-    address race on the create and exactly one wins.
+    address race on the create and exactly one wins. ``password_hash`` is the
+    bcrypt hash of the chosen password (the raw password is never passed here).
 
     Raises:
         FileExistsError: The account already exists — the "account exists" signal.
     """
     normalized = normalize(email)
+    now = _now()
     user = User(
         email=normalized,
         display_email=email.strip(),
         first_name=first_name,
         last_name=last_name,
-        created_at=_now(),
+        password_hash=password_hash,
+        created_at=now,
+        password_updated_at=now if password_hash else None,
     )
     path = _user_path(normalized)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,6 +170,20 @@ def mark_verified(email: str) -> User | None:
         user.email_verified = True
         user.verified_at = _now()
         _save_user(user)
+    return user
+
+
+def set_password(email: str, password_hash: str) -> User | None:
+    """Replace an account's password hash (change-password flow, §14.4).
+
+    Returns the updated account, or ``None`` if it does not exist.
+    """
+    user = load_user(email)
+    if user is None:
+        return None
+    user.password_hash = password_hash
+    user.password_updated_at = _now()
+    _save_user(user)
     return user
 
 

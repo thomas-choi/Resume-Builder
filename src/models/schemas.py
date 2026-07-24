@@ -189,12 +189,18 @@ class ReviewDecision(BaseModel):
     notes: str = ""
 
 
-# --- Accounts & passwordless auth (Phase 7, design doc §14.4) ---------------
+# --- Accounts & password auth (Phase 7, design doc §14.4) -------------------
 #
 # The normalized email is the user-id (R4); the on-disk handle is sha256(email)
 # (§14.3), computed in auth_store — never stored in these records as a path.
-# Neither the raw code nor the raw link-token is ever stored: only a hash is,
-# and that hash IS the challenge/session filename.
+# The password is stored only as a bcrypt hash (`password_hash`); the raw
+# password never touches disk, and neither does a raw session cookie (that hash
+# IS the session filename).
+#
+# Email verification is currently OFF (Phase 7.f): sign-up sets a password and
+# opens a session immediately. `email_verified` is retained on the record (and
+# stamped True at creation) so the flag can be reactivated later without a
+# migration.
 
 
 class User(BaseModel):
@@ -204,10 +210,12 @@ class User(BaseModel):
     display_email: str  # as typed, for showing back
     first_name: str
     last_name: str
-    email_verified: bool = False  # False until R5 done; gates login (R6)
+    password_hash: str | None = None  # bcrypt hash; None only for legacy records
+    email_verified: bool = True  # verification is off (7.f); kept for later reuse
     created_at: datetime
     verified_at: datetime | None = None
     last_login_at: datetime | None = None
+    password_updated_at: datetime | None = None
 
 
 class Challenge(BaseModel):
@@ -237,21 +245,26 @@ class Session(BaseModel):
 
 
 class SignUpRequest(BaseModel):
+    """Sign-up body. ``password`` is validated against the rule server-side."""
+
     first_name: str
     last_name: str
     email: EmailStr
+    password: str
 
 
 class SignInRequest(BaseModel):
+    """Sign-in body: email + password (the password is the credential)."""
+
     email: EmailStr
+    password: str
 
 
-class VerifyRequest(BaseModel):
-    """Verify body: ``{email, code}`` in code mode or ``{token}`` in link mode."""
+class ChangePasswordRequest(BaseModel):
+    """Change the signed-in account's password: current proof + new password."""
 
-    email: EmailStr | None = None
-    code: str | None = None
-    token: str | None = None
+    current_password: str
+    new_password: str
 
 
 class UserPublic(BaseModel):

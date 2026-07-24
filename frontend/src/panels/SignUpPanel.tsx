@@ -1,26 +1,29 @@
-/** Sign-up screen: first name, last name, email → a verification challenge. */
+/** Sign-up screen: name, email, and a password (typed twice) → signed in. */
 
 import { useState } from "react";
 
 import { signup } from "../lib/api";
+import { PASSWORD_RULE_TEXT, validatePassword } from "../lib/password";
+import type { UserPublic } from "../lib/types";
 
 interface Props {
-  /** Handed the (email, method) once the challenge is sent. */
-  onChallengeSent: (email: string, method: "code" | "link") => void;
+  /** Handed the account once sign-up succeeds (the session cookie is already set). */
+  onSignedIn: (user: UserPublic) => void;
   onSwitchToSignIn: () => void;
 }
 
-export function SignUpPanel({ onChallengeSent, onSwitchToSignIn }: Props) {
+export function SignUpPanel({ onSignedIn, onSwitchToSignIn }: Props) {
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    // Validate all three client-side before posting — a blank field is the
-    // user's mistake to catch here, not a round-trip.
+    // Catch blanks, the password rule and the mistype client-side before posting.
     if (!firstName.trim() || !lastName.trim() || !email.trim()) {
       setError("First name, last name and email are all required.");
       return;
@@ -29,15 +32,25 @@ export function SignUpPanel({ onChallengeSent, onSwitchToSignIn }: Props) {
       setError("Enter a valid email address.");
       return;
     }
+    const ruleError = validatePassword(password);
+    if (ruleError) {
+      setError(ruleError);
+      return;
+    }
+    if (password !== confirm) {
+      setError("The two passwords do not match.");
+      return;
+    }
     setError(null);
     setBusy(true);
     try {
-      const { method } = await signup({
+      const user = await signup({
         firstName: firstName.trim(),
         lastName: lastName.trim(),
         email: email.trim(),
+        password,
       });
-      onChallengeSent(email.trim(), method);
+      onSignedIn(user);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -67,9 +80,24 @@ export function SignUpPanel({ onChallengeSent, onSwitchToSignIn }: Props) {
         value={email}
         onChange={(e) => setEmail(e.target.value)}
       />
+      <label htmlFor="signup-password">Password</label>
+      <input
+        id="signup-password"
+        type="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
+      <p className="muted hint">{PASSWORD_RULE_TEXT}</p>
+      <label htmlFor="signup-confirm">Confirm password</label>
+      <input
+        id="signup-confirm"
+        type="password"
+        value={confirm}
+        onChange={(e) => setConfirm(e.target.value)}
+      />
       {error && <p className="error">{error}</p>}
       <button type="submit" disabled={busy}>
-        {busy ? "Sending…" : "Sign up"}
+        {busy ? "Creating…" : "Sign up"}
       </button>
       <p className="muted">
         Already have an account?{" "}

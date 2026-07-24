@@ -1,34 +1,32 @@
 /**
  * The authentication boundary (§14.12).
  *
- * Wraps the app: `GET /auth/me` decides whether to show the sign-up / sign-in /
- * verify screens or the real panels. A mid-session `401` from *any* call drops
- * straight back to signed-out — distinguished from a network blip by status
- * (Phase 6.c: a failed refresh keeps loaded data on screen; a 401 is the one
- * case where erasing is correct).
+ * Wraps the app: `GET /auth/me` decides whether to show the sign-up / sign-in
+ * screens or the real panels. A mid-session `401` from *any* call drops straight
+ * back to signed-out — distinguished from a network blip by status (Phase 6.c: a
+ * failed refresh keeps loaded data on screen; a 401 is the one case where
+ * erasing is correct).
+ *
+ * Auth is password-based (Phase 7.f): sign-up and sign-in both establish the
+ * session cookie directly, so there is no intermediate verify step. A signed-in
+ * account can change its password in place.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 
-import { getAuthMe, setUnauthorizedHandler, signin, signout, UnauthorizedError } from "./lib/api";
+import { getAuthMe, setUnauthorizedHandler, signout, UnauthorizedError } from "./lib/api";
 import type { UserPublic } from "./lib/types";
+import { ChangePasswordPanel } from "./panels/ChangePasswordPanel";
 import { SignInPanel } from "./panels/SignInPanel";
 import { SignUpPanel } from "./panels/SignUpPanel";
-import { VerifyPanel } from "./panels/VerifyPanel";
 
-type Screen = "signin" | "signup" | "verify-code" | "verify-link" | "check-inbox";
-
-function initialScreen(): Screen {
-  // A magic link opens the app at `#/verify?token=…`; go straight to the link
-  // verifier, which reads and then scrubs the token from the URL.
-  return window.location.hash.startsWith("#/verify") ? "verify-link" : "signin";
-}
+type Screen = "signin" | "signup";
 
 export function AuthGate({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
-  const [screen, setScreen] = useState<Screen>(initialScreen);
-  const [pendingEmail, setPendingEmail] = useState<string | null>(null);
+  const [screen, setScreen] = useState<Screen>("signin");
+  const [changingPassword, setChangingPassword] = useState(false);
   // Set by the global 401 handler. It overrides a possibly-stale `me` so the
   // gate lands on the sign-in screen deterministically, without racing the
   // query cache — this is the "signed-out state" a 401 drops to (§14.12).
@@ -58,25 +56,15 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
       // previous identity loaded outlives the sign-out.
       queryClient.clear();
       setSignedOut(true);
+      setChangingPassword(false);
       setScreen("signin");
     },
   });
 
-  function onVerified(user: UserPublic) {
+  function onSignedIn(user: UserPublic) {
     // The cookie is set; seed the cache so the app renders without a round-trip.
     setSignedOut(false);
     queryClient.setQueryData(["auth", "me"], user);
-  }
-
-  function onChallengeSent(email: string, method: "code" | "link") {
-    setPendingEmail(email);
-    setScreen(method === "code" ? "verify-code" : "check-inbox");
-  }
-
-  async function resend() {
-    if (!pendingEmail) return;
-    const { method } = await signin(pendingEmail);
-    setScreen(method === "code" ? "verify-code" : "check-inbox");
   }
 
   if (me.isPending && !signedOut) {
@@ -91,11 +79,31 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
           <span>
             Signed in as <strong>{user.first_name} {user.last_name}</strong>
           </span>
-          <button type="button" onClick={() => signOut.mutate()} disabled={signOut.isPending}>
-            Sign out
-          </button>
+          <div className="auth-bar-actions">
+            {!changingPassword && (
+              <button
+                type="button"
+                className="linklike"
+                onClick={() => setChangingPassword(true)}
+              >
+                Change password
+              </button>
+            )}
+            <button type="button" onClick={() => signOut.mutate()} disabled={signOut.isPending}>
+              Sign out
+            </button>
+          </div>
         </div>
-        {children}
+        {changingPassword ? (
+          <div className="auth-screen">
+            <ChangePasswordPanel
+              onDone={() => setChangingPassword(false)}
+              onCancel={() => setChangingPassword(false)}
+            />
+          </div>
+        ) : (
+          children
+        )}
       </>
     );
   }
@@ -117,37 +125,16 @@ export function AuthGate({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="auth-screen">
-      {screen === "signup" && (
+      {screen === "signup" ? (
         <SignUpPanel
-          onChallengeSent={onChallengeSent}
+          onSignedIn={onSignedIn}
           onSwitchToSignIn={() => setScreen("signin")}
         />
-      )}
-      {screen === "signin" && (
+      ) : (
         <SignInPanel
-          onChallengeSent={onChallengeSent}
+          onSignedIn={onSignedIn}
           onSwitchToSignUp={() => setScreen("signup")}
         />
-      )}
-      {(screen === "verify-code" || screen === "verify-link") && (
-        <VerifyPanel
-          mode={screen === "verify-link" ? "link" : "code"}
-          email={pendingEmail}
-          onVerified={onVerified}
-          onResend={resend}
-        />
-      )}
-      {screen === "check-inbox" && (
-        <div className="auth-panel">
-          <h2>Check your inbox</h2>
-          <p className="muted">
-            If that address has an account, a verification link is on its way.
-            Open it to finish signing in.
-          </p>
-          <button type="button" onClick={() => setScreen("signin")}>
-            Back to sign in
-          </button>
-        </div>
       )}
     </div>
   );

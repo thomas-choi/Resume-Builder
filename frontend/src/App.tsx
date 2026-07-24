@@ -22,12 +22,16 @@ import { useState } from "react";
 import { ProfilePanel } from "./panels/ProfilePanel";
 import { SourcesPanel } from "./panels/SourcesPanel";
 import { TailorPanel } from "./panels/TailorPanel";
+import { TutorialPage } from "./panels/TutorialPage";
+
+type View = "builder" | "tutorial";
 
 export function App() {
   const queryClient = useQueryClient();
   const [profileId, setProfileId] = useState<string | null>(null);
   const [profileIdInput, setProfileIdInput] = useState("");
   const [sessionKey, setSessionKey] = useState(0);
+  const [view, setView] = useState<View>("builder");
 
   function clearEverything() {
     // Destructive: unsaved profile edits, staged uploads and a typed token all
@@ -51,6 +55,23 @@ export function App() {
     <div className="app">
       <header>
         <h1>Resume Builder</h1>
+        <nav className="tabs">
+          <button
+            type="button"
+            className={view === "builder" ? "tab active" : "tab"}
+            onClick={() => setView("builder")}
+          >
+            Builder
+          </button>
+          <button
+            type="button"
+            className={view === "tutorial" ? "tab active" : "tab"}
+            onClick={() => setView("tutorial")}
+          >
+            Tutorial
+          </button>
+        </nav>
+        {view === "builder" && (
         <div className="controls">
           <form
             onSubmit={(event) => {
@@ -71,17 +92,22 @@ export function App() {
             Clear everything
           </button>
         </div>
-        {profileId && (
+        )}
+        {view === "builder" && profileId && (
           <p className="muted">
             Active profile: <strong>{profileId}</strong>
           </p>
         )}
       </header>
+      {view === "tutorial" ? (
+        <TutorialPage />
+      ) : (
       <main>
         <SourcesPanel key={`sources-${sessionKey}`} onIngested={setProfileId} />
         <ProfilePanel key={`profile-${downstreamKey}`} profileId={profileId} />
         <TailorPanel key={`tailor-${downstreamKey}`} profileId={profileId} />
       </main>
+      )}
     </div>
   );
 }

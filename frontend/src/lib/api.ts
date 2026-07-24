@@ -1,7 +1,6 @@
 /** Thin fetch wrappers over the FastAPI endpoints (same origin — see main.py). */
 
 import type {
-  AuthChallengeResponse,
   CareerProfile,
   IngestResponse,
   ProfileResponse,
@@ -76,6 +75,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(response.status, detail);
   }
+  // A 204 (change-password, signout) carries no body — `json()` would throw.
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
@@ -100,40 +101,63 @@ export interface SignUpInput {
   firstName: string;
   lastName: string;
   email: string;
+  password: string;
 }
 
-/** Claim an account and send a verification challenge (uniform 202). */
-export function signup(input: SignUpInput): Promise<AuthChallengeResponse> {
-  return request<AuthChallengeResponse>("/auth/signup", {
+/** Create an account with a password and sign in immediately (201). */
+export function signup(input: SignUpInput): Promise<UserPublic> {
+  return request<UserPublic>("/auth/signup", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       first_name: input.firstName,
       last_name: input.lastName,
       email: input.email,
+      password: input.password,
     }),
   });
 }
 
-/** Request a sign-in challenge (uniform 202 in every branch). */
-export function signin(email: string): Promise<AuthChallengeResponse> {
-  return request<AuthChallengeResponse>("/auth/signin", {
+/**
+ * Sign in with email + password.
+ *
+ * A `401` here means *bad credentials*, not an expired session, so this call
+ * **bypasses** the global 401 handler (which would erase state and show the
+ * signed-out screen) and instead surfaces the server's message as an `ApiError`
+ * for the sign-in form to display.
+ */
+export async function signin(email: string, password: string): Promise<UserPublic> {
+  const response = await fetch("/auth/signin", {
     method: "POST",
+    credentials: "same-origin",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ email }),
+    body: JSON.stringify({ email, password }),
   });
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`;
+    try {
+      const body = await response.json();
+      if (body?.detail) detail = String(body.detail);
+    } catch {
+      /* non-JSON error body — keep the status line */
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return (await response.json()) as UserPublic;
 }
 
-/** Consume a challenge: `{email, code}` (code mode) or `{token}` (link mode). */
-export function verify(body: {
-  email?: string;
-  code?: string;
-  token?: string;
-}): Promise<UserPublic> {
-  return request<UserPublic>("/auth/verify", {
+/** Change the signed-in account's password (204, rotates the session). */
+export function changePassword(
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  return request<void>("/auth/change-password", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      current_password: currentPassword,
+      new_password: newPassword,
+    }),
   });
 }
 

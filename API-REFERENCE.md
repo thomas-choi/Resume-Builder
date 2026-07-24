@@ -11,7 +11,7 @@ unless noted. Schemas referenced below are defined in `src/models/schemas.py`.
 > another account resolves to a **`404`** (never `403` — that would confirm the id
 > exists). Set `AUTH_ENABLED=false` for legacy single-user mode: the same routes
 > are open and act as one synthetic account. Obtain a session via `/auth/*` (see
-> [Accounts & passwordless auth](#accounts--passwordless-auth-auth-phase-7)).
+> [Accounts & password auth](#accounts--password-auth-auth-phase-7)).
 
 ## GET /
 
@@ -678,60 +678,64 @@ paused — a `review.json` copy of the items the person was shown. The same URL
 keeps working after a restart. There is no listing or deletion endpoint yet —
 the `documents` array in the tailor response is the index.
 
-## Accounts & passwordless auth (`/auth/*`, Phase 7)
+## Accounts & password auth (`/auth/*`, Phase 7)
 
-Email-only, passwordless sign-up/sign-in (design doc §14). The email address is
-the user-id; a proof of receipt — a **6-digit code** typed back (default) or a
-**magic link** clicked, chosen by `AUTH_VERIFY_METHOD` — confirms the address at
-sign-up and authenticates at sign-in. A successful `verify` sets an HttpOnly
-session cookie (`SESSION_COOKIE_NAME`, default `rb_session`).
+Email + password sign-up/sign-in (design doc §14). The email address is the
+user-id; the **password** is the credential. Only a bcrypt hash of the password
+is stored (in the account record) — the raw password never touches disk. A
+successful sign-up or sign-in sets an HttpOnly session cookie
+(`SESSION_COOKIE_NAME`, default `rb_session`).
+
+> **Email verification is OFF (Phase 7.f).** Sign-up creates the account and
+> opens a session immediately; the earlier 6-digit-code / magic-link flow has
+> been retired from the active paths (the challenge/mailer code is retained but
+> unused, so verification can be reintroduced later). This is a deliberate,
+> temporary simplification — see design doc §14 and `HISTORY.md`.
 
 > **Enforcement is live (7.d):** the session established here is what the business
 > routes require. With `AUTH_ENABLED=true` (default) `/ingest`, `/profile/*`,
 > `/tailor*` and `/document/*` all `401` without a session and root every write
-> under `data/users/{sha256(email)}/`; a cross-account id is a `404`. In dev, read
-> the emitted code/link from the newest `.eml` in `data/auth/outbox/` (the `file`
-> mail backend). Set `AUTH_ENABLED=false` to skip login entirely (single-user
-> mode). The frontend `AuthGate` (Phase 7.e) drives this flow in the browser.
+> under `data/users/{sha256(email)}/`; a cross-account id is a `404`. Set
+> `AUTH_ENABLED=false` to skip login entirely (single-user mode). The frontend
+> `AuthGate` drives this flow in the browser.
+
+**Password rule** (enforced server-side, mirrored in the UI): **more than 8
+characters** and **at least one** of `_ $ , -`.
 
 | Method | Path | Auth | Returns |
 |---|---|---|---|
-| `POST` | `/auth/signup` | — | `202 {"status":"sent","method":"code"\|"link"}` — **identical** for a free, unverified-existing or verified-existing address (no account oracle) |
-| `POST` | `/auth/signin` | — | `202 {"status":"sent","method":…}` — identical across no-account / unverified / verified |
-| `POST` | `/auth/verify` | — | `200 {email, first_name, last_name}` + `Set-Cookie` |
+| `POST` | `/auth/signup` | — | `201 {email, first_name, last_name}` + `Set-Cookie` |
+| `POST` | `/auth/signin` | — | `200 {email, first_name, last_name}` + `Set-Cookie` |
+| `POST` | `/auth/change-password` | session | `204`, password replaced, session rotated |
 | `GET` | `/auth/me` | session | `200 {email, first_name, last_name}` / `401` |
 | `POST` | `/auth/signout` | session | `204`, session revoked, cookie cleared |
 
 ### POST /auth/signup
 
-**Body:** `{"first_name": …, "last_name": …, "email": …}`. Claims the account
-(atomic `O_EXCL`) and emails a sign-up challenge. A second sign-up for an
-already-**verified** address makes no new account and mails "you already have an
-account"; for an **unverified** address it re-sends a fresh sign-up challenge.
+**Body:** `{"first_name": …, "last_name": …, "email": …, "password": …}`.
+Validates the password against the rule, claims the account (atomic `O_EXCL`),
+hashes the password with bcrypt, and opens a session.
+
+- `400` — the password fails the rule (the response `detail` says how).
+- `409` — an account with this email already exists.
 
 ### POST /auth/signin
 
-**Body:** `{"email": …}`. Unknown address → a "no account, sign up" mail;
-**unverified** account → a *sign-up* challenge (never a sign-in one — R6: no
-login before confirmation); verified account → a sign-in challenge. All three
-return the identical `202`.
+**Body:** `{"email": …, "password": …}`. Verifies the password against the stored
+hash and opens a session.
 
-### POST /auth/verify
+- `401` — **Invalid email or password.** An unknown address and a wrong password
+  return the *same* `401` (no account oracle).
 
-**Body:** `{"email", "code"}` (code mode) or `{"token"}` (link mode). Consumes
-the challenge and opens a session.
+### POST /auth/change-password
 
-- `400` — unknown / wrong code / wrong method / wrong purpose (including a
-  sign-in proof for an account that is not yet verified).
-- `410` — the proof was real but is **expired, already consumed, or
-  attempts-exhausted** (offer "send me a new one").
+**Body:** `{"current_password": …, "new_password": …}`. Requires a session
+(`current_user`). Verifies the current password, validates the new one against
+the rule, replaces the stored hash, and **rotates the session** (the old cookie
+is revoked and a fresh one issued).
 
-### Errors common to the send endpoints
-
-- `429` — the per-address / per-IP hourly send cap (`AUTH_MAX_SENDS_PER_HOUR`)
-  was reached.
-- `502` — the mail could not be sent; the minted challenge stays valid, a retry
-  mints another.
+- `400` — the current password is incorrect, or the new password fails the rule.
+- `401` — no valid session.
 
 ## Planned (later phases)
 

@@ -239,3 +239,73 @@ button.linklike {
   cursor: pointer;
   text-decoration: underline;
 }
+
+.auth-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.auth-panel .hint {
+  margin: -0.25rem 0 0.25rem;
+  font-size: 0.8rem;
+}
+
+.auth-panel .row {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+/* Builder / Tutorial navigation */
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin: 0.5rem 0;
+}
+
+.tabs .tab {
+  border: 1px solid var(--border);
+  background: none;
+  padding: 0.35rem 0.9rem;
+  cursor: pointer;
+  border-radius: 4px 4px 0 0;
+  font-size: 0.9rem;
+}
+
+.tabs .tab.active {
+  background: var(--border);
+  font-weight: 600;
+}
+
+/* Tutorial page */
+.tutorial {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 1rem;
+  line-height: 1.55;
+}
+
+.tutorial section {
+  margin-bottom: 2rem;
+}
+
+.tutorial h2 {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+}
+
+.tutorial ol {
+  padding-left: 1.4rem;
+}
+
+.tutorial li {
+  margin-bottom: 0.5rem;
+}
+
+.tutorial code {
+  background: var(--border);
+  padding: 0.05rem 0.3rem;
+  border-radius: 3px;
+  font-size: 0.85em;
+}

@@ -1200,7 +1200,31 @@ a `node:20-slim` stage builds the review UI, and the python:3.11-slim runtime
 0.0.0.0:8000, with `data/` volume-mounted.
 
 
-## 14. Accounts, passwordless auth and per-user isolation (Phase 7)
+## 14. Accounts, auth and per-user isolation (Phase 7)
+
+> **Status update — 7.f: passwords replace the passwordless flow (2026-07-23).**
+> The credential model changed. Sign-in is now **email + password**; sign-up
+> sets a password (typed twice in the UI) and opens a session immediately. The
+> password rule is **more than 8 characters and at least one of `_ $ , -`**,
+> enforced server-side in `src/utils/passwords.py` (bcrypt hashing) and mirrored
+> in the UI (`frontend/src/lib/password.ts`). Only the bcrypt hash is stored, on
+> the `User` record (`password_hash`); the raw password never touches disk.
+> A signed-in account can change its own password (`POST /auth/change-password`,
+> current + new), which rotates the session.
+>
+> **Email verification is currently OFF.** Accounts are created already-verified
+> (`email_verified` defaults True and no longer gates login), so requirements R1,
+> R2, R5 and R6 below — the whole email-proof-of-receipt story — are **not
+> enforced right now**. This is a deliberate, temporary simplification chosen to
+> unblock password auth; the challenge store (§14.4), the mailer (§14.9) and the
+> `mint`/`verify_challenge` machinery are **retained but unused**, so verification
+> can be reintroduced later without rebuilding it. Two consequences accepted for
+> now: sign-up is an account-existence oracle (existing email → `409`), and there
+> is no proof the address belongs to the person signing up. The sections below
+> describe the original passwordless design and remain accurate for the retained
+> store/mailer components; treat R1/R2/R5/R6 and the code/link `/auth/verify`
+> route as dormant. There is no forgot-password reset yet (change-while-signed-in
+> only). See `HISTORY.md` (2026-07-23) for the change record.
 
 > **Status: 7.a–7.e implemented (7.a/7.b 2026-07-22; 7.c/7.d/7.e 2026-07-23).**
 > The mailer (§14.9), the account/challenge/session store (§14.3–14.7), the

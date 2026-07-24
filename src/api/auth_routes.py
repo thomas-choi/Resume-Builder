@@ -1,10 +1,14 @@
-"""Passwordless account routes (design doc §14.5 / §14.13), Phase 7.b.
+"""Password account routes (design doc §14.5 / §14.13), Phase 7.f.
 
-A second, **unauthenticated** ``APIRouter`` carrying ``/auth/*``. The flow works
-end to end via the ``file`` mail backend; the business routes stay open until
-7.d. R6 (no login before confirmation) is enforced here: sign-in on an
-unverified account mints a *signup* challenge, never a signin one, and
-``/auth/verify`` re-checks ``email_verified`` before honouring a signin proof.
+A second, **unauthenticated** ``APIRouter`` carrying ``/auth/*``. Passwords
+replace the earlier passwordless email code/link flow: sign-up sets a password
+and opens a session immediately, sign-in is email + password, and a signed-in
+account can change its own password.
+
+Email verification is currently OFF (the ``email_verified`` flag is stamped
+True at creation and never gates login). The challenge/mailer machinery in
+``auth_store``/``mailer`` is retained but no longer wired here, so verification
+can be reintroduced later without rebuilding it.
 """
 
 import logging
@@ -14,15 +18,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from src import config
 from src.api.deps import current_user
 from src.models.schemas import (
+    ChangePasswordRequest,
     SignInRequest,
     SignUpRequest,
     User,
     UserPublic,
-    VerifyRequest,
 )
-from src.utils import auth_store
-from src.utils.auth_store import ChallengeExpired, ChallengeInvalid
-from src.utils.mailer import send
+from src.utils import auth_store, passwords
 
 logger = logging.getLogger(__name__)
 
@@ -36,136 +38,16 @@ def _check_origin(request: Request) -> None:
         raise HTTPException(status_code=403, detail="bad origin")
 
 
-def _guard_rate(email: str, request: Request) -> None:
-    """Enforce the per-address / per-IP send cap before emailing (§14.9)."""
-    ip = request.client.host if request.client else None
-    if not auth_store.allow_send(email, ip):
-        raise HTTPException(status_code=429, detail="too many requests, try later")
+def _validate_password(password: str) -> None:
+    """Reject a password that fails the rule with a ``400`` carrying the reason."""
+    reason = passwords.validate_password_rule(password)
+    if reason is not None:
+        raise HTTPException(status_code=400, detail=reason)
 
 
-async def _deliver(to: str, subject: str, text: str, html: str | None = None) -> None:
-    """Send mail, turning any delivery failure into a ``502`` (§14.9)."""
-    try:
-        await send(to, subject, text, html)
-    except Exception as exc:  # noqa: BLE001 — every backend failure maps to 502
-        logger.warning("auth: mail send failed for uid=%s: %s", auth_store.uid(to), exc)
-        raise HTTPException(
-            status_code=502, detail="could not send the email, try again"
-        ) from exc
-
-
-def _minutes(seconds: int) -> int:
-    return max(1, seconds // 60)
-
-
-async def _send_challenge(email: str, purpose: str, method: str) -> None:
-    """Mint a challenge and email the code (or link) for it."""
-    raw = auth_store.mint(email, purpose, method)
-    ttl = config.SIGNUP_TTL_S if purpose == "signup" else config.SIGNIN_TTL_S
-    finish = "Finish signing up" if purpose == "signup" else "Sign in"
-    if method == "link":
-        url = f"{config.PUBLIC_BASE_URL}/#/verify?token={raw}"
-        text = (
-            f"{finish} to Resume Builder by opening this link "
-            f"(expires in {_minutes(ttl)} minutes):\n\n{url}\n"
-        )
-        html = f"<p>{finish} to Resume Builder:</p><p><a href='{url}'>Verify</a></p>"
-        await _deliver(email, f"{finish} — your verification link", text, html)
-    else:
-        text = (
-            f"{finish} to Resume Builder. Your verification code is {raw} "
-            f"(expires in {_minutes(ttl)} minutes).\n"
-        )
-        await _deliver(email, f"{finish} — your verification code", text)
-
-
-@auth_router.post("/signup", status_code=202)
-async def signup(body: SignUpRequest, request: Request) -> dict:
-    """Claim an account and email a sign-up challenge.
-
-    Three branches — free / exists-unverified / exists-verified — all return an
-    identical ``202`` so the endpoint is not an account oracle.
-    """
-    _check_origin(request)
-    email = auth_store.normalize(body.email)
-    method = config.AUTH_VERIFY_METHOD
-    _guard_rate(email, request)
-    try:
-        auth_store.create_user(body.first_name, body.last_name, body.email)
-        await _send_challenge(email, "signup", method)
-    except FileExistsError:
-        user = auth_store.load_user(email)
-        if user is not None and user.email_verified:
-            text = (
-                "You already have a Resume Builder account. "
-                f"Sign in here: {config.PUBLIC_BASE_URL}/#/signin\n"
-            )
-            await _deliver(email, "You already have an account", text)
-        else:
-            await _send_challenge(email, "signup", method)
-    return {"status": "sent", "method": method}
-
-
-@auth_router.post("/signin", status_code=202)
-async def signin(body: SignInRequest, request: Request) -> dict:
-    """Email a sign-in challenge — with R6 enforced in the middle branch.
-
-    Unknown address → a "no account" mail; **unverified** account → a
-    ``purpose=signup`` challenge (never a signin credential); verified account →
-    the normal signin challenge. All three return an identical ``202``.
-    """
-    _check_origin(request)
-    email = auth_store.normalize(body.email)
-    method = config.AUTH_VERIFY_METHOD
-    _guard_rate(email, request)
-    user = auth_store.load_user(email)
-    if user is None:
-        text = (
-            "There is no Resume Builder account for this address. "
-            f"Sign up here: {config.PUBLIC_BASE_URL}/#/signup\n"
-        )
-        await _deliver(email, "No account found", text)
-    elif not user.email_verified:
-        # R6: an unverified address gets a signup proof, never a signin one.
-        await _send_challenge(email, "signup", method)
-    else:
-        await _send_challenge(email, "signin", method)
-    return {"status": "sent", "method": method}
-
-
-@auth_router.post("/verify")
-async def verify(body: VerifyRequest, request: Request, response: Response) -> UserPublic:
-    """Consume a challenge, open a session and set the session cookie.
-
-    Body is ``{email, code}`` (code mode) or ``{token}`` (link mode). On a
-    ``signup`` proof the account is marked verified; a ``signin`` proof is
-    honoured only for an already-verified account (belt for R6).
-    """
-    _check_origin(request)
-    method = "link" if body.token else "code"
-    try:
-        challenge = auth_store.verify_challenge(
-            method=method,
-            email=body.email,
-            code=body.code,
-            token=body.token,
-        )
-    except ChallengeInvalid as exc:
-        raise HTTPException(status_code=400, detail="invalid verification") from exc
-    except ChallengeExpired as exc:
-        raise HTTPException(status_code=410, detail="verification expired") from exc
-
-    if challenge.purpose == "signup":
-        user = auth_store.mark_verified(challenge.email)
-    else:  # signin — re-check email_verified before honouring (R6)
-        user = auth_store.load_user(challenge.email)
-        if user is None or not user.email_verified:
-            raise HTTPException(status_code=400, detail="invalid verification")
-
-    if user is None:
-        raise HTTPException(status_code=400, detail="invalid verification")
-
-    cookie = auth_store.create_session(user.email)
+def _issue_session(response: Response, email: str) -> None:
+    """Open a session for ``email`` and attach the session cookie to ``response``."""
+    cookie = auth_store.create_session(email)
     response.set_cookie(
         key=config.SESSION_COOKIE_NAME,
         value=cookie,
@@ -175,13 +57,89 @@ async def verify(body: VerifyRequest, request: Request, response: Response) -> U
         secure=config.SESSION_COOKIE_SECURE,
         path="/",
     )
-    return UserPublic(email=user.email, first_name=user.first_name, last_name=user.last_name)
+
+
+def _public(user: User) -> UserPublic:
+    return UserPublic(
+        email=user.email, first_name=user.first_name, last_name=user.last_name
+    )
+
+
+@auth_router.post("/signup", status_code=201)
+async def signup(body: SignUpRequest, request: Request, response: Response) -> UserPublic:
+    """Create an account with a password and sign in immediately.
+
+    The password is validated against the rule first; an already-registered
+    address returns ``409`` (with verification off, sign-up is no longer an
+    account-existence oracle — the trade-off accepted in Phase 7.f).
+    """
+    _check_origin(request)
+    email = auth_store.normalize(body.email)
+    _validate_password(body.password)
+    password_hash = passwords.hash_password(body.password)
+    try:
+        user = auth_store.create_user(
+            body.first_name, body.last_name, body.email, password_hash
+        )
+    except FileExistsError as exc:
+        raise HTTPException(
+            status_code=409, detail="An account with this email already exists."
+        ) from exc
+    _issue_session(response, email)
+    response.status_code = 201
+    logger.info("auth: account created + signed in uid=%s", auth_store.uid(email))
+    return _public(user)
+
+
+@auth_router.post("/signin")
+async def signin(body: SignInRequest, request: Request, response: Response) -> UserPublic:
+    """Sign in with email + password.
+
+    A missing account and a wrong password both return the same ``401`` so the
+    endpoint does not reveal whether an address is registered.
+    """
+    _check_origin(request)
+    email = auth_store.normalize(body.email)
+    user = auth_store.load_user(email)
+    if user is None or not passwords.verify_password(body.password, user.password_hash or ""):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    _issue_session(response, email)
+    logger.info("auth: signed in uid=%s", auth_store.uid(email))
+    return _public(user)
+
+
+@auth_router.post("/change-password", status_code=204)
+async def change_password(
+    body: ChangePasswordRequest,
+    request: Request,
+    response: Response,
+    user: User = Depends(current_user),
+) -> Response:
+    """Change the signed-in account's password.
+
+    Requires the current password (proof of possession), validates the new one
+    against the rule, then rotates the session so a change re-establishes a fresh
+    cookie and any other session for the account is dropped.
+    """
+    _check_origin(request)
+    if not passwords.verify_password(body.current_password, user.password_hash or ""):
+        raise HTTPException(status_code=400, detail="Current password is incorrect.")
+    _validate_password(body.new_password)
+    auth_store.set_password(user.email, passwords.hash_password(body.new_password))
+    # Rotate the session: revoke the cookie in play, issue a fresh one.
+    old_cookie = request.cookies.get(config.SESSION_COOKIE_NAME)
+    if old_cookie:
+        auth_store.delete_session(old_cookie)
+    _issue_session(response, user.email)
+    response.status_code = 204
+    logger.info("auth: password changed uid=%s", auth_store.uid(user.email))
+    return response
 
 
 @auth_router.get("/me")
 async def me(user: User = Depends(current_user)) -> UserPublic:
     """Return the signed-in account, or ``401``."""
-    return UserPublic(email=user.email, first_name=user.first_name, last_name=user.last_name)
+    return _public(user)
 
 
 @auth_router.post("/signout", status_code=204)

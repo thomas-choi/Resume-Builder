@@ -1,6 +1,6 @@
-/** The auth boundary: signed-out screens, verify flows, and the 401-vs-network split. */
+/** The auth boundary: signed-out screens, password flows, and the 401-vs-network split. */
 
-import { screen, waitFor } from "@testing-library/react";
+import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -30,13 +30,14 @@ describe("AuthGate", () => {
     expect(screen.queryByTestId("panels")).toBeNull();
   });
 
-  it("renders the app and a sign-out button when signed in", async () => {
+  it("renders the app, change-password and sign-out when signed in", async () => {
     stubAuthFetch({ me: userFixture() });
     renderWithClient(<AuthGate>{PANELS}</AuthGate>);
 
     expect(await screen.findByTestId("panels")).toBeInTheDocument();
     expect(screen.getByText(/Alice Smith/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Sign out" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Change password" })).toBeInTheDocument();
   });
 
   it("validates all three sign-up fields before posting", async () => {
@@ -54,51 +55,102 @@ describe("AuthGate", () => {
     );
   });
 
-  it("code mode: verifies with the remembered email and offers a new code on 410", async () => {
-    let verifyStatus = 410;
+  it("signs in with email + password and shows the app", async () => {
     const fetchMock = stubAuthFetch({
       me: 401,
+      handlers: { "/auth/signin": () => jsonResponse(userFixture(), 200) },
+    });
+    const user = userEvent.setup();
+    renderWithClient(<AuthGate>{PANELS}</AuthGate>);
+
+    await user.type(await screen.findByLabelText("Email"), "alice@example.com");
+    await user.type(screen.getByLabelText("Password"), "s3cret_pw");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
+
+    const call = fetchMock.mock.calls.find((c) => String(c[0]).includes("/auth/signin"));
+    expect(bodyOf(call!)).toEqual({ email: "alice@example.com", password: "s3cret_pw" });
+    expect(await screen.findByTestId("panels")).toBeInTheDocument();
+  });
+
+  it("shows the server error on a bad password (uniform 401)", async () => {
+    stubAuthFetch({
+      me: 401,
       handlers: {
-        "/auth/signin": () => jsonResponse({ status: "sent", method: "code" }, 202),
-        "/auth/verify": () =>
-          verifyStatus === 410
-            ? jsonResponse({ detail: "verification expired" }, 410)
-            : jsonResponse(userFixture(), 200),
+        "/auth/signin": () => jsonResponse({ detail: "Invalid email or password." }, 401),
       },
     });
     const user = userEvent.setup();
     renderWithClient(<AuthGate>{PANELS}</AuthGate>);
 
     await user.type(await screen.findByLabelText("Email"), "alice@example.com");
-    await user.click(screen.getByRole("button", { name: "Send verification" }));
+    await user.type(screen.getByLabelText("Password"), "wrong_pass1");
+    await user.click(screen.getByRole("button", { name: "Sign in" }));
 
-    // Now on the code screen. Enter a code and submit.
-    await user.type(await screen.findByLabelText("Verification code"), "123456");
-    await user.click(screen.getByRole("button", { name: "Verify" }));
-
-    // The verify call carried the remembered email + code — no re-typing.
-    const verifyCall = fetchMock.mock.calls.find((c) => String(c[0]).includes("/auth/verify"));
-    expect(bodyOf(verifyCall!)).toEqual({ email: "alice@example.com", code: "123456" });
-    // A 410 offers a fresh code.
-    expect(await screen.findByRole("button", { name: "Send me a new code" })).toBeInTheDocument();
+    expect(await screen.findByText(/Invalid email or password/i)).toBeInTheDocument();
+    expect(screen.queryByTestId("panels")).toBeNull();
   });
 
-  it("link mode: posts the token from the hash and clears the fragment", async () => {
-    window.location.hash = "#/verify?token=magic-abc";
-    const fetchMock = stubAuthFetch({
-      me: 401,
-      handlers: { "/auth/verify": () => jsonResponse(userFixture(), 200) },
-    });
+  it("enforces the password rule on sign-up before posting", async () => {
+    const fetchMock = stubAuthFetch({ me: 401 });
+    const user = userEvent.setup();
     renderWithClient(<AuthGate>{PANELS}</AuthGate>);
 
-    await waitFor(() => {
-      const call = fetchMock.mock.calls.find((c) => String(c[0]).includes("/auth/verify"));
-      expect(call).toBeTruthy();
-      expect(bodyOf(call!)).toEqual({ token: "magic-abc" });
+    await user.click(await screen.findByRole("button", { name: "Sign up" }));
+    await user.type(screen.getByLabelText("First name"), "Alice");
+    await user.type(screen.getByLabelText("Last name"), "Smith");
+    await user.type(screen.getByLabelText("Email"), "alice@example.com");
+    // No special char → rejected client-side, never posted.
+    await user.type(screen.getByLabelText("Password"), "abcdefghij");
+    await user.type(screen.getByLabelText("Confirm password"), "abcdefghij");
+    await user.click(screen.getByRole("button", { name: "Sign up" }));
+
+    expect(screen.getByText(/special character/i)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/auth/signup"))).toBe(
+      false,
+    );
+  });
+
+  it("catches a mistyped confirmation on sign-up", async () => {
+    const fetchMock = stubAuthFetch({ me: 401 });
+    const user = userEvent.setup();
+    renderWithClient(<AuthGate>{PANELS}</AuthGate>);
+
+    await user.click(await screen.findByRole("button", { name: "Sign up" }));
+    await user.type(screen.getByLabelText("First name"), "Alice");
+    await user.type(screen.getByLabelText("Last name"), "Smith");
+    await user.type(screen.getByLabelText("Email"), "alice@example.com");
+    await user.type(screen.getByLabelText("Password"), "s3cret_pw");
+    await user.type(screen.getByLabelText("Confirm password"), "s3cret_pX");
+    await user.click(screen.getByRole("button", { name: "Sign up" }));
+
+    expect(screen.getByText(/do not match/i)).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some((c) => String(c[0]).includes("/auth/signup"))).toBe(
+      false,
+    );
+  });
+
+  it("changes password from the signed-in bar and returns to the app", async () => {
+    const fetchMock = stubAuthFetch({
+      me: userFixture(),
+      handlers: { "/auth/change-password": () => new Response(null, { status: 204 }) },
     });
-    // The token is scrubbed from the URL so it does not linger in history.
-    expect(window.location.hash).toBe("");
-    // Success hands off to the app.
+    const user = userEvent.setup();
+    renderWithClient(<AuthGate>{PANELS}</AuthGate>);
+
+    await user.click(await screen.findByRole("button", { name: "Change password" }));
+    await user.type(screen.getByLabelText("Current password"), "s3cret_pw");
+    await user.type(screen.getByLabelText("New password"), "an0ther-pw");
+    await user.type(screen.getByLabelText("Confirm new password"), "an0ther-pw");
+    await user.click(screen.getByRole("button", { name: "Change password" }));
+
+    const call = fetchMock.mock.calls.find((c) =>
+      String(c[0]).includes("/auth/change-password"),
+    );
+    expect(bodyOf(call!)).toEqual({
+      current_password: "s3cret_pw",
+      new_password: "an0ther-pw",
+    });
+    // Back to the app.
     expect(await screen.findByTestId("panels")).toBeInTheDocument();
   });
 

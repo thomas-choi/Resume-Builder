@@ -294,22 +294,23 @@ see in the browser is identical.)*
 | An organization repo you worked on only via a non-default branch, or under a different commit email, may not be recognized as yours | Later improvement (branch-aware contribution probe) |
 | Accounts are isolated per person (Phase 7 — see below); a shared, no-login mode is still available for single-user deployments | Resolved (per-user data roots + route enforcement) |
 
-## Accounts (Phase 7 — passwordless sign-up / sign-in, isolated per person)
+## Accounts (Phase 7 — email + password sign-up / sign-in, isolated per person)
 
-You create an account and sign in **without a password**. The email address *is*
-your identity — there is no separate username to choose.
+You create an account and sign in with an **email and password**. The email
+address *is* your identity — there is no separate username to choose.
 
-- **Sign up** with your first name, last name and email. We email you a proof of
-  receipt: by default a **6-digit code** you type back into the screen, or (if
-  the deployment prefers it) a **magic link** you click. Completing it confirms
-  the address and signs you in.
-- **Sign in** with just your email; the same code-or-link confirms it's you.
-- **No login before you confirm.** An address that started sign-up but never
-  finished it can't be used to sign in — the only way forward is to complete the
-  sign-up it began.
-- To keep the screens from revealing who has an account, every sign-up and
-  sign-in reply looks the same; if there's nothing to act on (no account, or one
-  you already finished), the *email* explains what to do next.
+- **Sign up** with your first name, last name, email and a password. You type
+  the password **twice** so a typo can't lock you out, and it must follow the
+  rule below. Sign-up creates your account and signs you in right away.
+- **Sign in** with your email and password.
+- **Password rule:** **more than 8 characters**, and **at least one** of these
+  special characters: `_ $ , -`. The sign-up screen checks this as you go and
+  the server enforces it too.
+- **Change your password** any time from the top bar (*Change password*): enter
+  your current password, then the new one twice. Changing it signs your other
+  sessions out.
+- **Wrong email or password** gives the same "Invalid email or password" message
+  either way, so the screen never reveals whether an address has an account.
 - **Signed in, then away for a while?** Sessions last 14 days and refresh as you
   use the app. If yours expires mid-session, the app quietly drops you back to
   the sign-in screen rather than showing a wall of errors — your unsaved edits on
@@ -328,9 +329,26 @@ a filename or a log.
 (`AUTH_ENABLED=false`), which skips login entirely and puts everyone on one
 shared account — handy for a personal install or CI. See OPERATIONS.md.
 
-*Running locally with no mail server?* The default setup writes each email to a
-file instead of sending it — open the newest file in `data/auth/outbox/` to read
-your code or link (see OPERATIONS.md).
+> **Email verification is off right now.** Sign-up no longer emails a code or
+> link — your account works the moment you set a password. We plan to bring
+> verification back, so no email is required to use the app today. There is also
+> no "forgot password" reset yet; you change your password from inside the app
+> while signed in.
+
+## Tutorial page
+
+A **Tutorial** tab at the top of the app gives a short, self-contained guide:
+
+- **How Resume Builder works** — the sources → profile → tailor flow, and the
+  promise that nothing is fabricated.
+- **How to download your LinkedIn export** (`summary.zip`) — the exact
+  Settings → Data Privacy → *Get a copy of your data* steps, so you can add your
+  LinkedIn history as a source.
+- **How to create a GitHub personal access token** — where it lives in GitHub
+  settings, which permissions to grant, and why a token is optional (it raises
+  rate limits and unlocks your private repos).
+
+Switch back to **Builder** at any time from the same tab bar.
 
 ---
 
