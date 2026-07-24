@@ -63,6 +63,33 @@ def test_signup_sends_code_and_returns_202(client, sent):
     assert auth_store.load_user("a@example.com") is not None
 
 
+def test_signup_accepts_any_allowed_origin(client, sent, monkeypatch):
+    monkeypatch.setattr(
+        config,
+        "AUTH_ALLOWED_ORIGINS",
+        frozenset({"http://localhost:8000", "http://192.168.0.212:8000"}),
+    )
+    resp = client.post(
+        "/auth/signup",
+        json={"first_name": "A", "last_name": "B", "email": "a@example.com"},
+        headers={"Origin": "http://192.168.0.212:8000"},
+    )
+    assert resp.status_code == 202
+
+
+def test_signup_rejects_origin_outside_allow_list(client, monkeypatch):
+    monkeypatch.setattr(
+        config, "AUTH_ALLOWED_ORIGINS", frozenset({"http://localhost:8000"})
+    )
+    resp = client.post(
+        "/auth/signup",
+        json={"first_name": "A", "last_name": "B", "email": "a@example.com"},
+        headers={"Origin": "http://evil.example.com"},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "bad origin"
+
+
 def test_verify_flips_email_verified_and_sets_cookie(client, sent):
     resp = _signup_and_verify(client, sent)
     assert resp.status_code == 200

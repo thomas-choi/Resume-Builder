@@ -15,6 +15,12 @@ from src.models.schemas import (
 )
 
 
+# The account the store/graph tests write under (Phase 7.c). Every store call
+# takes the owner's email first; tests use this one address, whose data lands
+# under `data/users/{sha256(TEST_EMAIL)}/`.
+TEST_EMAIL = "tester@example.com"
+
+
 class RawMessage:
     """Minimal stand-in for an AIMessage carrying structured-output tool calls."""
 

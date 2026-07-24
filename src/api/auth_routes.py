@@ -30,9 +30,9 @@ auth_router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 def _check_origin(request: Request) -> None:
-    """Cheap second gate behind SameSite: a present ``Origin`` must match config."""
+    """Cheap second gate behind SameSite: a present ``Origin`` must be allowed."""
     origin = request.headers.get("origin")
-    if origin and origin.rstrip("/") != config.PUBLIC_BASE_URL.rstrip("/"):
+    if origin and origin.rstrip("/") not in config.AUTH_ALLOWED_ORIGINS:
         raise HTTPException(status_code=403, detail="bad origin")
 
 

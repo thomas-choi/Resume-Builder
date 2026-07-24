@@ -21,6 +21,7 @@ from src.models.schemas import (
     ValidationFlag,
     ValidationResult,
 )
+from tests.conftest import TEST_EMAIL
 
 
 def _flagged_cv() -> TailoredCV:
@@ -91,6 +92,7 @@ def _start(sample_profile, tailor_id: str, **overrides) -> tuple[object, dict]:
     graph = tailoring_graph.build_tailoring_graph()
     state = graph.invoke(
         {
+            "email": TEST_EMAIL,
             "profile": sample_profile,
             "job_post": "A job post",
             "tailor_id": tailor_id,
@@ -270,7 +272,7 @@ def test_flagged_run_interrupts_before_rendering(monkeypatch, data_dir, sample_p
     assert payload["brief"] == "A brief for the human."
     # Paused, not finished — and nothing on disk.
     assert graph.get_state(_thread("t-pause")).next == ("human_review",)
-    assert not (data_dir / "documents" / "t-pause" / "cv.docx").exists()
+    assert not (config.user_root(TEST_EMAIL) / "documents" / "t-pause" / "cv.docx").exists()
 
 
 def test_pending_review_is_persisted_for_the_api(monkeypatch, data_dir, sample_profile):
@@ -278,7 +280,7 @@ def test_pending_review_is_persisted_for_the_api(monkeypatch, data_dir, sample_p
 
     _mock_nodes(monkeypatch)
     _start(sample_profile, "t-persist")
-    stored = document_store.load_review("t-persist")
+    stored = document_store.load_review(TEST_EMAIL, "t-persist")
     assert stored["tailor_id"] == "t-persist"
     assert len(stored["items"]) == 2
     assert ReviewRequest.model_validate(
@@ -308,7 +310,7 @@ def test_resume_renders_the_reviewed_cv_without_rejected_claims(
     # The rejected bullet is gone from the rendered document, the approved
     # skill is still there.
     text = "\n".join(
-        p.text for p in Document(str(data_dir / "documents" / "t-resume" / "cv.docx")).paragraphs
+        p.text for p in Document(str(config.user_root(TEST_EMAIL) / "documents" / "t-resume" / "cv.docx")).paragraphs
     )
     assert "Ran a team of 40" not in text
     assert "Kubernetes" in text

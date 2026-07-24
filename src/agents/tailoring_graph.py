@@ -48,6 +48,9 @@ _CHECKPOINTER = MemorySaver()
 
 
 class TailoringState(TypedDict, total=False):
+    # The owner's email (the user-id, §14.8). Threaded from the route so the
+    # review record and rendered documents land under this account's root.
+    email: str
     profile: CareerProfile
     job_post: str
     job_requirements: JobRequirements
@@ -109,7 +112,7 @@ def prepare_review(state: TailoringState) -> TailoringState:
     request.brief = review.write_brief(request, state.get("job_requirements"))
     # Persisted before pausing so the pending review is readable (and
     # auditable) independently of the in-process checkpointer.
-    document_store.save_review(tailor_id, request.model_dump())
+    document_store.save_review(state["email"], tailor_id, request.model_dump())
     logger.info(
         "prepare_review: tailor %s has %d flagged item(s) for review",
         tailor_id,
@@ -162,6 +165,7 @@ def render_document(state: TailoringState) -> TailoringState:
 
     profile = state["profile"]
     documents = document.render_documents(
+        state["email"],
         state["tailor_id"],
         state["tailored_cv"],
         name=profile.name,

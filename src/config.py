@@ -1,6 +1,7 @@
 """Environment-driven configuration for the resume builder."""
 
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -103,13 +104,23 @@ SKILLS_DIR: Path = Path(os.getenv("SKILLS_DIR", "./skills"))
 
 # Accounts / passwordless auth (Phase 7). 7.a adds only the mail rows; the
 # auth-flow rows (verify method, TTLs, session cookie, rate limit) arrive with
-# 7.b. `AUTH_ENABLED` / `SINGLE_USER_EMAIL` are deliberately deferred to 7.c —
-# they only matter once the stores take a per-user root.
+# 7.b. `AUTH_ENABLED` / `SINGLE_USER_EMAIL` land in 7.c (below) — they only
+# matter once the stores take a per-user root.
 
 
 def _flag(name: str, default: str = "true") -> bool:
     """Parse a boolean env var the same way as RENDER_PDF."""
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _origins(name: str, default: str) -> frozenset[str]:
+    """Parse a comma-separated origin allow-list, trimming a trailing slash.
+
+    Each entry is a full browser origin (scheme + host + optional port), e.g.
+    ``http://localhost:8000,http://127.0.0.1:8000``. Empty entries are dropped.
+    """
+    raw = os.getenv(name, default)
+    return frozenset(o.strip().rstrip("/") for o in raw.split(",") if o.strip())
 
 
 # Mail delivery (§14.9). `file` (default) drops a complete .eml into the outbox
@@ -129,15 +140,87 @@ SMTP_TIMEOUT_S: int = int(os.getenv("SMTP_TIMEOUT_S", "10"))
 AUTH_VERIFY_METHOD: str = os.getenv("AUTH_VERIFY_METHOD", "code")  # code | link
 VERIFY_CODE_LENGTH: int = int(os.getenv("VERIFY_CODE_LENGTH", "6"))
 AUTH_MAX_CODE_ATTEMPTS: int = int(os.getenv("AUTH_MAX_CODE_ATTEMPTS", "5"))
+
+# --- Public address (single source of truth) --------------------------------
+# One scheme+host+port describes how the app is reached, so moving a deployment
+# (a LAN box, a cloud host on an assigned port) changes only these three, and
+# both the magic-link base URL and the CSRF origin allow-list derive from them.
+# API_PORT is the same knob the container binds (API_PORT > $PORT > 8000), read
+# here only to build the URL/origins. Either derived value can still be pinned
+# explicitly via its own env var — e.g. a dev setup whose UI loads from a
+# separate Vite port lists both origins in AUTH_ALLOWED_ORIGINS by hand.
+API_PORT: int = int(os.getenv("API_PORT") or os.getenv("PORT") or "8000")
+PUBLIC_HOST: str = os.getenv("PUBLIC_HOST", "localhost")
+PUBLIC_SCHEME: str = os.getenv("PUBLIC_SCHEME", "http")  # set https behind TLS
+_DERIVED_BASE_URL = f"{PUBLIC_SCHEME}://{PUBLIC_HOST}:{API_PORT}"
 # Base for magic links + the "you already have an account" mail. Never derived
 # from the request Host header (a forged Host would point the link elsewhere).
-PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000")
+PUBLIC_BASE_URL: str = os.getenv("PUBLIC_BASE_URL", _DERIVED_BASE_URL)
+# Origins the browser may POST /auth/* from (§14.9 CSRF gate). A present
+# `Origin` header must be in this set. Comma-separated; defaults to just
+# PUBLIC_BASE_URL (the single derived origin). Set it explicitly only when the
+# UI loads from more than one origin, e.g. a separate dev-server port.
+AUTH_ALLOWED_ORIGINS: frozenset[str] = _origins(
+    "AUTH_ALLOWED_ORIGINS", PUBLIC_BASE_URL
+)
 SESSION_COOKIE_NAME: str = os.getenv("SESSION_COOKIE_NAME", "rb_session")
 SESSION_COOKIE_SECURE: bool = _flag("SESSION_COOKIE_SECURE", "true")
 SESSION_TTL_S: int = int(os.getenv("SESSION_TTL_S", "1209600"))  # 14 days, sliding
 SIGNUP_TTL_S: int = int(os.getenv("SIGNUP_TTL_S", "1800"))  # 30 min
 SIGNIN_TTL_S: int = int(os.getenv("SIGNIN_TTL_S", "900"))  # 15 min
 AUTH_MAX_SENDS_PER_HOUR: int = int(os.getenv("AUTH_MAX_SENDS_PER_HOUR", "5"))
+
+# Per-user isolation (§14.10, added in 7.c). `AUTH_ENABLED=false` runs the
+# legacy single-user mode: `current_user` returns a synthetic verified account
+# for `SINGLE_USER_EMAIL` instead of reading a cookie, and every run's data is
+# rooted under that one account — the same code path as a real signed-in user,
+# so auth-off never becomes the untested branch (§14.11).
+AUTH_ENABLED: bool = _flag("AUTH_ENABLED", "true")
+# `local@example.com`, not the design's literal `local@localhost`: the account
+# is a real `User` (its record round-trips through `create_user` in migration),
+# whose `email` field is an `EmailStr` — and `localhost` has no dot, so it fails
+# that validation. `example.com` is the IANA-reserved placeholder domain, so no
+# mail is ever deliverable to it, which is exactly right for an offline account.
+SINGLE_USER_EMAIL: str = os.getenv("SINGLE_USER_EMAIL", "local@example.com")
+
+# ^[0-9a-f]{64}^ — a sha256 hex handle. Asserted in user_root as belt-and-braces
+# (the hash always matches), so a malformed id can never name a directory.
+_UID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def user_root(email: str) -> Path:
+    """The per-account storage root ``DATA_DIR/users/{uid}`` (§14.8).
+
+    The single place ``DATA_DIR/"users"/uid`` is spelled. ``uid =
+    sha256(normalize(email))`` is computed by :mod:`src.utils.auth_store` (never
+    re-implemented here) so the on-disk handle and the auth store's account
+    filenames stay in lock-step. The email is the user-id; ``uid`` is only the
+    physical handle, so the address never appears in a path (R3, §14.3).
+
+    Raises:
+        ValueError: If the computed ``uid`` is not 64 hex chars — impossible for
+            a real hash, asserted anyway as defense in depth.
+    """
+    from src.utils import auth_store  # local import: auth_store imports config
+
+    handle = auth_store.uid(email)
+    if not _UID_RE.fullmatch(handle):
+        raise ValueError(f"invalid user handle {handle!r}")
+    return DATA_DIR / "users" / handle
+
+
+def within(root: Path, path: Path) -> bool:
+    """Whether ``path`` resolves to somewhere inside ``root`` (§14.2, §14.8).
+
+    Each store asserts this before opening anything — defense in depth against a
+    malformed id inside one user's own tree escaping via ``..`` or an absolute
+    path, even after the separator-free id checks.
+    """
+    try:
+        return path.resolve().is_relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+
 
 # Logging: level name (DEBUG/INFO/WARNING/ERROR); unset LOG_FILE = console only
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

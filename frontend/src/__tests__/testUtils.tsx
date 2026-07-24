@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render } from "@testing-library/react";
 import type { ReactElement } from "react";
+import { vi } from "vitest";
 
-import type { CareerProfile, Project, ReviewRequest, TailorResponse } from "../lib/types";
+import type { CareerProfile, Project, ReviewRequest, TailorResponse, UserPublic } from "../lib/types";
 
 /** Render inside a fresh QueryClient (no retries — a failure must surface now). */
 export function renderWithClient(ui: ReactElement) {
@@ -10,6 +11,43 @@ export function renderWithClient(ui: ReactElement) {
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(<QueryClientProvider client={queryClient}>{ui}</QueryClientProvider>);
+}
+
+export function userFixture(overrides: Partial<UserPublic> = {}): UserPublic {
+  return { email: "alice@example.com", first_name: "Alice", last_name: "Smith", ...overrides };
+}
+
+/**
+ * Stub `global.fetch` for the auth flow. `/auth/me` resolves to a signed-in
+ * user by default (so the panel suites that now sit behind the gate keep
+ * rendering the app); pass `{ me: 401 }` to render the signed-out screens.
+ * Other paths are dispatched through `handlers`, else a 200 empty body.
+ */
+export function stubAuthFetch(options: {
+  me?: UserPublic | 401;
+  handlers?: Record<string, () => Response | Promise<Response>>;
+} = {}) {
+  const me = options.me ?? userFixture();
+  const handlers = options.handlers ?? {};
+  const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+    const url = typeof input === "string" ? input : input.toString();
+    const path = url.replace(/^https?:\/\/[^/]+/, "");
+    if (path === "/auth/me") {
+      return me === 401
+        ? new Response(JSON.stringify({ detail: "not authenticated" }), { status: 401 })
+        : new Response(JSON.stringify(me), { status: 200 });
+    }
+    for (const [prefix, handler] of Object.entries(handlers)) {
+      if (path.startsWith(prefix)) return handler();
+    }
+    return new Response(JSON.stringify({}), { status: 200 });
+  });
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+export function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status });
 }
 
 export function profileFixture(overrides: Partial<CareerProfile> = {}): CareerProfile {

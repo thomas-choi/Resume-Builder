@@ -10,22 +10,40 @@ from src import config
 # lines across a run share the same [run:...] tag and are greppable together.
 run_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("run_id", default="-")
 
-_FORMAT = "%(asctime)s %(levelname)s [run:%(run_id)s] %(name)s: %(message)s"
+# Per-user attribution (§14.8). Records the **uid** (the sha256(email) handle),
+# never the raw address: the user-id is the email (PII), so the pseudonymous
+# hash is what ties a log line back to an account. Codes, link tokens, session
+# cookies and raw emails are never logged.
+user_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="-")
+
+_FORMAT = (
+    "%(asctime)s %(levelname)s [run:%(run_id)s user:%(user_id)s] %(name)s: %(message)s"
+)
 _MAX_BYTES = 10 * 1024 * 1024
 _BACKUP_COUNT = 3
 
 
-class _RunIdFilter(logging.Filter):
-    """Inject the current run_id contextvar onto every log record."""
+class _ContextFilter(logging.Filter):
+    """Inject the current run_id / user_id contextvars onto every log record."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         record.run_id = run_id_var.get()
+        record.user_id = user_id_var.get()
         return True
 
 
 def set_run_id(run_id: str) -> None:
     """Bind the run correlation id for subsequent log records in this context."""
     run_id_var.set(run_id)
+
+
+def set_user(uid: str) -> None:
+    """Bind the account handle (``sha256(email)``) for subsequent log records.
+
+    The argument is the **uid**, not the email: attribution uses the
+    pseudonymous hash so no log line holds the person's address (§14.8).
+    """
+    user_id_var.set(uid)
 
 
 def _resolve_level() -> int:
@@ -54,7 +72,7 @@ def setup_logging() -> None:
     if not has_console:
         console = logging.StreamHandler()
         console.setFormatter(logging.Formatter(_FORMAT))
-        console.addFilter(_RunIdFilter())
+        console.addFilter(_ContextFilter())
         root.addHandler(console)
 
     if config.LOG_FILE is None:
@@ -70,7 +88,7 @@ def setup_logging() -> None:
             config.LOG_FILE, maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT
         )
         file_handler.setFormatter(logging.Formatter(_FORMAT))
-        file_handler.addFilter(_RunIdFilter())
+        file_handler.addFilter(_ContextFilter())
         root.addHandler(file_handler)
 
     # uvicorn attaches its own console-only handlers with propagate=False,

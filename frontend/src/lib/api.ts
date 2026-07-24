@@ -1,18 +1,51 @@
 /** Thin fetch wrappers over the FastAPI endpoints (same origin — see main.py). */
 
 import type {
+  AuthChallengeResponse,
   CareerProfile,
   IngestResponse,
   ProfileResponse,
   ReviewDecision,
   ReviewRequest,
   TailorResponse,
+  UserPublic,
 } from "./types";
+
+/**
+ * Called when *any* API call comes back `401`. AuthGate registers a handler
+ * that clears the query cache and drops to the signed-out screen. A `401` is
+ * the one case where erasing loaded data is correct; it is told apart from a
+ * network failure (Phase 6.c: a failed *refresh* must keep the data on screen)
+ * **by status, not by guesswork** — a transport error never reaches here.
+ */
+let onUnauthorized: (() => void) | null = null;
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  onUnauthorized = handler;
+}
+
+/** Thrown on a `401` so callers can distinguish it from any other HTTP error. */
+export class UnauthorizedError extends Error {
+  status = 401 as const;
+}
+
+/** Any other non-2xx response, carrying its status so callers can branch on it
+ * (VerifyPanel needs `410` to offer "send me a new code"). */
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(path, init);
+    // Same-origin credentials so the session cookie rides along on every call
+    // (the UI and API share one origin — see main.py).
+    response = await fetch(path, { credentials: "same-origin", ...init });
   } catch (error) {
     // `fetch` rejects only on a *transport* failure — connection reset, DNS,
     // proxy hang-up, browser offline — and does so with a bare
@@ -25,6 +58,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     // An abort is React Query discarding a superseded request, not a failure.
     throw error;
   }
+  if (response.status === 401) {
+    // Session gone or never established: drop straight to signed-out. This is
+    // deliberate erasure, gated on the 401 status — the network-failure branch
+    // above never reaches this point.
+    onUnauthorized?.();
+    throw new UnauthorizedError("session expired");
+  }
   if (!response.ok) {
     // FastAPI puts the reason in `detail`; surface it rather than a bare status.
     let detail = `${response.status} ${response.statusText}`;
@@ -34,9 +74,74 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* non-JSON error body — keep the status line */
     }
-    throw new Error(detail);
+    throw new ApiError(response.status, detail);
   }
   return (await response.json()) as T;
+}
+
+// --- auth (Phase 7.e) ------------------------------------------------------
+
+/**
+ * Who is signed in, or `401`.
+ *
+ * This one call **bypasses** the global 401 handler: a signed-out `401` here is
+ * the normal "show me the sign-in screen" answer, not a mid-session expiry, so
+ * it must not trigger the cache-clearing drop-out (which would refetch this and
+ * loop). AuthGate reads the thrown `UnauthorizedError` as "render auth screens".
+ */
+export async function getAuthMe(signal?: AbortSignal): Promise<UserPublic> {
+  const response = await fetch("/auth/me", { credentials: "same-origin", signal });
+  if (response.status === 401) throw new UnauthorizedError("not authenticated");
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  return (await response.json()) as UserPublic;
+}
+
+export interface SignUpInput {
+  firstName: string;
+  lastName: string;
+  email: string;
+}
+
+/** Claim an account and send a verification challenge (uniform 202). */
+export function signup(input: SignUpInput): Promise<AuthChallengeResponse> {
+  return request<AuthChallengeResponse>("/auth/signup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      first_name: input.firstName,
+      last_name: input.lastName,
+      email: input.email,
+    }),
+  });
+}
+
+/** Request a sign-in challenge (uniform 202 in every branch). */
+export function signin(email: string): Promise<AuthChallengeResponse> {
+  return request<AuthChallengeResponse>("/auth/signin", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email }),
+  });
+}
+
+/** Consume a challenge: `{email, code}` (code mode) or `{token}` (link mode). */
+export function verify(body: {
+  email?: string;
+  code?: string;
+  token?: string;
+}): Promise<UserPublic> {
+  return request<UserPublic>("/auth/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+/** Revoke the session and clear the cookie. */
+export function signout(): Promise<void> {
+  return fetch("/auth/signout", { method: "POST", credentials: "same-origin" }).then(
+    () => undefined,
+  );
 }
 
 export interface IngestInput {

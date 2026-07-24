@@ -1146,22 +1146,24 @@ a `node:20-slim` stage builds the review UI, and the python:3.11-slim runtime
 
 ## 14. Accounts, passwordless auth and per-user isolation (Phase 7)
 
-> **Status: 7.a + 7.b implemented (2026-07-22); 7.c–7.e still design.** The
-> mailer (§14.9), the account/challenge/session store (§14.3–14.7) and the
-> `/auth/*` routes (§14.5, §14.13) are built and tested — the sign-up/sign-in
-> flow works end to end via the `file` mail backend, with R6 enforced. **Not yet
-> built:** per-user data roots (§14.3 `data/users/{uid}/`), business-route
-> enforcement (§14.8), the migration script (§14.11) and the frontend (§14.12).
-> Until 7.c–7.d land, `/ingest`, `/profile` and `/tailor` are unauthenticated and
-> share one namespace. The rest of §14 is recorded as originally designed so the
-> later steps stay settled ahead of code.
+> **Status: 7.a–7.e implemented (7.a/7.b 2026-07-22; 7.c/7.d/7.e 2026-07-23).**
+> The mailer (§14.9), the account/challenge/session store (§14.3–14.7), the
+> `/auth/*` routes (§14.5, §14.13), **per-user data roots** (§14.3
+> `data/users/{uid}/`), **fail-closed business-route enforcement** (§14.8), the
+> **migration script** (§14.11) and the **frontend `AuthGate`** (§14.12) are all
+> built and tested. With `AUTH_ENABLED=true` (the shipped default) every business
+> route requires a session, ids resolve only under the caller's own root
+> (cross-account → `404`), and the three non-path side channels (SSE registry,
+> checkpointer `thread_id`, logs) are isolated too. `AUTH_ENABLED=false` runs the
+> legacy single-user mode through the *same* store code path.
 >
-> **Two deviations from a literal §14, both because their dependency does not
-> exist until 7.c:** (1) `POST /auth/verify` does **not** `mkdir
-> data/users/{uid}/` — creating the per-user root belongs to 7.c, so 7.b's verify
-> creates only the account record + session; (2) `AUTH_ENABLED` /
-> `SINGLE_USER_EMAIL` (§14.10, §14.11) are **not** added in 7.b — they only
-> matter once the stores take a `user_id`, so they arrive with 7.c.
+> **Deviations from a literal §14, recorded:** (1) `SINGLE_USER_EMAIL` defaults to
+> `local@example.com`, **not** the design's `local@localhost` — the single-user
+> account is a real `User` whose `email` is an `EmailStr`, and `localhost` (no
+> dot) fails that validation; `example.com` is the IANA-reserved placeholder, so
+> nothing is ever deliverable to it. (2) The 7.b verify path still does not
+> `mkdir data/users/{uid}/`; the per-user tree is created lazily by the stores on
+> first write, which is equivalent and needs no verify-time change.
 >
 > **As-implemented notes worth recording:** code-method challenges keep a
 > companion index `challenges/idx-{sha256(email)}.json` mapping the email to its
@@ -1469,8 +1471,11 @@ cookies — so `GET /ingest/{job_id}/events` authenticates exactly like every
 other route, with no token-in-query-string workaround.
 
 Belt to `SameSite`'s braces: unsafe methods assert that `Origin` (when present)
-matches `PUBLIC_BASE_URL`. Rejected as the *primary* defense because reverse
-proxies and native clients make `Origin` unreliable; kept as a cheap second gate.
+is in `AUTH_ALLOWED_ORIGINS` — a comma-separated allow-list that defaults to just
+`PUBLIC_BASE_URL`, so the UI can be reached over several hosts (`localhost`,
+`127.0.0.1`, a LAN IP) without every browser origin having to match the single
+magic-link base. Rejected as the *primary* defense because reverse proxies and
+native clients make `Origin` unreliable; kept as a cheap second gate.
 
 ### 14.8 Enforcement — one dependency, fail-closed
 
@@ -1572,6 +1577,7 @@ noted rather than pre-solved.
 | `VERIFY_CODE_LENGTH` | `6` | Digits in the OTP |
 | `AUTH_MAX_CODE_ATTEMPTS` | `5` | Wrong-code tries before a challenge is burned |
 | `PUBLIC_BASE_URL` | `http://localhost:8000` | Base for magic links + the "sign in here" mail — never derived from `Host` |
+| `AUTH_ALLOWED_ORIGINS` | value of `PUBLIC_BASE_URL` | Comma-separated origins allowed to POST `/auth/*`; a present `Origin` outside the set → `403 bad origin` |
 | `SESSION_COOKIE_NAME` | `rb_session` | |
 | `SESSION_TTL_S` | `1209600` (14 d) | Sliding |
 | `SESSION_COOKIE_SECURE` | `true` | Set `false` for local http |
@@ -1699,6 +1705,8 @@ drops to sign-in while a *network* failure still keeps the loaded profile (the
 Phase 6.c behaviour must survive).
 
 ### 14.15 Build order
+
+*All five steps are implemented (7.a/7.b 2026-07-22; 7.c/7.d/7.e 2026-07-23).*
 
 1. **7.a** — `mailer.py` + config + the `file` backend, with tests. Nothing else
    works without a testable way to send mail.

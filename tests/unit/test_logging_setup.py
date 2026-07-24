@@ -68,9 +68,11 @@ def test_run_id_tag_in_log_output(tmp_path, monkeypatch):
 
     logging_setup.setup_logging()
     logging_setup.set_run_id("run-abc")
+    logging_setup.set_user("uid-xyz")
     logging.getLogger("test").info("tagged line")
 
-    assert "[run:run-abc]" in log_file.read_text()
+    # Both the run id and the pseudonymous user handle tag the line (§14.8).
+    assert "[run:run-abc user:uid-xyz]" in log_file.read_text()
 
 
 def test_unknown_level_falls_back_to_info(monkeypatch):

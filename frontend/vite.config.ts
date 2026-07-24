@@ -32,7 +32,7 @@ export default defineConfig({
   server: {
     ...server,
     proxy: Object.fromEntries(
-      ["/ingest", "/profile", "/tailor", "/document", "/healthz"].map((path) => [
+      ["/auth", "/ingest", "/profile", "/tailor", "/document", "/healthz"].map((path) => [
         path,
         { target: API_URL, changeOrigin: true },
       ]),

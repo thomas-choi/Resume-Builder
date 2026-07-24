@@ -2,16 +2,21 @@
 
 Mirrors the layout conventions of :mod:`src.utils.profile_store`, but keyed by a
 ``run_id`` (one ``/ingest`` execution) instead of a ``profile_id`` (an evolving
-storage key). For every run it captures:
+storage key). Per account (§14.8): every root-touching function takes the
+owner's ``email`` first. For every run it captures, under
+``data/users/{uid}/``:
 
-- ``data/sources/{run_id}/`` — the raw inputs exactly as received (uploaded CVs,
-  the serialized GitHub source, the free-text / LinkedIn summary).
-- ``data/sources/{run_id}/manifest.json`` — an index of those inputs (category,
+- ``sources/{run_id}/`` — the raw inputs exactly as received (uploaded CVs, the
+  serialized GitHub source, the free-text / LinkedIn summary).
+- ``sources/{run_id}/manifest.json`` — an index of those inputs (category,
   filename, byte size, sha256) linked to the produced ``profile_id`` / ``version``.
-- ``data/output/{run_id}/output.json`` — a copy of the synthesized profile.
+- ``output/{run_id}/output.json`` — a copy of the synthesized profile.
 
 Together these let a run be reconstructed or audited after the fact, tying raw
 inputs → final output (design doc §13 / PLAN.md Phase 1 run tracking).
+
+The pure helpers that touch no root (:func:`source_entry`,
+:func:`prune_source_document`, :func:`_free_path`) keep their old signatures.
 """
 
 import hashlib
@@ -29,22 +34,30 @@ _MANIFEST_NAME = "manifest.json"
 _OUTPUT_NAME = "output.json"
 
 
-def _sources_root() -> Path:
-    return config.DATA_DIR / "sources"
+def _sources_root(email: str) -> Path:
+    return config.user_root(email) / "sources"
 
 
-def _output_root() -> Path:
-    return config.DATA_DIR / "output"
+def _output_root(email: str) -> Path:
+    return config.user_root(email) / "output"
 
 
-def sources_dir(run_id: str) -> Path:
+def _checked(root: Path, run_id: str) -> Path:
+    """Join ``run_id`` onto ``root``, asserting it stays inside (§14.2)."""
+    path = root / run_id
+    if not config.within(root, path):
+        raise ValueError(f"run id {run_id!r} escapes the user root")
+    return path
+
+
+def sources_dir(email: str, run_id: str) -> Path:
     """Directory holding the archived raw inputs for a run."""
-    return _sources_root() / run_id
+    return _checked(_sources_root(email), run_id)
 
 
-def output_dir(run_id: str) -> Path:
+def output_dir(email: str, run_id: str) -> Path:
     """Directory holding the saved output copy for a run."""
-    return _output_root() / run_id
+    return _checked(_output_root(email), run_id)
 
 
 def _free_path(dest_dir: Path, safe_name: str) -> Path:
@@ -59,7 +72,9 @@ def _free_path(dest_dir: Path, safe_name: str) -> Path:
     return dest
 
 
-def save_source_file(run_id: str, category: str, filename: str, data: bytes) -> Path:
+def save_source_file(
+    email: str, run_id: str, category: str, filename: str, data: bytes
+) -> Path:
     """Archive one raw input under ``sources/{run_id}/{category}/{filename}``.
 
     A name already taken within the run is suffixed (``CV.docx`` → ``CV-2.docx``
@@ -82,7 +97,7 @@ def save_source_file(run_id: str, category: str, filename: str, data: bytes) -> 
         must use this rather than the name they passed in.
     """
     safe_name = Path(filename).name or "unnamed"
-    dest_dir = sources_dir(run_id) / category
+    dest_dir = sources_dir(email, run_id) / category
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = _free_path(dest_dir, safe_name)
     dest.write_bytes(data)
@@ -143,17 +158,18 @@ def prune_source_document(path: Path, pruned_text: str) -> Path:
     return raw_path
 
 
-def add_source_entry(run_id: str, entry: dict) -> None:
+def add_source_entry(email: str, run_id: str, entry: dict) -> None:
     """Append one entry to an existing manifest, preserving its profile link.
 
     No-op (logs a warning) when the manifest is missing, for the same reason as
     :func:`link_profile`: provenance bookkeeping must never fail a run.
     """
-    manifest = load_manifest(run_id)
+    manifest = load_manifest(email, run_id)
     if manifest is None:
         logger.warning("run_store: no manifest to extend for run %s", run_id)
         return
     write_manifest(
+        email,
         run_id,
         [*manifest.get("sources", []), entry],
         profile_id=manifest.get("profile_id"),
@@ -162,6 +178,7 @@ def add_source_entry(run_id: str, entry: dict) -> None:
 
 
 def write_manifest(
+    email: str,
     run_id: str,
     entries: list[dict],
     profile_id: str | None = None,
@@ -178,7 +195,7 @@ def write_manifest(
     Returns:
         The manifest path.
     """
-    run_dir = sources_dir(run_id)
+    run_dir = sources_dir(email, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
         "run_id": run_id,
@@ -192,25 +209,26 @@ def write_manifest(
     return path
 
 
-def load_manifest(run_id: str) -> dict | None:
+def load_manifest(email: str, run_id: str) -> dict | None:
     """Read a run's manifest, or ``None`` if it was never written."""
-    path = sources_dir(run_id) / _MANIFEST_NAME
+    path = sources_dir(email, run_id) / _MANIFEST_NAME
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def link_profile(run_id: str, profile_id: str, version: int) -> None:
+def link_profile(email: str, run_id: str, profile_id: str, version: int) -> None:
     """Patch an existing manifest with the produced ``profile_id`` / ``version``.
 
     No-op (logs a warning) if the manifest is missing, so output persistence
     never fails a run purely for lack of a manifest.
     """
-    manifest = load_manifest(run_id)
+    manifest = load_manifest(email, run_id)
     if manifest is None:
         logger.warning("run_store: no manifest to link for run %s", run_id)
         return
     write_manifest(
+        email,
         run_id,
         manifest.get("sources", []),
         profile_id=profile_id,
@@ -218,7 +236,9 @@ def link_profile(run_id: str, profile_id: str, version: int) -> None:
     )
 
 
-def save_output(run_id: str, profile: CareerProfile, meta: dict | None = None) -> Path:
+def save_output(
+    email: str, run_id: str, profile: CareerProfile, meta: dict | None = None
+) -> Path:
     """Save a copy of the synthesized profile under ``output/{run_id}/output.json``.
 
     Also links the run's manifest to the produced ``profile_id`` / ``version``
@@ -234,7 +254,7 @@ def save_output(run_id: str, profile: CareerProfile, meta: dict | None = None) -
         The output.json path.
     """
     meta = meta or {}
-    out_dir = output_dir(run_id)
+    out_dir = output_dir(email, run_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "run_id": run_id,
@@ -248,6 +268,6 @@ def save_output(run_id: str, profile: CareerProfile, meta: dict | None = None) -
     profile_id = meta.get("profile_id")
     version = meta.get("version")
     if profile_id is not None and version is not None:
-        link_profile(run_id, profile_id, version)
+        link_profile(email, run_id, profile_id, version)
     logger.debug("run_store: saved output for run %s -> %s", run_id, path)
     return path

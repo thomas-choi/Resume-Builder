@@ -57,6 +57,8 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `REVIEW_MODEL` | no | `VALIDATION_MODEL` | Model that writes the reviewer's brief when a run pauses for human review — it explains that gate's findings, so it follows that tier unless set |
 | `REVIEW_AGENT_ENABLED` | no | `true` | Whether to write that brief at all. `false` → the run still pauses and still lists every flagged item, it just arrives without prose (one fewer LLM call per paused run) |
 | `REVIEW_MAX_TOOL_ITERATIONS` | no | `4` | Bound on the review agent's tool-calling loop (it loads skill bodies on demand). Exhausting it yields no brief rather than looping |
+| `API_PORT` | no | `8000` | Port uvicorn binds **and** `docker compose` publishes. Honored via the Docker `CMD`/Compose port mapping (not read by Python), with precedence `API_PORT` > `$PORT` (cloud convention — Cloud Run/Heroku/Railway inject it) > `8000`. Running uvicorn directly? pass `--port` yourself |
+| `UI_PORT` | no | `5173` | **Dev-only** port the Vite dev server (`npm run dev`) listens on — a frontend shell var read by `vite.config.ts`, not part of the backend `.env`. No effect in production (the API serves the built UI on `API_PORT`). Change it and you must add its origin to `AUTH_ALLOWED_ORIGINS` |
 | `FRONTEND_DIR` | no | `./frontend/dist` | Built review UI, served at `/`. Absent → `/` redirects to `/docs` and the API is unaffected |
 | `DATA_DIR` | no | `./data` | Root of the versioned JSON profile store |
 | `SKILLS_DIR` | no | `./skills` | Directory of per-agent `SKILL.md` reasoning skills (FUND skills mechanism). Prompt **content**, not secrets — ships in the image, safe to commit. A missing/empty dir degrades gracefully: each agent falls back to its inline prompt scaffolding and the pipeline still runs |
@@ -67,6 +69,8 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `RENDER_PDF` | no | `true` | Whether to convert each rendered `.docx` to PDF with headless LibreOffice. `false` → `.docx` only, no subprocess call |
 | `LIBREOFFICE_BIN` | no | `soffice` | The headless converter binary. Installed in the Docker image (`libreoffice-writer`); if it is missing or fails locally the PDF is skipped with a WARNING and the `.docx` is still returned |
 | `LIBREOFFICE_TIMEOUT_S` | no | `120` | Per-conversion timeout; on timeout the PDF is skipped, never the run |
+| `AUTH_ENABLED` | no | `true` | `true` (shipped default) makes every business route require a session, with data rooted per account. `false` runs **legacy single-user mode**: no login, and all data lands under one synthetic account (`SINGLE_USER_EMAIL`) |
+| `SINGLE_USER_EMAIL` | no | `local@example.com` | The account used when `AUTH_ENABLED=false`; its `sha256` roots the legacy data. Must be a valid email (it is a real account record) — hence `example.com`, not `localhost` |
 | `EMAIL_BACKEND` | no | `file` | Mail delivery (Phase 7). `file` drops a complete `.eml` in the outbox (see below); `console` logs the code/link; `smtp` sends for real |
 | `EMAIL_FROM` | no | `no-reply@localhost` | `From:` address on auth mail |
 | `EMAIL_OUTBOX_DIR` | no | `./data/auth/outbox` | Where the `file` backend writes `.eml` files |
@@ -74,16 +78,46 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `AUTH_VERIFY_METHOD` | no | `code` | `code` (6-digit OTP typed back) or `link` (magic link) |
 | `VERIFY_CODE_LENGTH` | no | `6` | Digits in the OTP |
 | `AUTH_MAX_CODE_ATTEMPTS` | no | `5` | Wrong-code tries before a challenge is burned |
-| `PUBLIC_BASE_URL` | no | `http://localhost:8000` | Base for magic links + the "sign in here" mail — **never** derived from the `Host` header (a forged `Host` would poison the link) |
+| `PUBLIC_HOST` | no | `localhost` | Hostname/IP the browser reaches the app at. With `PUBLIC_SCHEME` + `API_PORT` it is the **single source of truth** for the public address: both `PUBLIC_BASE_URL` and the default `AUTH_ALLOWED_ORIGINS` derive from `PUBLIC_SCHEME://PUBLIC_HOST:API_PORT` |
+| `PUBLIC_SCHEME` | no | `http` | Scheme half of the derived public address; set `https` when the app is served behind TLS |
+| `PUBLIC_BASE_URL` | no | `PUBLIC_SCHEME://PUBLIC_HOST:API_PORT` | Base for magic links + the "sign in here" mail — **never** derived from the `Host` header (a forged `Host` would poison the link). Set explicitly only to override the derived value |
+| `AUTH_ALLOWED_ORIGINS` | no | value of `PUBLIC_BASE_URL` | Comma-separated origins allowed to POST `/auth/*` (CSRF gate). Defaults to the single derived origin — set it explicitly **only when the UI loads from more than one origin**, e.g. also via `localhost` or the Vite dev server (`npm run dev`): `http://192.168.0.212:8000,http://localhost:8000,http://192.168.0.212:5173`. A request whose `Origin` header is outside this set gets a `403 bad origin`. Read once at startup, so restart the API after changing it (see [Auth origins in dev](#auth-origins-in-dev)) |
 | `SESSION_COOKIE_NAME` | no | `rb_session` | Session cookie name |
 | `SESSION_COOKIE_SECURE` | no | `true` | `Secure` flag on the cookie; set `false` only for local `http://` |
 | `SESSION_TTL_S` | no | `1209600` | Session lifetime (14 days), sliding on use |
 | `SIGNUP_TTL_S` / `SIGNIN_TTL_S` | no | `1800` / `900` | Sign-up / sign-in challenge lifetimes |
 | `AUTH_MAX_SENDS_PER_HOUR` | no | `5` | Challenges emailed per address per hour (mailbomb / code-farming bound) |
 
-> Phase 7.b ships the auth **flow** only; the business routes are not yet behind
-> it (that is 7.d). `AUTH_ENABLED` / `SINGLE_USER_EMAIL` arrive with per-user
-> roots in 7.c.
+> **Enforcement is on (Phase 7.d).** With `AUTH_ENABLED=true` every business
+> route (`/ingest`, `/profile/*`, `/tailor*`, `/document/*`) requires a valid
+> session cookie and returns `401` without one; each account's runs live under
+> `data/users/{sha256(email)}/`, and an id belonging to another account is a
+> `404`. Only `/healthz` and `/auth/*` are open. Set `AUTH_ENABLED=false` for a
+> single-user or CI deployment: no login is needed and everything is rooted at
+> `data/users/{sha256(SINGLE_USER_EMAIL)}/` — the **same** storage path as a real
+> signed-in account, so the two modes never diverge.
+
+### Migrating an existing (pre-Phase-7) install to per-user storage
+
+Installs created before Phase 7 wrote directly to `data/{profiles,sources,output,
+documents}/`. Move that tree under a per-account root **once**, naming the owner:
+
+```bash
+python scripts/migrate_to_users.py --email you@example.com
+# email you@example.com -> uid 5f2c…(64 hex)
+# root: data/users/5f2c…
+# moved: profiles, sources, output, documents
+```
+
+The script creates the account (already **verified**, so you can sign in
+immediately), then `os.replace`s each legacy directory into
+`data/users/{uid}/` — a rename within one filesystem, so it is instant and
+loss-free (the per-user tree is byte-for-byte the old schema). It is
+**idempotent** (a second run finds nothing to move and is a no-op) and **refuses
+to run if a target directory already exists** (a half-migrated or real per-user
+tree), printing the `email → uid` mapping either way. Run it with the API
+stopped. Afterwards, sign in as that email (via the `file`-backend outbox in dev,
+or real SMTP) to reach the migrated data.
 
 **Reading a verification code/link with no mail server.** With the default
 `EMAIL_BACKEND=file`, every auth mail is written as a complete `.eml` under
@@ -213,12 +247,22 @@ uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
 Either way, `/` serves the review UI when `frontend/dist` exists and otherwise
 redirects to `/docs`.
 
-Docker (one service, `.env` file, `data/` volume):
+Docker (one service, `.env` file, `data/` and `logs/` volumes):
 
 ```bash
 docker compose up --build
 # server listens on 0.0.0.0:8000 — API *and* review UI
+# the built image and running container are both named `resume-builder`
 ```
+
+The Compose file bind-mounts both `./data` (the profile store) and `./logs`
+into the container. Because `LOG_FILE` is relative and the container's workdir
+is `/app`, the log resolves to `/app/logs/app.log`; without the `./logs` mount
+that file lives only inside the container and never appears on the host (use
+`docker compose logs` in that case). Over **plain HTTP** (localhost or a LAN IP)
+set `SESSION_COOKIE_SECURE=false`, or the browser drops the `Secure` session
+cookie and every post-login request 401s (bouncing the UI back to the verify
+screen); keep it `true` behind HTTPS.
 
 The image is multi-stage: a `node:20-slim` stage runs `npm ci && npm run build`
 and the Python runtime copies `dist/` in, so the shipped container has no Node
@@ -271,6 +315,40 @@ same-origin paths in development exactly as it does in production — there is n
 CORS configuration anywhere. Consequently, when serving on `0.0.0.0` for a
 browser on another machine, only the **UI** port needs to be reachable from
 that browser; `API_URL` is resolved by the Vite process, not by the browser.
+
+<a id="auth-origins-in-dev"></a>
+#### Auth origins in dev — the dev-server origin must be allow-listed
+
+One thing the proxy does **not** hide: the browser still sends an `Origin`
+header naming the **UI** origin it loaded (e.g. `http://localhost:3000`), and
+the proxy's `changeOrigin: true` rewrites only `Host`, not `Origin`. The API's
+`/auth/*` CSRF gate checks that `Origin` against `AUTH_ALLOWED_ORIGINS`, so in
+development the **dev-server origin must be in that backend allow-list** or every
+sign-up/sign-in POST returns `403 bad origin`. (In production the built bundle is
+same-origin with the API, so its `:8000` origin is already covered.)
+
+Worked example — API on `:8000`, dev UI on `:3000`, both reachable on the LAN:
+
+```bash
+# 1) Backend .env — list BOTH the API origins and the dev-server (:3000) origins
+AUTH_ALLOWED_ORIGINS=http://localhost:8000,http://127.0.0.1:8000,http://192.168.0.212:8000,http://localhost:3000,http://127.0.0.1:3000,http://192.168.0.212:3000
+
+# 2) Start the backend (reads .env once at startup)
+uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
+
+# 3) Start the frontend dev server on :3000, proxying to the API
+cd frontend
+UI_HOST=0.0.0.0 UI_PORT=3000 API_URL=http://localhost:8000 npm run dev
+
+# 4) Open the UI at an allow-listed origin
+#    http://localhost:3000  or  http://192.168.0.212:3000
+```
+
+`AUTH_ALLOWED_ORIGINS` is read **once at startup** via `load_dotenv()`
+(`override=False`), so editing `.env` is not enough — a `--reload` cycle inherits
+the already-loaded value. **Fully stop and restart the API** (`CTRL+C`, then
+re-run `uvicorn`) after changing it. Only origins you actually browse from need
+listing; drop the ones you don't use.
 
 `npm run preview` (serving the built `dist/` from `npm run build` rather than
 the dev bundle) honours all four variables the same way, proxy included — so a

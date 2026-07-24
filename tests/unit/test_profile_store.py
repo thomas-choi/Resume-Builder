@@ -1,35 +1,40 @@
-"""Versioned JSON profile store."""
+"""Versioned JSON profile store (per-account root, Phase 7.c)."""
 
 import pytest
 
+from src import config
 from src.utils import profile_store
+from tests.conftest import TEST_EMAIL
 
 
 def test_save_and_load_round_trip(data_dir, sample_profile):
-    profile_id, version = profile_store.save_profile(sample_profile)
+    profile_id, version = profile_store.save_profile(TEST_EMAIL, sample_profile)
     assert version == 1
-    loaded = profile_store.load_profile(profile_id)
+    loaded = profile_store.load_profile(TEST_EMAIL, profile_id)
     assert loaded == sample_profile
+    # The bytes land under the per-user root, nothing at the legacy top level.
+    assert (config.user_root(TEST_EMAIL) / "profiles" / profile_id).is_dir()
+    assert not (data_dir / "profiles").exists()
 
 
 def test_versioning_increments_and_latest_pointer(data_dir, sample_profile):
-    profile_id, v1 = profile_store.save_profile(sample_profile)
+    profile_id, v1 = profile_store.save_profile(TEST_EMAIL, sample_profile)
     edited = sample_profile.model_copy(update={"headline": "Staff Engineer"})
-    _, v2 = profile_store.save_profile(edited, profile_id)
+    _, v2 = profile_store.save_profile(TEST_EMAIL, edited, profile_id)
     assert (v1, v2) == (1, 2)
-    assert profile_store.latest_version(profile_id) == 2
-    assert profile_store.list_versions(profile_id) == [1, 2]
+    assert profile_store.latest_version(TEST_EMAIL, profile_id) == 2
+    assert profile_store.list_versions(TEST_EMAIL, profile_id) == [1, 2]
     # latest loads v2, explicit version loads v1
-    assert profile_store.load_profile(profile_id).headline == "Staff Engineer"
-    assert profile_store.load_profile(profile_id, 1).headline == "Senior Engineer"
+    assert profile_store.load_profile(TEST_EMAIL, profile_id).headline == "Staff Engineer"
+    assert profile_store.load_profile(TEST_EMAIL, profile_id, 1).headline == "Senior Engineer"
 
 
 def test_load_missing_profile_raises(data_dir):
     with pytest.raises(FileNotFoundError):
-        profile_store.load_profile("nope")
+        profile_store.load_profile(TEST_EMAIL, "nope")
 
 
 def test_load_missing_version_raises(data_dir, sample_profile):
-    profile_id, _ = profile_store.save_profile(sample_profile)
+    profile_id, _ = profile_store.save_profile(TEST_EMAIL, sample_profile)
     with pytest.raises(FileNotFoundError):
-        profile_store.load_profile(profile_id, 99)
+        profile_store.load_profile(TEST_EMAIL, profile_id, 99)

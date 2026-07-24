@@ -14,6 +14,9 @@ import logging
 logger = logging.getLogger(__name__)
 
 class IngestionState(TypedDict, total=False):
+    # The owner's email (the user-id, §14.8). Threaded from the route so every
+    # store write lands under this account's root; never read from user input.
+    email: str
     run_id: str
     sources: list[SourceDocument]
     extractions: list[SourceExtraction]
@@ -82,7 +85,7 @@ def synthesize_profile(state: IngestionState) -> IngestionState:
     return {"profile": synthesis.synthesize(state["extractions"])}
 
 
-def _prune_archived_sources(run_id: str, state: IngestionState) -> None:
+def _prune_archived_sources(email: str, run_id: str, state: IngestionState) -> None:
     """Rewrite archived sources whose failed items were dropped mid-extraction.
 
     File writes for a run live in one node on purpose, so `extract_source` can
@@ -100,6 +103,7 @@ def _prune_archived_sources(run_id: str, state: IngestionState) -> None:
         try:
             raw_path = run_store.prune_source_document(path, text)
             run_store.add_source_entry(
+                email,
                 run_id,
                 run_store.source_entry(
                     source.source_type,
@@ -125,14 +129,16 @@ def store_profile(state: IngestionState) -> IngestionState:
     end-to-end provenance.
     """
     logger.debug(f"** Storing profile")
+    email = state["email"]
     profile_id, version = profile_store.save_profile(
-        state["profile"], state.get("profile_id")
+        email, state["profile"], state.get("profile_id")
     )
     logger.debug(f"** Storing profile {profile_id} version {version}")
     run_id = state.get("run_id")
     if run_id:
-        _prune_archived_sources(run_id, state)
+        _prune_archived_sources(email, run_id, state)
         run_store.save_output(
+            email,
             run_id,
             state["profile"],
             {"profile_id": profile_id, "version": version},

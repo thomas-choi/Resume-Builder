@@ -1,11 +1,16 @@
 services:
   api:
     build: .
+    image: resume-builder
+    container_name: resume-builder
+    # ${API_PORT:-8000} is substituted from .env by Compose; the container binds
+    # the same port (via API_PORT in env_file), so host and container agree.
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:${API_PORT:-8000}"
     env_file:
       - .env
     environment:
       DATA_DIR: /app/data
     volumes:
       - ./data:/app/data
+      - ./logs:/app/logs

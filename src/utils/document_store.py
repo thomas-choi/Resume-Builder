@@ -1,8 +1,9 @@
-"""Rendered-document store: ``data/documents/{tailor_id}/``.
+"""Rendered-document store: ``data/users/{uid}/documents/{tailor_id}/``.
 
 Third store alongside :mod:`src.utils.profile_store` (an evolving profile) and
-:mod:`src.utils.run_store` (one ingest run), keyed by ``tailor_id`` — one
-`POST /tailor` execution. It holds what that execution produced:
+:mod:`src.utils.run_store` (one ingest run), keyed per account by the owner's
+``email`` (§14.8) and then by ``tailor_id`` — one `POST /tailor` execution. It
+holds what that execution produced:
 
 - ``cv.docx`` / ``cv.pdf`` and ``cover-letter.docx`` / ``cover-letter.pdf`` —
   the rendered documents served by ``GET /document/{tailor_id}``.
@@ -52,15 +53,20 @@ def validate_tailor_id(tailor_id: str) -> str:
     return tailor_id
 
 
-def document_dir(tailor_id: str) -> Path:
+def document_dir(email: str, tailor_id: str) -> Path:
     """Directory holding one tailoring run's rendered documents."""
-    return config.DATA_DIR / "documents" / validate_tailor_id(tailor_id)
+    root = config.user_root(email) / "documents"
+    path = root / validate_tailor_id(tailor_id)
+    if not config.within(root, path):
+        raise ValueError(f"tailor id {tailor_id!r} escapes the user root")
+    return path
 
 
-def document_path(tailor_id: str, kind: str, fmt: str) -> Path:
+def document_path(email: str, tailor_id: str, kind: str, fmt: str) -> Path:
     """Path of one rendered document (existing or not).
 
     Args:
+        email: The owner's user-id.
         tailor_id: The tailoring run id.
         kind: ``"cv"`` or ``"cover_letter"``.
         fmt: ``"docx"`` or ``"pdf"``.
@@ -72,10 +78,10 @@ def document_path(tailor_id: str, kind: str, fmt: str) -> Path:
         raise ValueError(f"unknown document kind {kind!r} (expected: {', '.join(_STEMS)})")
     if fmt not in _FORMATS:
         raise ValueError(f"unknown document format {fmt!r} (expected: {', '.join(_FORMATS)})")
-    return document_dir(tailor_id) / f"{_STEMS[kind]}.{fmt}"
+    return document_dir(email, tailor_id) / f"{_STEMS[kind]}.{fmt}"
 
 
-def find_document(tailor_id: str, kind: str, fmt: str) -> Path:
+def find_document(email: str, tailor_id: str, kind: str, fmt: str) -> Path:
     """Path of a rendered document that exists.
 
     Raises:
@@ -83,18 +89,18 @@ def find_document(tailor_id: str, kind: str, fmt: str) -> Path:
             unavailable, or the run was skipped by the validation gate).
         ValueError: On an unknown kind/format or an unsafe ``tailor_id``.
     """
-    path = document_path(tailor_id, kind, fmt)
+    path = document_path(email, tailor_id, kind, fmt)
     if not path.exists():
         raise FileNotFoundError(f"no {kind}.{fmt} rendered for tailor {tailor_id}")
     return path
 
 
-def list_documents(tailor_id: str) -> list[dict]:
+def list_documents(email: str, tailor_id: str) -> list[dict]:
     """Describe every rendered document for a tailoring run, CV first."""
     documents = []
     for kind in _STEMS:
         for fmt in _FORMATS:
-            path = document_path(tailor_id, kind, fmt)
+            path = document_path(email, tailor_id, kind, fmt)
             if path.exists():
                 documents.append(
                     {
@@ -107,9 +113,9 @@ def list_documents(tailor_id: str) -> list[dict]:
     return documents
 
 
-def save_result(tailor_id: str, payload: dict) -> Path:
+def save_result(email: str, tailor_id: str, payload: dict) -> Path:
     """Save the tailoring run's JSON result next to its documents."""
-    out_dir = document_dir(tailor_id)
+    out_dir = document_dir(email, tailor_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / _RESULT_NAME
     path.write_text(
@@ -128,17 +134,17 @@ def save_result(tailor_id: str, payload: dict) -> Path:
     return path
 
 
-def load_result(tailor_id: str) -> dict | None:
+def load_result(email: str, tailor_id: str) -> dict | None:
     """Read a tailoring run's saved result, or ``None`` if it was never written."""
-    path = document_dir(tailor_id) / _RESULT_NAME
+    path = document_dir(email, tailor_id) / _RESULT_NAME
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def save_review(tailor_id: str, payload: dict) -> Path:
+def save_review(email: str, tailor_id: str, payload: dict) -> Path:
     """Save the review request a paused run put in front of a human."""
-    out_dir = document_dir(tailor_id)
+    out_dir = document_dir(email, tailor_id)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / _REVIEW_NAME
     path.write_text(
@@ -156,9 +162,9 @@ def save_review(tailor_id: str, payload: dict) -> Path:
     return path
 
 
-def load_review(tailor_id: str) -> dict | None:
+def load_review(email: str, tailor_id: str) -> dict | None:
     """Read a run's review request, or ``None`` if it never paused for one."""
-    path = document_dir(tailor_id) / _REVIEW_NAME
+    path = document_dir(email, tailor_id) / _REVIEW_NAME
     if not path.exists():
         return None
     return json.loads(path.read_text(encoding="utf-8"))

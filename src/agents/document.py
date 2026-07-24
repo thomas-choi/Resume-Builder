@@ -44,6 +44,7 @@ def skip_reason(
 
 
 def render_documents(
+    email: str,
     tailor_id: str,
     cv: TailoredCV,
     name: str = "",
@@ -53,6 +54,7 @@ def render_documents(
     """Render the CV (and cover letter, if generated) to .docx and PDF.
 
     Args:
+        email: The owner's user-id; documents land under its per-account root.
         tailor_id: The tailoring run id; documents land in its store directory.
         cv: The validated tailored CV.
         name: Candidate name, taken from the `CareerProfile`.
@@ -63,22 +65,22 @@ def render_documents(
         One descriptor per written file (see `document_store.list_documents`);
         PDFs are absent when LibreOffice is unavailable or disabled.
     """
-    document_store.document_dir(tailor_id).mkdir(parents=True, exist_ok=True)
+    document_store.document_dir(email, tailor_id).mkdir(parents=True, exist_ok=True)
 
     docx_path = docx_renderer.render_cv(
-        cv, document_store.document_path(tailor_id, "cv", "docx"), name, contact
+        cv, document_store.document_path(email, tailor_id, "cv", "docx"), name, contact
     )
     docx_renderer.convert_to_pdf(docx_path)
     if cover_letter is not None:
         letter_path = docx_renderer.render_cover_letter(
             cover_letter,
-            document_store.document_path(tailor_id, "cover_letter", "docx"),
+            document_store.document_path(email, tailor_id, "cover_letter", "docx"),
             name,
             contact,
         )
         docx_renderer.convert_to_pdf(letter_path)
 
-    documents = document_store.list_documents(tailor_id)
+    documents = document_store.list_documents(email, tailor_id)
     logger.info(
         "render_document: tailor %s produced %s",
         tailor_id,

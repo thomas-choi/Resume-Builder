@@ -196,3 +196,46 @@ button[aria-pressed="true"] {
   color: var(--muted);
   margin-right: 0.3rem;
 }
+
+/* Auth screens and the signed-in bar (Phase 7.e). */
+.auth-screen {
+  max-width: 24rem;
+  margin: 3rem auto;
+  padding: 1.5rem;
+}
+
+.auth-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.auth-panel label {
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.auth-panel .error,
+.auth-screen .error {
+  color: #b3261e;
+  font-size: 0.85rem;
+}
+
+.auth-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+}
+
+button.linklike {
+  border: none;
+  background: none;
+  color: #1a73e8;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}

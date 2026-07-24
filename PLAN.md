@@ -1194,10 +1194,10 @@ as `diffProjects`, keyed on the lower-cased name to match the server.
 ## Phase 7 — Accounts, passwordless auth and per-user isolation — **planned**
 
 Full design in `TECHNICAL-DESIGN.md` §14 (§14.1–14.15). The build order is
-7.a–7.e (§14.15); **this section details only 7.a and 7.b** — enough for a new
-session to implement them without re-deriving the design. The later steps
-(per-user roots, enforcement flip, migration, frontend) are designed in §14 but
-not yet expanded here.
+7.a–7.e (§14.15). **7.a and 7.b are implemented (2026-07-22).** This section
+details all five steps — the remaining work is **7.c (per-user roots), 7.d
+(enforcement flip + non-path isolation), and 7.e (frontend)** — enough for a new
+session to implement each without re-deriving the design from §14.
 
 **Scope boundary for 7.a + 7.b.** *In:* a testable email sender, the on-disk
 account/challenge/session store, the `/auth/*` endpoints, and R6 (no login
@@ -1216,7 +1216,7 @@ thing they depend on does not exist until 7.c:
 - `AUTH_ENABLED` / `SINGLE_USER_EMAIL` (§14.10, §14.11) are **7.c** config —
   they only matter once the stores take a `user_id`. Do not add them in 7.b.
 
-### 7.a — `src/utils/mailer.py` + mail config + `file` backend — **planned**
+### 7.a — `src/utils/mailer.py` + mail config + `file` backend — **implemented (2026-07-22)**
 
 Nothing else in Phase 7 is testable without a way to send mail that needs no
 SMTP server, so this lands first (§14.9).
@@ -1271,7 +1271,7 @@ run the async `send` with `pytest-asyncio`, already a dependency):
 file in `data/auth/outbox`" note); `HISTORY.md` (one entry); one line in
 `API-REFERENCE.md` noting "no API change — mailer utility only".
 
-### 7.b — `src/utils/auth_store.py` + `src/api/auth_routes.py` + `deps.py` — **planned**
+### 7.b — `src/utils/auth_store.py` + `src/api/auth_routes.py` + `deps.py` — **implemented (2026-07-22)**
 
 The identity model, the challenge (code + link) and session lifecycles, and the
 `/auth/*` routes with **R6 enforced**. **No enforcement on the business routes
@@ -1411,6 +1411,234 @@ newest first.
 commit split: (1) 7.a — mailer + mail config + `test_mailer.py` + docs; (2) 7.b
 — schemas + `email-validator` + `auth_store.py` + `deps.py` + `auth_routes.py` +
 auth config + both test files + docs.
+
+### 7.c — per-user roots: `config.user_root` + store signatures + migration — **implemented 2026-07-23**
+
+Move every run's output under a per-account root **without** changing what the
+stores write or turning enforcement on. This is the step §14.15 insists comes
+before 7.d: "moving the data while every route is still reachable makes the
+migration verifiable on its own." Develop and test 7.c with **`AUTH_ENABLED=false`**
+so `current_user` yields the single-user synthetic account and the business
+routes stay open (§14.11); 7.d is what makes the shipped `AUTH_ENABLED=true`
+default fail-closed.
+
+**Config additions to `src/config.py`** — the two rows §14.10 deferred out of 7.b
+(they only matter once the stores take a user), following the existing
+bool-parsing idiom:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AUTH_ENABLED` | `true` | `false` runs legacy single-user mode (§14.11) |
+| `SINGLE_USER_EMAIL` | `local@localhost` | The account used when auth is off; its `uid` roots the legacy data |
+
+**`config.user_root(email) -> Path`** — the single place `DATA_DIR/"users"/uid`
+is spelled (§14.8). Normalize the email, compute `uid = sha256(normalize(email))`
+(reuse `auth_store.normalize`/`auth_store.uid` — do **not** duplicate the hash),
+assert `uid` against `^[0-9a-f]{64}$` (belt-and-braces; a hash always matches),
+and return the path. Add a module-level `_within(root, path) -> bool`
+(`Path.resolve()` + `is_relative_to`) that each store asserts before opening
+anything — defense in depth against a malformed id inside one user's own tree
+(§14.2, §14.8).
+
+**Store signatures gain the user (email) as the first positional argument**
+(§14.8) — required, never defaulted, so every existing call site is a **type
+error until updated** and no missed site can silently write the shared tree:
+
+- `profile_store` — `_profiles_dir()` → derives from `config.user_root(email)`;
+  `save_profile(email, profile, profile_id=None)`, `load_profile(email,
+  profile_id, version=None)`, `latest_version(email, ...)`, `list_versions(email,
+  ...)`, `_profile_dir(email, profile_id)`.
+- `run_store` — `_sources_root`/`_output_root` derive from `user_root(email)`;
+  `sources_dir(email, run_id)`, `output_dir(email, run_id)`,
+  `save_source_file(email, run_id, ...)`, `add_source_entry(email, run_id, ...)`,
+  `write_manifest(email, run_id, ...)`, `load_manifest(email, run_id)`,
+  `link_profile(email, run_id, ...)`, `save_output(email, run_id, ...)`. The pure
+  helpers that touch no root (`source_entry`, `prune_source_document`,
+  `_free_path`) are unchanged.
+- `document_store` — `document_dir(email, tailor_id)`, `document_path(email,
+  tailor_id, ...)`, `find_document(email, ...)`, `list_documents(email, ...)`,
+  `save_result`/`load_result`/`save_review`/`load_review(email, tailor_id, ...)`.
+  `validate_tailor_id` stays as in-tree defense in depth (§14.2).
+
+**Call-site updates.** Each business handler in `src/api/routes.py` obtains the
+email from `current_user` and threads it into the stores. In 7.c `current_user`
+(`src/api/deps.py`) gains its **`AUTH_ENABLED=false` branch**: return a synthetic
+verified `User(email=SINGLE_USER_EMAIL, email_verified=True)` instead of reading a
+cookie (§14.11), so with auth off no login is needed and the routes are still
+open. The `Depends(current_user)`/router-level enforcement that 401s a missing
+cookie is **7.d**. The graph-invocation code paths (ingestion/tailoring) that
+call the stores also take the email through.
+
+**Migration script `scripts/migrate_to_users.py`** (§14.11) —
+`--email you@example.com`: create the account record (verified), compute `uid =
+sha256(normalize(email))`, then `os.replace` each of
+`data/{profiles,sources,output,documents}` into `data/users/{uid}/`. A rename
+within one filesystem, so it is instant and reversible; nothing is copied or
+rewritten because the per-user tree is byte-for-byte the §13 schema (§14.3).
+**Idempotent**, **refuses to run if the target root is non-empty**, and prints
+the `email → uid` mapping.
+
+**Tests — `tests/unit/test_user_root.py` + `tests/unit/test_migration.py`** (the
+§14.14 "Migration" row + the storage-rooting mechanics; the full R3 isolation
+suite is **7.d**):
+
+- `config.user_root` returns `DATA_DIR/users/{sha256(email)}`; normalization means
+  `A@X.com` and `a@x.com` resolve to one root; the returned `uid` matches
+  `^[0-9a-f]{64}$`; `_within` rejects a `..`-joined path.
+- The stores round-trip a profile / run / document under a given email and **the
+  bytes land under `data/users/{uid}/`**, nothing at the legacy top level.
+- `AUTH_ENABLED=false`: `current_user` returns the `SINGLE_USER_EMAIL` account and
+  a full save/load goes through `user_root(SINGLE_USER_EMAIL)` — the single code
+  path §14.11 requires (auth-off must not be the untested branch).
+- Migration moves a populated legacy tree into the right `uid`, is idempotent on a
+  second run, refuses a non-empty target, and the pre/post reads match.
+
+**Docs to update:** `TECHNICAL-DESIGN.md` §14 (mark 7.c implemented; storage now
+per-user, business routes still open until 7.d); `OPERATIONS.md` (`AUTH_ENABLED`
+/ `SINGLE_USER_EMAIL` rows + the `migrate_to_users.py` runbook); `API-REFERENCE.md`
+("no API surface change — storage rooting + migration only"); `PRODUCT-GUIDE.md`
+(data is now per-account on disk, though sharing persists until 7.d enforces);
+`HISTORY.md` (one entry per change).
+
+### 7.d — enforcement flip + the non-path isolation fixes + R3 suite — **implemented 2026-07-23**
+
+Turn the guarantee on. After 7.c the data is already rooted per account; 7.d has
+"exactly one thing to prove" (§14.15) — that no request can reach another user's
+root, by any parameter or side channel.
+
+**Fail-closed `current_user`.** With `AUTH_ENABLED=true` (the shipped default),
+`current_user` reads the `SESSION_COOKIE_NAME` cookie, loads the session + user,
+refreshes `last_seen_at`, and **raises `401` on a missing/expired session**
+(§14.8) — the branch already written in 7.b, now actually guarding business
+routes. The `AUTH_ENABLED=false` synthetic-account branch from 7.c is retained
+for legacy/integration mode.
+
+**Router-level dependency (§14.8).** Move the existing business routes off the
+bare `router = APIRouter()` onto `APIRouter(dependencies=[Depends(current_user)])`,
+so **a route added later is protected unless someone opts it out** — the opposite
+failure mode from decorating each handler. `/healthz` and `/auth/*` stay on a
+second, unauthenticated router. Handlers read the email from the resolved
+dependency rather than each re-declaring it.
+
+**`404`, never `403`, for an id under another root** (§14.8): a `403` confirms the
+id is real and makes the endpoint an enumeration oracle. An id that fails
+`_within` or does not exist under the caller's root returns the same `404` whether
+it never existed or belongs to someone else.
+
+**Three isolation fixes that are *not* a filesystem path** (§14.8) — a
+storage-only change would miss all three:
+
+1. **SSE job registry** (`JobRegistry`/`jobs` in `src/api/routes.py`, an
+   in-process `dict[job_id, Queue]`). Today any signed-in user can subscribe to
+   another's ingest and watch node-by-node progress. Give each registry entry an
+   **owner** (`uid`) and have `GET /ingest/{job_id}/events` return `404` for
+   anyone else. Set the owner when the job is created in `POST /ingest`.
+2. **Tailoring checkpointer `thread_id`** — `src/api/routes.py:324` returns
+   `{"configurable": {"thread_id": tailor_id}}`, so a guessed `tailor_id` could
+   resume someone else's paused human-review run. Namespace it to
+   `f"{uid}:{tailor_id}"` everywhere the config is built (the review/resume paths
+   must agree on the same namespaced key).
+3. **Logs** — `set_run_id` (`src/utils/logging_setup.py`) gains a companion
+   `set_user` that records the **`uid`** (the `sha256(email)` handle), **not** the
+   address: the user-id is now PII, so attribution uses the pseudonymous hash.
+   Codes, link tokens, session cookies and raw emails are never logged; wire
+   `set_user` in the ingest/tailor entry points alongside `set_run_id`.
+
+**Tests — the R3 isolation suite in `tests/unit/test_isolation.py`** (§14.14),
+plus session enforcement rows folded into `test_auth_routes.py`:
+
+- **Cross-user `404`.** With two accounts and a fixture profile/tailor in each,
+  as A: `GET /profile/{B_id}`, `PUT /profile` targeting B's id,
+  `GET /document/{B_tailor}`, `GET /tailor/{B}/review`, `POST /tailor/{B}/resume`,
+  and `GET /ingest/{B_job}/events` all return `404` — never `403`, never B's data.
+- **Traversal.** Ids containing `../`, absolute paths and URL-encoded separators
+  are rejected before touching disk.
+- **Nothing escapes the root.** After a full ingest+tailor as A, nothing exists
+  outside `data/users/{A_uid}/`.
+- **Unauthenticated → `401` on every business route**, parametrized over the
+  router's route table so a **newly added unprotected route fails the suite**;
+  expired session → `401`; sign-out revokes.
+- **SSE owner** — B subscribing to A's `job_id` gets `404`; A gets the stream.
+- **`thread_id` namespacing** — a paused review run for A cannot be resumed under
+  B's session even with the correct `tailor_id`.
+- **Logs** carry the `uid`, never the raw email, and never a code/token/cookie.
+
+**Docs to update:** `TECHNICAL-DESIGN.md` §14 (mark 7.d implemented; enforcement
+is now on, the three non-path fixes described); `API-REFERENCE.md` (every business
+route now requires a session → `401`; ids resolve under the session's root only,
+cross-user → `404`); `PRODUCT-GUIDE.md` (accounts are now isolated end to end);
+`OPERATIONS.md` (only if the enforcement flip changes a runbook — otherwise the
+one-line "no operational change" note); `HISTORY.md` (one entry per change).
+
+### 7.e — frontend: `AuthGate` + sign-up/in/verify panels + `api.ts` `401` — **implemented 2026-07-23**
+
+The React layer that puts the three screens in front of the app and makes a
+mid-session expiry surface as sign-in rather than a wall of failed panels (§14.12).
+Backend is untouched.
+
+**New components under `frontend/src/`** (§14.12):
+
+- **`AuthGate`** wraps `App`. `GET /auth/me` via TanStack Query: `401` → render
+  the auth screens; success → the existing panels plus the user's name and a
+  **Sign out** button in the header.
+- **`SignUpPanel`** — first name, last name, email → `POST /auth/signup` →
+  advance to `VerifyPanel` in **code** mode (remember the email so the code can
+  be posted with it), or a "check your inbox" message in **link** mode. Validate
+  the three fields client-side.
+- **`SignInPanel`** — email → `POST /auth/signin` → same handoff. **Identical
+  confirmation copy in every branch**, so the screen leaks no more than the
+  uniform-`202` API does.
+- **`VerifyPanel`** — **code mode:** a 6-digit input, `POST /auth/verify
+  {email, code}` (remembered email, no re-typing); on `410`/attempts-exhausted,
+  offer "send me a new code". **link mode:** rendered when the hash route is
+  `#/verify` — read `token`, call `history.replaceState` to clear the fragment
+  (§14.6), `POST /auth/verify {token}`, offer "send me a new link" on `410`.
+  Either way, success hands off to the app.
+
+**`lib/api.ts`** — send `credentials: "same-origin"` on every call, and add one
+rule: a `401` from any call **clears the query cache and drops to `AuthGate`'s
+signed-out state** (§14.12). This must compose with the Phase 6.c rule that a
+*failed refresh* must not erase loaded data — a `401` is exactly the case where
+erasing is correct, distinguished from a network failure **by status, not by
+guesswork**.
+
+**Sign out** reuses Phase 6.a's remount: `POST /auth/signout`, then bump
+`sessionKey` and `queryClient.clear()` — the same mechanism "Clear everything"
+uses, so no stale panel outlives the identity it was rendered for (§14.12).
+
+**Tests (vitest + Testing Library)** — `testUtils.tsx` gains a **default
+`GET /auth/me` stub** so the existing panel suites keep testing what they were
+written for now that they sit behind the gate (§14.12, §14.14). New cases:
+
+- Signed-out (`/auth/me` → `401`) renders the auth screen and **no** panels.
+- Sign-up validates its three fields before posting.
+- **Code mode:** the verify screen posts `{email, code}` with the remembered
+  email and shows "send me a new code" on `410`.
+- **Link mode:** on `#/verify` it posts the token from the hash and clears the
+  fragment.
+- A **mid-session `401`** drops to sign-in, while a **network** failure still
+  keeps the loaded profile on screen (the Phase 6.c behaviour must survive).
+
+**Docs to update:** `PRODUCT-GUIDE.md` (the sign-up/sign-in/verify user flow, the
+sign-out behaviour, session expiry); `TECHNICAL-DESIGN.md` §14/§10 (the
+`AuthGate` boundary and the `api.ts` `401`-vs-network split); `OPERATIONS.md`
+(only if the panels need a build/env note — otherwise the "no operational change"
+line); `API-REFERENCE.md` ("no API change — frontend only"); `HISTORY.md` (one
+entry per change).
+
+### Sequencing within 7.c–7.e
+
+The build order is **7.c → 7.d → 7.e** and the ordering matters (§14.15): 7.c
+moves the data and threads the email through the stores while every route is
+still reachable (verifiable in isolation via the migration + auth-off tests);
+7.d then has **one thing to prove** — that the flip to fail-closed plus the three
+non-path fixes actually isolate accounts (the R3 suite); 7.e is purely the
+frontend and depends on 7.d's `/auth/*` enforcement being real. Suggested commit
+split, one per step: (7.c) config + `user_root` + store signatures + call sites +
+`migrate_to_users.py` + `test_user_root.py`/`test_migration.py` + docs; (7.d)
+fail-closed `current_user` + router dependency + SSE-owner + `thread_id` +
+`set_user` + `test_isolation.py` + docs; (7.e) `AuthGate` + three panels +
+`api.ts` + `testUtils.tsx` + vitest + docs.
 
 ---
 

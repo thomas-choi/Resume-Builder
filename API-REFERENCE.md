@@ -3,6 +3,16 @@
 Base URL: `http://localhost:8000` (single FastAPI service). All responses are JSON
 unless noted. Schemas referenced below are defined in `src/models/schemas.py`.
 
+> **Authentication (Phase 7.d).** With `AUTH_ENABLED=true` (the shipped default)
+> every route below **except** `GET /`, `GET /healthz` and `/auth/*` requires a
+> valid session cookie and returns **`401`** without one. The user-id comes only
+> from the session — never from a path, query or body. Each account's data lives
+> under its own root, so a `profile_id`, `tailor_id` or `job_id` that belongs to
+> another account resolves to a **`404`** (never `403` — that would confirm the id
+> exists). Set `AUTH_ENABLED=false` for legacy single-user mode: the same routes
+> are open and act as one synthetic account. Obtain a session via `/auth/*` (see
+> [Accounts & passwordless auth](#accounts--passwordless-auth-auth-phase-7)).
+
 ## GET /
 
 Serves the review UI (Phase 4) when a built frontend is present at
@@ -319,9 +329,13 @@ back to the profile's own headline). An item left out of `approvals` counts as
 items the person chose to keep (kept for provenance — a human accepting a claim
 is not the gate having traced it).
 
-**Errors:** `400` unsafe `tailor_id`; `409` no review pending — it was already
-resumed, never paused, or the server restarted (the checkpointer is
-in-process; see OPERATIONS.md).
+**Errors:** `400` unsafe `tailor_id`; `404` no review pending — it was already
+resumed, never paused, belongs to another account, or the server restarted (the
+checkpointer is in-process; see OPERATIONS.md). The checkpointer key is
+namespaced to the caller (§14.8), so a `tailor_id` that is paused for a
+*different* account looks exactly like "no review pending" here — one uniform
+`404`, no cross-account oracle. (Phase 7.d unified this with the cross-account
+case; earlier builds returned `409`.)
 
 ### Worked example — end to end
 
@@ -655,7 +669,7 @@ paused — a `review.json` copy of the items the person was shown. The same URL
 keeps working after a restart. There is no listing or deletion endpoint yet —
 the `documents` array in the tailor response is the index.
 
-## Accounts & passwordless auth (`/auth/*`, Phase 7.b)
+## Accounts & passwordless auth (`/auth/*`, Phase 7)
 
 Email-only, passwordless sign-up/sign-in (design doc §14). The email address is
 the user-id; a proof of receipt — a **6-digit code** typed back (default) or a
@@ -663,10 +677,13 @@ the user-id; a proof of receipt — a **6-digit code** typed back (default) or a
 sign-up and authenticates at sign-in. A successful `verify` sets an HttpOnly
 session cookie (`SESSION_COOKIE_NAME`, default `rb_session`).
 
-> **Scope (7.b):** the `/auth/*` flow works end to end (via the `file` mail
-> backend by default — read the newest `.eml` in `data/auth/outbox/`), but the
-> business routes (`/ingest`, `/profile`, `/tailor`, …) are **not yet
-> authenticated and still share one namespace** — that enforcement lands in 7.d.
+> **Enforcement is live (7.d):** the session established here is what the business
+> routes require. With `AUTH_ENABLED=true` (default) `/ingest`, `/profile/*`,
+> `/tailor*` and `/document/*` all `401` without a session and root every write
+> under `data/users/{sha256(email)}/`; a cross-account id is a `404`. In dev, read
+> the emitted code/link from the newest `.eml` in `data/auth/outbox/` (the `file`
+> mail backend). Set `AUTH_ENABLED=false` to skip login entirely (single-user
+> mode). The frontend `AuthGate` (Phase 7.e) drives this flow in the browser.
 
 | Method | Path | Auth | Returns |
 |---|---|---|---|
@@ -709,17 +726,17 @@ the challenge and opens a session.
 
 ## Planned (later phases)
 
-Every endpoint in the design doc through Phase 7.b is implemented. Known gaps,
-none of which have an endpoint yet:
+Every endpoint in the design doc through Phase 7 is implemented, including
+per-account isolation and enforcement (7.c/7.d) and the frontend `AuthGate`
+(7.e). Known gaps, none of which have an endpoint yet:
 
 - **Pending reviews do not survive a restart.** The checkpointer is an
-  in-process `MemorySaver`, so a paused run's `resume` returns `409` after the
+  in-process `MemorySaver`, so a paused run's `resume` returns `404` after the
   server is restarted; `GET .../review` still serves the archived record.
   A durable checkpointer (SQLite/Postgres) would remove the caveat.
 - **No listing endpoints** for profiles, runs or documents — ids come from the
-  response that created them.
-- **Business routes not yet authenticated.** The `/auth/*` flow exists (7.b),
-  but `/ingest`, `/profile`, `/tailor` and `/document` carry no session
-  requirement and share one namespace — any caller can still read any
-  `profile_id` or `tailor_id` they can name. Router-level enforcement and
-  per-user data roots land in 7.c–7.d.
+  response that created them (and each is scoped to the caller's account).
+- **Single-container isolation only.** Accounts are isolated by in-process path
+  rooting, not by OS-level or per-user encryption; anyone with the `data/` volume
+  reads every account (§14.2). The SSE rate-limit / send counters are in-process,
+  so a multi-replica deployment would need shared state.

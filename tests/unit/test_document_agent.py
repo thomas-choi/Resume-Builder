@@ -10,6 +10,7 @@ from src.models.schemas import (
     ValidationResult,
 )
 from src.utils import document_store
+from tests.conftest import TEST_EMAIL
 
 
 def _cv() -> TailoredCV:
@@ -59,6 +60,7 @@ def test_skip_reason_blocks_when_validation_never_ran():
 def test_render_documents_writes_cv_and_cover_letter(data_dir, monkeypatch):
     monkeypatch.setattr(config, "RENDER_PDF", False)  # no LibreOffice in unit tests
     documents = document.render_documents(
+        TEST_EMAIL,
         "tailor-1",
         _cv(),
         name="Alice Smith",
@@ -74,20 +76,24 @@ def test_render_documents_writes_cv_and_cover_letter(data_dir, monkeypatch):
         ("cv", "docx"),
         ("cover_letter", "docx"),
     }
-    assert (data_dir / "documents" / "tailor-1" / "cv.docx").exists()
-    assert (data_dir / "documents" / "tailor-1" / "cover-letter.docx").exists()
+    root = config.user_root(TEST_EMAIL)
+    assert (root / "documents" / "tailor-1" / "cv.docx").exists()
+    assert (root / "documents" / "tailor-1" / "cover-letter.docx").exists()
     assert all(d["size_bytes"] > 0 for d in documents)
 
 
 def test_render_documents_without_cover_letter_writes_only_the_cv(data_dir, monkeypatch):
     monkeypatch.setattr(config, "RENDER_PDF", False)
-    documents = document.render_documents("tailor-2", _cv(), name="Alice Smith")
+    documents = document.render_documents(TEST_EMAIL, "tailor-2", _cv(), name="Alice Smith")
     assert [d["kind"] for d in documents] == ["cv"]
-    assert not (data_dir / "documents" / "tailor-2" / "cover-letter.docx").exists()
+    assert not (
+        config.user_root(TEST_EMAIL) / "documents" / "tailor-2" / "cover-letter.docx"
+    ).exists()
 
 
 def _state(sample_profile, **overrides) -> dict:
     state = {
+        "email": TEST_EMAIL,
         "profile": sample_profile,
         "tailored_cv": _cv(),
         "validation": ValidationResult(passed=True),
@@ -111,7 +117,7 @@ def test_node_skips_on_validation_flags(data_dir, sample_profile):
     )
     assert result["documents"] == []
     assert "need review" in result["render_skipped"]
-    assert not document_store.document_dir("tailor-node").exists()
+    assert not document_store.document_dir(TEST_EMAIL, "tailor-node").exists()
 
 
 def test_node_renders_flagged_run_once_approved(data_dir, monkeypatch, sample_profile):

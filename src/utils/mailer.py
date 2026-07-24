@@ -82,6 +82,8 @@ def _send_file(to: str, subject: str, text: str, html: str | None) -> None:
 
 def _smtp_send(message: EmailMessage) -> None:
     """Blocking SMTP delivery over STARTTLS — run in a worker thread."""
+    logger.debug("EMAIL sending via SMTP to %s subject=%r", message["To"], message["Subject"])
+
     if not config.SMTP_HOST:
         raise RuntimeError("EMAIL_BACKEND=smtp but SMTP_HOST is unset")
     with smtplib.SMTP(
@@ -91,4 +93,5 @@ def _smtp_send(message: EmailMessage) -> None:
             smtp.starttls()
         if config.SMTP_USER:
             smtp.login(config.SMTP_USER, config.SMTP_PASSWORD or "")
+        logger.debug("smtp.send_message(%r)", message)
         smtp.send_message(message)

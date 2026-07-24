@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from src import config
 from src.api.auth_routes import auth_router
-from src.api.routes import router
+from src.api.routes import public_router, router
 from src.utils.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,10 @@ def create_app() -> FastAPI:
         config.LOG_FILE or "console only",
     )
     app = FastAPI(title="Resume Builder", version="0.1.0")
+    # Business routes require a session (§14.8); the public router carries only
+    # /healthz, and the auth router carries /auth/* — both unauthenticated.
     app.include_router(router)
+    app.include_router(public_router)
     # Passwordless account routes (Phase 7.b), unauthenticated. Included before
     # the "/" static mount so /auth/* wins over the SPA fallback.
     app.include_router(auth_router)

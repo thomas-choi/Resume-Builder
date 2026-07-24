@@ -36,4 +36,7 @@ COPY skills/ skills/
 COPY --from=ui /ui/dist/ frontend/dist/
 
 EXPOSE 8000
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Port precedence: API_PORT (this project's knob) > $PORT (cloud convention:
+# Cloud Run / Heroku / Railway inject it) > 8000. `exec` keeps uvicorn as PID 1
+# so `docker stop` / SIGTERM reaches it for a clean shutdown.
+CMD ["sh", "-c", "exec uvicorn src.api.main:app --host 0.0.0.0 --port ${API_PORT:-${PORT:-8000}}"]

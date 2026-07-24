@@ -3,6 +3,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 
 import { App } from "./App";
+import { AuthGate } from "./AuthGate";
 import "./styles.css";
 
 // Profiles and tailoring results change only when this user changes them, so
@@ -27,7 +28,9 @@ const queryClient = new QueryClient({
 createRoot(document.getElementById("root") as HTMLElement).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <AuthGate>
+        <App />
+      </AuthGate>
     </QueryClientProvider>
   </StrictMode>,
 );
