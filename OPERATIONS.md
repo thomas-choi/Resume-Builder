@@ -61,6 +61,8 @@ npm run build      # writes frontend/dist, which the API serves at "/"
 | `IMAGE_REPO` | no | `thomaschoi/resume-builder` | **Cloud deploy only.** Docker Hub repository `docker-compose.prod.yml` pulls from. Not read by Python — Compose interpolates it from the VM's `.env` (see [Cloud deployment](#cloud-deployment-docker-hub--vm)) |
 | `IMAGE_TAG` | no | `latest` | **Cloud deploy only.** Image tag to run. Pin it to a git short SHA (what `scripts/build_and_push.sh` tags) to roll back a bad release |
 | `UI_PORT` | no | `5173` | **Dev-only** port the Vite dev server (`npm run dev`) listens on — a frontend shell var read by `vite.config.ts`, not part of the backend `.env`. No effect in production (the API serves the built UI on `API_PORT`). Change it and you must add its origin to `AUTH_ALLOWED_ORIGINS` |
+| `HOST_UID` | no | owner of `DATA_DIR` mount | **Docker only.** Forces the uid the container process drops to (read by `docker-entrypoint.sh`, not Python). Unset → auto-detected from the `./data` mount's owner so bind-mounted files are host-owned, not root. `0` → runs as root |
+| `HOST_GID` | no | owner of `DATA_DIR` mount | **Docker only.** Gid paired with `HOST_UID` (defaults to `HOST_UID` when only the uid is set) |
 | `FRONTEND_DIR` | no | `./frontend/dist` | Built review UI, served at `/`. Absent → `/` redirects to `/docs` and the API is unaffected |
 | `DATA_DIR` | no | `./data` | Root of the versioned JSON profile store |
 | `SKILLS_DIR` | no | `./skills` | Directory of per-agent `SKILL.md` reasoning skills (FUND skills mechanism). Prompt **content**, not secrets — ships in the image, safe to commit. A missing/empty dir degrades gracefully: each agent falls back to its inline prompt scaffolding and the pipeline still runs |
@@ -273,7 +275,24 @@ The Compose file bind-mounts both `./data` (the profile store) and `./logs`
 into the container. Because `LOG_FILE` is relative and the container's workdir
 is `/app`, the log resolves to `/app/logs/app.log`; without the `./logs` mount
 that file lives only inside the container and never appears on the host (use
-`docker compose logs` in that case). Over **plain HTTP** (localhost or a LAN IP)
+`docker compose logs` in that case).
+
+**The process runs as your host user, not root.** The image starts as root only
+long enough for its entrypoint (`docker-entrypoint.sh`) to read who owns the
+mounted `./data` directory — on the host that is whoever ran
+`docker compose up` — hand `./data` and `./logs` to that user (`chown -R`, which
+also repairs any root-owned files a *previous* root-run container left behind),
+and drop to it with `gosu` before starting uvicorn. So everything written into
+the bind mounts (`data/…`, `logs/app.log`) is owned by you and stays editable
+and deletable without `sudo` — the earlier failure where `logs/app.log` came out
+root-owned is gone. No configuration is needed. Two knobs if you need them:
+`HOST_UID`/`HOST_GID` force a specific id when the mount owner isn't what you
+want; a mount that is genuinely root-owned (a named volume, or a `./data` that
+Docker auto-created because it didn't exist — so create it first) falls back to
+running as root. For a very large `data/` the per-start recursive `chown` adds
+latency — set `HOST_UID` and pre-own the tree to skip the walk.
+
+Over **plain HTTP** (localhost or a LAN IP)
 set `SESSION_COOKIE_SECURE=false`, or the browser drops the `Secure` session
 cookie and every post-login request 401s (bouncing the UI back to the verify
 screen); keep it `true` behind HTTPS.
@@ -869,3 +888,7 @@ Each `POST /tailor` execution is likewise tagged with a `tailor_id`:
   `finish_reason`, token usage and a content preview instead of the bare `: None`
   it used to print — check those first, since a `length` finish reason means the
   batch was too big and `GITHUB_REPOS_PER_EXTRACTION` should come down.
+- **Profile picker + larger fonts (Phase 8) — no setup change.** No env vars, no
+  dependencies and no build change. `GET /profiles` is a read-only endpoint over
+  the same per-user `data/profiles/` tree already documented above (it enumerates
+  the caller's own profiles for the header dropdown); the font change is CSS only.

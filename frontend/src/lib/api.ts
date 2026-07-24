@@ -3,6 +3,7 @@
 import type {
   CareerProfile,
   IngestResponse,
+  ProfileListResponse,
   ProfileResponse,
   ReviewDecision,
   ReviewRequest,
@@ -203,6 +204,11 @@ export function getProfile(
   signal?: AbortSignal,
 ): Promise<ProfileResponse> {
   return request<ProfileResponse>(`/profile/${encodeURIComponent(profileId)}`, { signal });
+}
+
+/** List the signed-in user's profiles (newest first) for the profile picker. */
+export function listProfiles(signal?: AbortSignal): Promise<ProfileListResponse> {
+  return request<ProfileListResponse>("/profiles", { signal });
 }
 
 /** Save an edited profile as a new version (conflict resolution included). */

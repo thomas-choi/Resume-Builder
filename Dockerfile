@@ -19,8 +19,10 @@ WORKDIR /app
 # src/tools/docx_renderer.convert_to_pdf to turn rendered .docx into PDF.
 # Without it the API still returns .docx (PDF conversion degrades with a
 # warning) — set RENDER_PDF=false to skip it deliberately.
+# gosu lets the entrypoint drop from root to the host user cleanly (see
+# docker-entrypoint.sh) so bind-mounted files aren't written as root.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libreoffice-writer \
+    && apt-get install -y --no-install-recommends libreoffice-writer gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -34,6 +36,13 @@ COPY fund_models/ fund_models/
 COPY skills/ skills/
 # The built UI, served at "/" by src/api/main.py (FRONTEND_DIR).
 COPY --from=ui /ui/dist/ frontend/dist/
+
+# Entrypoint runs as root, matches the process to the host user (owner of the
+# mounted DATA_DIR) and execs the CMD via gosu. No USER directive: it must start
+# as root to chown the mounts and drop privileges.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 EXPOSE 8000
 # Port precedence: API_PORT (this project's knob) > $PORT (cloud convention:

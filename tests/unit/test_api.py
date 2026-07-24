@@ -480,6 +480,19 @@ def test_profile_get_put_roundtrip(client, sample_profile):
     assert resp.json()["profile"]["headline"] == "Staff Engineer"
 
 
+def test_list_profiles_returns_the_callers_profiles(client, sample_profile):
+    assert client.get("/profiles").json() == {"profiles": []}
+
+    profile_store.save_profile(SINGLE_EMAIL, sample_profile, "alice")
+    profile_store.save_profile(SINGLE_EMAIL, sample_profile, "bob")
+
+    listed = client.get("/profiles").json()["profiles"]
+    ids = {p["profile_id"] for p in listed}
+    assert ids == {"alice", "bob"}
+    assert all(p["label"] == "Alice Smith" for p in listed)
+    assert all(p["latest_version"] == 1 for p in listed)
+
+
 def test_profile_404s(client, sample_profile):
     assert client.get("/profile/nope").status_code == 404
     assert (

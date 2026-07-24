@@ -112,6 +112,17 @@ The queue is discarded after `done`. `warning` is advisory — every item it
 reports also comes back in `source_errors` on the `POST /ingest` response, so a
 client that misses the stream loses nothing.
 
+## GET /profiles
+
+Lists the signed-in user's profiles, newest first, for the header profile
+picker (Phase 6). Read-only; only profiles under the caller's own account are
+returned, so one account never sees another's ids.
+
+**Response 200:** `{"profiles": [{"profile_id", "latest_version", "label", "updated"}]}`
+— `label` is the profile's `name`, falling back to its `headline`, then its
+`profile_id`; `updated` is the latest-version mtime (epoch seconds), used for the
+newest-first ordering. Empty list for a new account.
+
 ## GET /profile/{profile_id}
 
 Latest version by default; `?version=n` for a specific version. 404 if unknown.

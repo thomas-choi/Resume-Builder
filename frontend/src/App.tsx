@@ -16,9 +16,10 @@
  *   diff or download links.
  */
 
-import { useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
+import { listProfiles } from "./lib/api";
 import { ProfilePanel } from "./panels/ProfilePanel";
 import { SourcesPanel } from "./panels/SourcesPanel";
 import { TailorPanel } from "./panels/TailorPanel";
@@ -29,9 +30,24 @@ type View = "builder" | "tutorial";
 export function App() {
   const queryClient = useQueryClient();
   const [profileId, setProfileId] = useState<string | null>(null);
-  const [profileIdInput, setProfileIdInput] = useState("");
+  const [selectedId, setSelectedId] = useState("");
   const [sessionKey, setSessionKey] = useState(0);
   const [view, setView] = useState<View>("builder");
+
+  // The picker lists the signed-in user's profiles. It is refreshed after an
+  // ingest (a newly built profile must appear) via query invalidation.
+  const profilesQuery = useQuery({
+    queryKey: ["profiles"],
+    queryFn: ({ signal }) => listProfiles(signal),
+  });
+  const profiles = profilesQuery.data?.profiles ?? [];
+
+  // Set the active profile from an ingest, and pull the new id into the picker.
+  function activateProfile(id: string) {
+    setProfileId(id);
+    setSelectedId(id);
+    queryClient.invalidateQueries({ queryKey: ["profiles"] });
+  }
 
   function clearEverything() {
     // Destructive: unsaved profile edits, staged uploads and a typed token all
@@ -45,7 +61,7 @@ export function App() {
     // than none.
     queryClient.clear();
     setProfileId(null);
-    setProfileIdInput("");
+    setSelectedId("");
     setSessionKey((key) => key + 1);
   }
 
@@ -76,17 +92,27 @@ export function App() {
           <form
             onSubmit={(event) => {
               event.preventDefault();
-              if (profileIdInput.trim()) setProfileId(profileIdInput.trim());
+              if (selectedId) setProfileId(selectedId);
             }}
           >
             <label htmlFor="load-profile">Load an existing profile</label>
-            <input
+            <select
               id="load-profile"
-              value={profileIdInput}
-              onChange={(event) => setProfileIdInput(event.target.value)}
-              placeholder="profile id"
-            />
-            <button type="submit">Load</button>
+              value={selectedId}
+              onChange={(event) => setSelectedId(event.target.value)}
+            >
+              <option value="" disabled>
+                {profiles.length ? "Select a profile…" : "No profiles yet"}
+              </option>
+              {profiles.map((p) => (
+                <option key={p.profile_id} value={p.profile_id}>
+                  {p.label === p.profile_id ? p.label : `${p.label} — ${p.profile_id}`}
+                </option>
+              ))}
+            </select>
+            <button type="submit" disabled={!selectedId}>
+              Load
+            </button>
           </form>
           <button type="button" onClick={clearEverything}>
             Clear everything
@@ -103,7 +129,7 @@ export function App() {
         <TutorialPage />
       ) : (
       <main>
-        <SourcesPanel key={`sources-${sessionKey}`} onIngested={setProfileId} />
+        <SourcesPanel key={`sources-${sessionKey}`} onIngested={activateProfile} />
         <ProfilePanel key={`profile-${downstreamKey}`} profileId={profileId} />
         <TailorPanel key={`tailor-${downstreamKey}`} profileId={profileId} />
       </main>

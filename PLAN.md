@@ -1642,6 +1642,58 @@ fail-closed `current_user` + router dependency + SSE-owner + `thread_id` +
 
 ---
 
+## Phase 8 — Profile picker + larger fonts — **implemented 2026-07-23**
+
+Two small user-requested UI features. Neither changes the pipeline, the
+anti-fabrication guarantees, or per-account isolation.
+
+### 8.a — "Load an existing profile" becomes a dropdown of the user's profiles
+
+**Problem.** The header loader (`frontend/src/App.tsx`) was a free-text `<input>`
+into which the user had to type an exact `profile_id` (a 12-char hex like
+`a1b2c3d4e5f6`). Nothing enumerated a user's profiles: `profile_store` only had
+`list_versions(email, profile_id)` for one *known* id, so a dropdown could not be
+built from the API as it stood.
+
+- **Backend — `profile_store.list_profiles(email) -> list[dict]`.** Globs the
+  directories under the per-user `_profiles_dir(email)`, and for each reads its
+  `latest_version` and loads that one version to derive a label
+  (`profile.name` → `profile.headline` → the id) plus the `latest` pointer's
+  mtime. Newest-first. A profile whose latest version can't be read still appears,
+  labelled by its id (never silently dropped). Cost is one small read per profile,
+  not per version.
+- **Backend — `GET /profiles`** (Depends `current_user`) returns
+  `{"profiles": [{"profile_id", "latest_version", "label", "updated"}]}`, scoped
+  to the caller's own root exactly like `GET /profile/{id}` — another account's
+  ids never appear. Placed above `GET /profile/{profile_id}` so the static path
+  isn't captured by the `{profile_id}` route.
+- **Frontend.** `listProfiles()` in `lib/api.ts` + `ProfileSummary` /
+  `ProfileListResponse` in `lib/types.ts`. `App` replaces the `<input>` with a
+  TanStack-Query-backed `<select>` (query key `["profiles"]`): option text is
+  `label — id` (or just the label when it equals the id), with a disabled
+  placeholder that reads "No profiles yet" when empty else "Select a profile…".
+  A new `activateProfile(id)` (used by both the picker's *Load* and
+  `SourcesPanel.onIngested`) sets the active id **and** invalidates
+  `["profiles"]`, so a freshly built profile shows up in the list without a manual
+  refresh. **Decision:** the free-text box is fully replaced (the dropdown covers
+  the real use); no manual-id fallback was kept.
+
+**Tests:** `test_profile_store.py` (empty for a new account; label from name;
+id-fallback on a blank name; another account's profile excluded);
+`test_api.py::test_list_profiles_returns_the_callers_profiles`;
+`App.test.tsx` (dropdown lists the user's profiles; select + Load activates one;
+the existing session-lifecycle tests updated to select rather than type).
+
+### 8.b — Larger fonts (moderate bump)
+
+Pure CSS in `frontend/src/styles.css`. `body` gains `font-size: 17px`; the app
+title (`.app > header h1`) 1.2 → 1.6rem; panel headers (`.panel h2`) 1 → 1.25rem;
+the edit boxes (`input`/`textarea`, now also `input[type="password"]` and
+`select`) gain `font-size: 1.05rem` and `padding: 0.45rem`. No behavioural change,
+so no test asserts pixel sizes; verified by `npm run build` and visually.
+
+---
+
 ## Docs sync (every phase, mandatory per CLAUDE.md)
 
 - `TECHNICAL-DESIGN.md` — "Implementation notes" section per phase (two-graph split, JSON storage, interrupt design in Phase 4) + Mermaid diagrams of implemented graphs.

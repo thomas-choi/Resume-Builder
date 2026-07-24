@@ -38,3 +38,23 @@ def test_load_missing_version_raises(data_dir, sample_profile):
     profile_id, _ = profile_store.save_profile(TEST_EMAIL, sample_profile)
     with pytest.raises(FileNotFoundError):
         profile_store.load_profile(TEST_EMAIL, profile_id, 99)
+
+
+def test_list_profiles_empty_for_new_account(data_dir):
+    assert profile_store.list_profiles(TEST_EMAIL) == []
+
+
+def test_list_profiles_labels_and_isolation(data_dir, sample_profile):
+    profile_store.save_profile(TEST_EMAIL, sample_profile, "alice")
+    # A second profile with a blank name falls back to its id as the label.
+    nameless = sample_profile.model_copy(update={"name": "", "headline": None})
+    profile_store.save_profile(TEST_EMAIL, nameless, "blankname")
+    # Another account's profile must not leak into this listing.
+    profile_store.save_profile("other@example.com", sample_profile, "eve")
+
+    listed = profile_store.list_profiles(TEST_EMAIL)
+    by_id = {p["profile_id"]: p for p in listed}
+    assert set(by_id) == {"alice", "blankname"}
+    assert by_id["alice"]["label"] == "Alice Smith"
+    assert by_id["alice"]["latest_version"] == 1
+    assert by_id["blankname"]["label"] == "blankname"

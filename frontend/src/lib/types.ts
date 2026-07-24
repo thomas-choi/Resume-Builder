@@ -134,6 +134,18 @@ export interface ProfileResponse {
   profile: CareerProfile;
 }
 
+/** One row of GET /profiles: a selectable profile in the picker. */
+export interface ProfileSummary {
+  profile_id: string;
+  latest_version: number;
+  label: string;
+  updated: number;
+}
+
+export interface ProfileListResponse {
+  profiles: ProfileSummary[];
+}
+
 /** The account fields returned by GET /auth/me, POST /auth/signup and /auth/signin. */
 export interface UserPublic {
   email: string;

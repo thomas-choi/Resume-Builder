@@ -329,6 +329,16 @@ async def ingest_events(
     return EventSourceResponse(event_stream())
 
 
+@router.get("/profiles")
+def list_profiles(user: User = Depends(current_user)) -> dict:
+    """List the caller's profiles (newest first) for the profile picker.
+
+    Only profiles under the caller's own root are returned, so one account
+    never sees another's ids — the same isolation as :func:`get_profile` (§14.8).
+    """
+    return {"profiles": profile_store.list_profiles(user.email)}
+
+
 @router.get("/profile/{profile_id}")
 def get_profile(
     profile_id: str,

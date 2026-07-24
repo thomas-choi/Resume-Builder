@@ -137,12 +137,19 @@ id, and the previous tailored CV, its diff and its download links go with it.
 Those links pointed at the earlier document; leaving them up invites
 downloading the wrong CV.
 
+**Loading an existing profile is a pick, not a typed id.** The "Load an existing
+profile" control at the top is a **dropdown listing every profile you own** —
+each shown by name (falling back to its headline, or its id) — newest first. Pick
+one and press *Load* to make it the active profile. A profile you have just built
+appears in the list automatically, so you can go straight from ingesting to
+selecting it. The list is yours alone: it never shows another account's profiles.
+
 **"Clear everything" starts a fresh session.** The button beside the profile
 loader empties every panel at once — staged files, the GitHub token, pasted
 notes, the loaded profile and its unsaved edits, the tailored CV and its
 downloads. It asks for confirmation first, because unsaved profile edits are
 among the things it discards. It only clears the *screen*: every profile,
-run and document remains on the server and can be loaded again by id.
+run and document remains on the server and can be loaded again from the dropdown.
 
 ### 2. Review and edit the profile
 

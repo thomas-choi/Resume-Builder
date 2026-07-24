@@ -547,7 +547,7 @@ restating third-party recommendations as the candidate's own claims.
 ## 10. Tech stack (matches your FUND stack)
 
 - **Orchestration:** LangGraph `StateGraph`, one node per agent above, shared Pydantic state object.
-- **Backend:** FastAPI, endpoints like `/ingest`, `/profile/{id}`, `/tailor` (job post in → CV out), SSE for streaming progress on long ingestion jobs — same pattern as your ATA's 17 REST/SSE endpoints.
+- **Backend:** FastAPI, endpoints like `/ingest`, `/profiles` (Phase 8: list the caller's profiles for the picker), `/profile/{id}`, `/tailor` (job post in → CV out), SSE for streaming progress on long ingestion jobs — same pattern as your ATA's 17 REST/SSE endpoints.
 - **Storage:** `CareerProfile` JSON per user in Postgres (or even just versioned JSON files if single-user) so re-tailoring for new job posts doesn't re-run ingestion.
 - **Models:** Haiku for extraction (cheap, high-volume, per-source), Sonnet for synthesis + tailoring (needs judgment), optionally Opus for the validation/anti-hallucination pass since precision matters most there — the same tiering strategy you're already using for subagent cost control.
 - **Frontend:** could reuse your React/Vite/TanStack scaffold — a simple 3-panel UI: sources → profile review/edit → job post + generated CV diff view.
@@ -720,6 +720,17 @@ Three decisions this encodes:
   git SHA alongside the moving `latest`, so reverting is `IMAGE_TAG=<sha>` +
   `up -d` — no rebuild, and no dependence on the workstation's current tree.
   The build script refuses to tag a dirty worktree for that reason.
+- **The container process runs as the host user, not root.** The image has no
+  `USER` directive; instead an entrypoint (`docker-entrypoint.sh`) starts as
+  root, reads the uid/gid that owns the mounted `DATA_DIR` (a bind mount carries
+  the host owner through, so that *is* the operator who ran the container),
+  `chown -R`s the `data/` and `logs/` mounts to it, and `exec gosu <uid> …`s the
+  CMD — so uvicorn is PID 1 as that uid and every file it writes into the mounts
+  is host-owned. This fixes bind-mounted state (profiles, `app.log`) coming out
+  root-owned and unmanageable without `sudo`. Baking a fixed uid into the image
+  was rejected because it can't match an arbitrary host; detecting from the
+  mount adapts per deployment with no build arg. `HOST_UID`/`HOST_GID` override
+  the detection; a root-owned mount falls back to running as root.
 
 One constraint carries over from Phase 4 and limits this topology: a paused
 human-review run lives in an in-process `MemorySaver`, so the service must stay

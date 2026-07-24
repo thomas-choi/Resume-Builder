@@ -72,3 +72,44 @@ def list_versions(email: str, profile_id: str) -> list[int]:
     if not pdir.exists():
         return []
     return sorted(int(p.stem[1:]) for p in pdir.glob("v*.json"))
+
+
+def list_profiles(email: str) -> list[dict]:
+    """All profiles owned by ``email``, newest first, for a picker UI.
+
+    Each entry carries the ``profile_id``, its ``latest_version``, a
+    human-readable ``label`` (the contact name, else the headline, else the id)
+    and the ``updated`` mtime (epoch seconds) of its ``latest`` pointer. Only the
+    latest version of each profile is loaded, so the cost is one small read per
+    profile rather than per version. A profile whose latest version can't be read
+    still appears, labelled by its id, so it stays selectable.
+    """
+    root = _profiles_dir(email)
+    if not root.exists():
+        return []
+    profiles: list[dict] = []
+    for pdir in root.iterdir():
+        if not pdir.is_dir():
+            continue
+        profile_id = pdir.name
+        version = latest_version(email, profile_id)
+        if version == 0:
+            continue
+        label = profile_id
+        try:
+            profile = load_profile(email, profile_id, version)
+            label = (profile.name or profile.headline or profile_id).strip()
+        except (FileNotFoundError, ValueError):
+            label = profile_id
+        pointer = pdir / "latest"
+        updated = pointer.stat().st_mtime if pointer.exists() else 0.0
+        profiles.append(
+            {
+                "profile_id": profile_id,
+                "latest_version": version,
+                "label": label or profile_id,
+                "updated": updated,
+            }
+        )
+    profiles.sort(key=lambda p: p["updated"], reverse=True)
+    return profiles

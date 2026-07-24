@@ -24,17 +24,23 @@ const tailorResponse = tailorFixture({
   ],
 });
 
-/** Type a profile id into the header and load it. */
+/** Pick a profile from the header dropdown and load it. */
 async function load(user: ReturnType<typeof userEvent.setup>, profileId: string) {
-  const input = screen.getByLabelText("Load an existing profile");
-  await user.clear(input);
-  await user.type(input, profileId);
+  const select = await screen.findByLabelText("Load an existing profile");
+  await screen.findByRole("option", { name: new RegExp(profileId) });
+  await user.selectOptions(select, profileId);
   await user.click(screen.getByRole("button", { name: "Load" }));
 }
 
 describe("App session lifecycle", () => {
   beforeEach(() => {
     vi.spyOn(api, "subscribeToIngest").mockImplementation(() => () => {});
+    vi.spyOn(api, "listProfiles").mockResolvedValue({
+      profiles: [
+        { profile_id: "alice", latest_version: 1, label: "Alice profile", updated: 2 },
+        { profile_id: "bob", latest_version: 1, label: "Bob profile", updated: 1 },
+      ],
+    });
     vi.spyOn(api, "getProfile").mockImplementation(async (profileId: string) => ({
       profile_id: profileId,
       version: 1,
@@ -76,6 +82,19 @@ describe("App session lifecycle", () => {
     expect(screen.getByText(/Active profile:/)).toHaveTextContent("alice");
     expect(screen.getByLabelText(/Anything else/)).toHaveValue("Some notes");
     expect(screen.getByText(/Alice Smith/)).toBeInTheDocument();
+  });
+
+  it("lists the user's profiles in the loader dropdown", async () => {
+    const user = userEvent.setup();
+    renderWithClient(<App />);
+
+    const select = await screen.findByLabelText("Load an existing profile");
+    expect(await screen.findByRole("option", { name: /Alice profile — alice/ })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: /Bob profile — bob/ })).toBeInTheDocument();
+
+    await user.selectOptions(select, "alice");
+    await user.click(screen.getByRole("button", { name: "Load" }));
+    expect(await screen.findByText(/Active profile:/)).toHaveTextContent("alice");
   });
 
   it("drops the previous profile's tailored CV when the active profile changes", async () => {
